@@ -1,5 +1,9 @@
 # NeuralScreen
 
+> **HDR fork (experimental):** automatic FP16 desktop/window capture and scRGB output.
+> Neural processing uses an SDR proxy; recordings/screenshots remain SDR.
+> [Setup, validation and limitations](docs/HDR.md).
+
 **NVIDIA's DLSS 5 neural renderer, applied to your whole Windows desktop in
 real time.** Everything on screen — games, video, photos — goes through the
 same neural network that DLSS 5 games use, and comes back sharper.
@@ -188,7 +192,7 @@ second per frame; a press may feel lost.
 ## Known limitations
 
 - **True fullscreen games** cannot have the overlay drawn over them — a Windows rule. Borderless or windowed only.
-- **HDR displays** are not supported: switch to SDR (Win+Alt+B).
+- **HDR displays:** experimental support in this fork; see [HDR setup and limitations](docs/HDR.md).
 - **Windows 10, two NVIDIA cards and a second monitor are experimental** — built or fixed from user logs, none of it tested on the development machine (Windows 11, one card, one monitor); the overlay is drawn on the primary monitor. Reports welcome.
 - **Pipeline latency** is 40–60 ms — fine interactively, not competitively; **processing resolution is capped at 2560×1440** (the network refuses 4K), output is always your full native resolution.
 - **The bundled `nvngx_dlssnr.dll` is the leaked 310.8.0 runtime carrying sm_75/86/89/120 kernels (RTX 20-50)** — see License below.
