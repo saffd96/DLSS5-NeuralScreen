@@ -179,6 +179,7 @@ class OverlayMenu:
             "dlss_sr_scale": .65,
             "dlss_sr": False,
             "ui_detection": False,
+            "gpu_motion": False,
             "frame_generation": False,
             "frame_multiplier": 2,
             "screen_size": "",
