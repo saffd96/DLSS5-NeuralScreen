@@ -40,8 +40,35 @@ def _fetch(url: str, dest: Path) -> bool:
 
 
 def _gh(args: list) -> str:
+    """gh, decoded as UTF-8 whatever the console codepage is.
+
+    text=True alone decodes with the ANSI codepage (cp1251 on this machine),
+    and the v1.6.1 release body - English and Russian in one document - has
+    bytes it cannot decode: the reader thread died, stdout came back None
+    and the verifier crashed on a release that was perfectly fine.
+    """
     return subprocess.run(["gh"] + args, capture_output=True, text=True,
+                          encoding="utf-8", errors="replace",
                           check=True).stdout.strip()
+
+
+def _fetch_asset(asset_id: int, dest: Path) -> bool:
+    """Download a release asset by id, straight from the API.
+
+    gh carries the token and follows the redirect; the bytes are the ones
+    GitHub stores rather than whatever the download CDN is still caching.
+    """
+    try:
+        with open(dest, "wb") as fh:
+            subprocess.run(
+                ["gh", "api", f"repos/perseval-BLR/DLSS5-NeuralScreen/"
+                              f"releases/assets/{asset_id}",
+                 "-H", "Accept: application/octet-stream"],
+                stdout=fh, check=True, timeout=900)
+        return True
+    except Exception as exc:
+        print(f"    [FAIL] could not fetch asset {asset_id}: {exc}")
+        return False
 
 
 def main() -> int:
@@ -101,17 +128,30 @@ def main() -> int:
         if zip_name in names:
             local_zip = _sha256(ROOT / zip_name)
             dl = tmp / zip_name
-            if _fetch(rel["assets"][names.index(zip_name)]["browser_download_url"],
-                      dl):
+            # Through the API asset endpoint, NOT browser_download_url. That
+            # URL is served by a CDN which keeps the previous copy for a
+            # while after a re-upload, and the check then reports a digest
+            # MISMATCH on an archive that is byte-identical - twice now,
+            # each time costing a re-upload to disprove. The API endpoint
+            # answers with the bytes GitHub actually stores.
+            if _fetch_asset(rel["assets"][names.index(zip_name)]["id"], dl):
                 remote_zip = _sha256(dl)
                 if local_zip != remote_zip:
                     failures.append(f"zip digest MISMATCH local={local_zip[:12]} "
                                     f"github={remote_zip[:12]}")
                 else:
                     print(f"    [OK] zip digest matches GitHub ({local_zip[:12]})")
-        latest = _gh(["release", "list", "--limit", "1"])
-        if not latest.startswith(tag):
-            failures.append(f"{tag} is not the Latest release")
+        # Asked of the API, not inferred from the first column of
+        # "gh release list". That column is the release TITLE, and every
+        # release until 1.7.0 happened to start its title with the tag - so
+        # the check really tested a naming habit. 1.7.0 led with what the
+        # release does and the verifier called a perfectly correct Latest
+        # release wrong.
+        latest = _gh(["api", "repos/perseval-BLR/DLSS5-NeuralScreen/releases/latest",
+                      "--jq", ".tag_name"])
+        if latest != tag:
+            failures.append(f"{tag} is not the Latest release (GitHub says "
+                            f"{latest!r})")
 
     # 4. The repository description carries the current feature markers.
     desc = _gh(["repo", "view", "perseval-BLR/DLSS5-NeuralScreen",

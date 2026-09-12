@@ -194,11 +194,11 @@ second per frame; a press may feel lost.
 - **True fullscreen games** cannot have the overlay drawn over them — a Windows rule. Borderless or windowed only.
 - **HDR displays:** experimental support in this fork; see [HDR setup and limitations](docs/HDR.md).
 - **Windows 10, two NVIDIA cards and a second monitor are experimental** — built or fixed from user logs, none of it tested on the development machine (Windows 11, one card, one monitor); the overlay is drawn on the primary monitor. Reports welcome.
-- **Pipeline latency** is 40–60 ms — fine interactively, not competitively; **processing resolution is capped at 2560×1440** (the network refuses 4K), output is always your full native resolution.
+- **Pipeline latency** is 40–60 ms (17-20ms with Boost Mode) — fine interactively, not competitively; **processing resolution is capped at 2560×1440** (the network refuses 4K), output is always your full native resolution.
 - **The bundled `nvngx_dlssnr.dll` is the leaked 310.8.0 runtime carrying sm_75/86/89/120 kernels (RTX 20-50)** — see License below.
 
 ## License
 
 The code here is MIT. NVIDIA's `nvngx_dlssnr.dll` is the leaked 310.8.0
-runtime (sm_75/86/89/120 kernels, RTX 20-50). Included as-is, no
-guarantees; research-only.
+runtime (sm_75/86/89/120 kernels, RTX 20-50), included as-is, no
+guarantees, research-only. Interface faces: IBM Plex (OFL-1.1, `fonts/OFL.txt`).

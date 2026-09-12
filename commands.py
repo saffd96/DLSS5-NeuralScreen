@@ -35,7 +35,7 @@ from i18n import STRINGS as UI_STRINGS
 from paths import BASE_DIR
 from pipeline import restart_worker
 from recorder import VideoRecorder
-from settings_io import (CHANNEL_URL, PROFILES, REPO_URL, WORK_SCALE_MAX,
+from settings_io import (CHANNEL_URL, PROFILES, REPO_URL,
                          WORK_SCALE_MIN, WORK_SCALE_STEP,
                          _autostart_enabled, _next_preset_name,
                          _set_autostart, _work_size, hotkey_labels)
@@ -140,20 +140,26 @@ def apply_menu_action(st, action: tuple) -> None:
     if kind == "nr":
         st.tray_commands.put("toggle")
     elif kind == "nr_res":
-        # One control, one meaning: how much resolution the network
-        # sees. Above the cap there is nothing left to reduce, so that
-        # end of the slider is "the whole screen" - which is the same
-        # thing as the reduced mode being off.
-        want = float(action[1])
-        cap = settings_io.work_scale_cap(st)
-        if want > cap + 1e-6:
-            pipeline.request_apply(st, 1.0, st.cfg["profile"], st.params, new_small=False)
-        else:
-            pipeline.request_apply(st, want, st.cfg["profile"], st.params, new_small=True)
+        # How much resolution the network sees. The slider is only offered
+        # while Boost is on, so every position is a real work resolution;
+        # whether the reduced mode runs at all is the switch's business.
+        want = min(settings_io.work_scale_cap(st), float(action[1]))
+        pipeline.request_apply(st, want, st.cfg["profile"], st.params, new_small=True)
     elif kind == "split":
         # No need to recreate the worker: the wipe position rides in
         # every frame's header.
         st.split_pos = min(1.0, max(0.0, float(action[1])))
+    elif kind == "toggle" and action[1] == "boost":
+        # Boost: run the network at the work resolution instead of the full
+        # frame, and composite its edit back onto the native 1:1 picture.
+        # The work scale is NOT touched here - it is the user's setting and
+        # has to survive the switch going off and on again, so the slider
+        # comes back where it was left.
+        want = not st.nr_small
+        scale = min(settings_io.work_scale_cap(st), st.work_scale) if want \
+            else st.work_scale
+        pipeline.request_apply(st, scale, st.cfg["profile"], st.params,
+                               new_small=want)
     elif kind == "toggle" and action[1] == "open_on_start":
         st.startup_menu = not st.startup_menu
         settings_io.save_menu_layout(st)
@@ -175,6 +181,13 @@ def apply_menu_action(st, action: tuple) -> None:
         st.cfg["rec_indicator"] = not bool(st.cfg.get("rec_indicator", True))
         settings_io.save_menu_layout(st)
         print(f"[main] recording indicator: {'on' if st.cfg['rec_indicator'] else 'off'}")
+    elif kind == "toggle" and action[1] == "skip_static":
+        # A per-frame flag in the header, not a worker setting: no restart,
+        # the next frame already carries the new state.
+        st.cfg["skip_static"] = not bool(st.cfg.get("skip_static", True))
+        settings_io.save_menu_layout(st)
+        print(f"[main] skip static frames: "
+              f"{'on' if st.cfg['skip_static'] else 'off'}")
     elif kind == "toggle" and action[1] == "spout":
         # The Spout2 bridge: the worker reads NS_SPOUT only at startup,
         # so the toggle goes through a worker restart (pipeline.apply_spout
@@ -228,9 +241,15 @@ def apply_menu_action(st, action: tuple) -> None:
             print(f"[main] {cmd} -> {text}")
             st.display.alert(UI_STRINGS[st.lang]["settings_applied"])
     elif kind == "theme":
-        # The menu has already applied the theme to itself
-        # (overlay_ui); here we only remember it for config.json -
-        # settings_io.save_menu_layout(st) runs on menu close and on exit.
+        # The menu has already applied the theme to itself (overlay_ui).
+        # It lands in st.cfg RIGHT HERE, not only in the file: the file is
+        # written on menu close and on exit, but a rebuild in between -
+        # a monitor switch, a GPU switch, one-window mode - recreates the
+        # menu and restores the theme from st.cfg. With the value still
+        # missing there, a monitor switch threw the user back to light
+        # (issue #33).
+        if action[1] in ("light", "dark"):
+            st.cfg["theme"] = action[1]
         print(f"[main] menu theme -> {action[1]}")
     elif kind == "gpu":
         # The value arrives as "N: NVIDIA GeForce ..." - the index is the
@@ -434,10 +453,17 @@ def drain_commands(st) -> bool:
                         # revive it - a fresh process may succeed (a
                         # transient GPU conflict, a driver hiccup).
                         st.worker_failed = False
+                        # The automatic revive is disarmed by the manual one.
+                        # It used to stay armed: the user brought the worker
+                        # back by hand, and up to 30 s later the deadline came
+                        # round and restarted the healthy worker underneath
+                        # them - a black screen out of nowhere (audit F4).
+                        st.next_auto_revive = 0.0
                         print("[main] reviving the worker after the failure")
                         try:
                             st.worker, st.worker_logs, st.reader, st.worker_stop = restart_worker(
-                                st.worker, st.params, st.work_w, st.work_h, st.warmup,
+                                st.worker, st.params, st.work_w, st.work_h,
+                                st.effective_warmup,
                                 st.width if (st.work_w != st.width or st.work_h != st.height) else 0,
                                 st.height if (st.work_w != st.width or st.work_h != st.height) else 0,
                                 st.worker_stop, st.shm)
@@ -525,13 +551,34 @@ def drain_commands(st) -> bool:
                               file=sys.stderr)
                         st.display.alert(UI_STRINGS[st.lang]["win_none"])
             elif cmd in ("scale_up", "scale_down"):
+                # The hotkeys walk one ladder: every step below the cap is a
+                # work resolution with Boost on, and the step above it is the
+                # full frame with Boost off. Without that last part the keys
+                # would change the number in the alert and nothing in the
+                # picture whenever Boost happened to be off - the network
+                # runs at the full size then whatever the scale says
+                # (measured bit for bit, 12.09).
+                cap = settings_io.work_scale_cap(st)
+                cur = st.work_scale if st.nr_small else cap + WORK_SCALE_STEP
                 delta = WORK_SCALE_STEP if cmd == "scale_up" else -WORK_SCALE_STEP
-                new_scale = min(WORK_SCALE_MAX, max(WORK_SCALE_MIN, st.work_scale + delta))
-                if abs(new_scale - st.work_scale) > 1e-6:
-                    new_w, new_h = _work_size(st.width, st.height, new_scale)
-                    print(f"[main] work_scale -> {new_scale:.2f} ({new_w}x{new_h})")
-                    st.display.alert(UI_STRINGS[st.lang]["work_scale_changed"].format(new_scale, new_w, new_h))
-                    pipeline.request_apply(st, new_scale, st.cfg["profile"], st.params)
+                new_scale = min(cap + WORK_SCALE_STEP,
+                                max(WORK_SCALE_MIN, cur + delta))
+                if abs(new_scale - cur) > 1e-6:
+                    want_small = new_scale <= cap + 1e-6
+                    applied = new_scale if want_small else st.work_scale
+                    new_w, new_h = _work_size(st.width, st.height, applied)
+                    print(f"[main] work_scale -> {new_scale:.2f} ({new_w}x{new_h}), "
+                          f"boost {'on' if want_small else 'off'}")
+                    # Off the ladder's top step the numbers the user is shown
+                    # are the full frame, not the scale that stays stored for
+                    # when Boost comes back: an alert reading "0.70" would
+                    # name a position that does not exist.
+                    st.display.alert(UI_STRINGS[st.lang]["work_scale_changed"].format(
+                        new_scale if want_small else 1.0,
+                        new_w if want_small else st.width,
+                        new_h if want_small else st.height))
+                    pipeline.request_apply(st, applied, st.cfg["profile"], st.params,
+                                           new_small=want_small)
     except queue.Empty:
         pass
     return st.running

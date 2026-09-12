@@ -1,4 +1,4 @@
-﻿// dlss5-feed-host64 - the 64-bit half of DLSS5-Feeder for 32-bit games.
+// dlss5-feed-host64 - the 64-bit half of DLSS5-Feeder for 32-bit games.
 //
 // A 32-bit game cannot load NGX or the DLSS 5 add-on (both x64-only). This little
 // process can: it puts ReShade x64 (dxgi.dll) and renodx-dlss5.addon64 next to
@@ -31,7 +31,8 @@
 #include <windows.graphics.capture.interop.h>
 #include <windows.graphics.directx.direct3d11.interop.h>
 #include <d3d12.h>
-#include <dxgi1_6.h>
+#include <dxgi1_4.h>
+#include <dxgi1_6.h>   // IDXGIOutput6: the captured display's colour space (HDR)
 #include <d3dcompiler.h>
 #include "spout_bridge.h"
 #include <cstdio>
@@ -141,6 +142,13 @@ static const char *NgxResultName(NVSDK_NGX_Result r)
     switch (static_cast<unsigned>(r))
     {
     case 0x1:        return "Success";
+    case 0xBAD00001: return "FeatureNotSupported";
+    // What the feature library answers when the call did not leave a module
+    // whose path contains "nvngx.dll" - the commonest way for a broken
+    // install to fail, and it used to print as "?".
+    case 0xBAD00002: return "PlatformError";
+    case 0xBAD00003: return "FeatureAlreadyExists";
+    case 0xBAD00004: return "FeatureNotFound";
     case 0xBAD00005: return "InvalidParameter";
     case 0xBAD00007: return "NotInitialized";
     case 0xBAD00008: return "UnsupportedInputFormat";
@@ -405,6 +413,63 @@ static int SetupArchSpoof()
     return 1;
 }
 
+// Point the four NGX pointers at our forwarder instead of at the feature
+// library itself.
+//
+// nvngx_dlssnr.dll decides whether to serve a call by the path of the module
+// the call returns to: it must contain the substring "nvngx.dll". The process
+// name is not looked at - measured, see native/ns_forwarder.cpp. That is the
+// only reason this executable is named nvngx.dll today, and routing the calls
+// through a module that carries the substring in its own file name removes it.
+//
+// On failure this returns false and the caller falls back to the direct path,
+// which works only while the executable itself is named nvngx.dll. The reason
+// always goes to the log - a missing forwarder must not look like "Neural
+// Rendering is not supported on this card".
+static bool LoadNrForwarder(const wchar_t *dll_name)
+{
+    // NS_FORWARDER=<path> points at a different module. It exists for the
+    // test that proves the rule: the same binary copied to a name without the
+    // substring must be refused. Without a way to aim the worker at that copy
+    // the rule could only be asserted in a comment.
+    wchar_t path[MAX_PATH] = {};
+    if (GetEnvironmentVariableW(L"NS_FORWARDER", path, MAX_PATH) == 0)
+    {
+        GetModuleFileNameW(nullptr, path, MAX_PATH);
+        if (wchar_t *s = wcsrchr(path, L'\\')) *(s + 1) = L'\0';
+        wcsncat_s(path, L"nvngx.dll_ns-forwarder.dll", _TRUNCATE);
+    }
+
+    const HMODULE fwd = LoadLibraryW(path);
+    if (fwd == nullptr)
+    { Log("[pure] forwarder %ls did not load, err=%lu", path, GetLastError()); return false; }
+
+    const auto load = reinterpret_cast<int (*)(const wchar_t *)>(GetProcAddress(fwd, "NsFwdLoad"));
+    const auto where = reinterpret_cast<void (*)(wchar_t *, unsigned int)>(GetProcAddress(fwd, "NsFwdPath"));
+    const auto init_ext = reinterpret_cast<PFN_NR_InitExt>(GetProcAddress(fwd, "NsFwdInitExt"));
+    const auto create = reinterpret_cast<PFN_NR_Create>(GetProcAddress(fwd, "NsFwdCreate"));
+    const auto evaluate = reinterpret_cast<PFN_NR_Evaluate>(GetProcAddress(fwd, "NsFwdEvaluate"));
+    const auto release = reinterpret_cast<PFN_NR_Release>(GetProcAddress(fwd, "NsFwdRelease"));
+    if (load == nullptr || init_ext == nullptr || create == nullptr
+        || evaluate == nullptr || release == nullptr)
+    { Log("[pure] the forwarder is missing exports - is it an old build?"); return false; }
+
+    const int lr = load(dll_name);
+    if (lr != 0)
+    { Log("[pure] the forwarder could not load %ls (%d)", dll_name, lr); return false; }
+
+    g_nr_module = fwd;
+    g_nr_init_ext = init_ext;
+    g_nr_create = create;
+    g_nr_evaluate = evaluate;
+    g_nr_release = release;
+
+    wchar_t actual[MAX_PATH] = {};
+    if (where != nullptr) where(actual, MAX_PATH);
+    Log("[pure] NGX calls go through %ls", actual[0] != L'\0' ? actual : path);
+    return true;
+}
+
 static bool InitDirectNr(const wchar_t *data_path)
 {
     // Before the NVIDIA library is loaded: it asks for the architecture when
@@ -414,14 +479,13 @@ static bool InitDirectNr(const wchar_t *data_path)
     // NS_NGX_CORE=<path to the driver's nvngx.dll>: load NGX Core before the
     // feature DLL.
     //
-    // This process has to be named nvngx.dll or Init_Ext answers
-    // FAIL_PlatformError - which is why the worker is a separate process at
-    // all. The suspicion is that nvngx_dlssnr.dll does not care about the
-    // process name as such, it only wants a module called nvngx.dll present:
-    // in a game that is the real NGX Core, and here it is our own image, which
-    // is listed under its own file name. If preloading the real core lets a
-    // differently named process through, Neural Rendering can run inside a
-    // game process and the naming constraint disappears.
+    // Historical: this experiment asked whether preloading the real NGX core
+    // would let a differently named process through, on the suspicion that the
+    // feature library only wanted a module called nvngx.dll to be PRESENT. It
+    // never worked, and now we know why - the library wants the module that
+    // CALLS it, not one that happens to be loaded. See LoadNrForwarder above;
+    // the flag is kept because the preload costs nothing and the core is worth
+    // having loaded first.
     wchar_t core[MAX_PATH] = {};
     if (GetEnvironmentVariableW(L"NS_NGX_CORE", core, MAX_PATH) > 0)
     {
@@ -432,11 +496,11 @@ static bool InitDirectNr(const wchar_t *data_path)
     // NS_NGX_VIA_CORE=1: create and evaluate feature 18 through NGX Core
     // instead of calling the feature DLL directly.
     //
-    // The direct path is the only reason this process must be named
-    // nvngx.dll. NGX Core itself initialises from any process name (measured:
-    // "[host] NVSDK_NGX_D3D12_Init -> Success" out of nsprobe.exe), so if the
-    // core will hand us feature 18, the naming constraint is gone - and with
-    // it the reason the worker has to be a separate process at all.
+    // This was the other way out of the naming constraint, back when the
+    // constraint looked like it was on the process. It is not needed for that
+    // any more - the forwarder answers it - and creating feature 18 through
+    // the core fails anyway (FAIL_UnableToInitializeFeature, every time). Kept
+    // as a switch because the comparison is occasionally useful.
     char via[8] = {};
     const DWORD via_got = GetEnvironmentVariableA("NS_NGX_VIA_CORE", via, sizeof(via));
     if (via_got > 0 && via_got < sizeof(via) && via[0] == '1')
@@ -460,19 +524,32 @@ static bool InitDirectNr(const wchar_t *data_path)
         dll_name = dll_path;
         Log("[pure] NS_NR_DLL=%ls", dll_name);
     }
-    g_nr_module = LoadLibraryW(dll_name);
-    if (!g_nr_module) { Log("[pure] LoadLibrary(%ls) failed %lu", dll_name, GetLastError()); return false; }
-    g_nr_init_ext = reinterpret_cast<PFN_NR_InitExt>(GetProcAddress(g_nr_module, "NVSDK_NGX_D3D12_Init_Ext"));
-    g_nr_create = reinterpret_cast<PFN_NR_Create>(GetProcAddress(g_nr_module, "NVSDK_NGX_D3D12_CreateFeature"));
-    g_nr_evaluate = reinterpret_cast<PFN_NR_Evaluate>(GetProcAddress(g_nr_module, "NVSDK_NGX_D3D12_EvaluateFeature"));
-    g_nr_release = reinterpret_cast<PFN_NR_Release>(GetProcAddress(g_nr_module, "NVSDK_NGX_D3D12_ReleaseFeature"));
-    if (!g_nr_init_ext || !g_nr_create || !g_nr_evaluate || !g_nr_release)
-    { Log("[pure] missing direct exports in nvngx_dlssnr.dll: Init_Ext=%s Create=%s Evaluate=%s Release=%s (GetLastError=%lu)",
-         g_nr_init_ext ? "ok" : "MISSING", g_nr_create ? "ok" : "MISSING",
-         g_nr_evaluate ? "ok" : "MISSING", g_nr_release ? "ok" : "MISSING",
-         GetLastError()); return false; }
+    // NS_NO_FORWARDER=1 keeps the old shape, where the calls leave this
+    // executable - which the feature library serves only while the executable
+    // is named nvngx.dll. Kept for comparison, and as a way out on a machine
+    // that will not load the forwarder for some reason of its own.
+    char nofwd[8] = {};
+    const DWORD nofwd_got = GetEnvironmentVariableA("NS_NO_FORWARDER", nofwd, sizeof(nofwd));
+    const bool asked_direct = nofwd_got > 0 && nofwd_got < sizeof(nofwd) && nofwd[0] == '1';
+    if (asked_direct) Log("[pure] NS_NO_FORWARDER=1: calling the feature library from the worker");
+    const bool direct = asked_direct || !LoadNrForwarder(dll_name);
+    if (direct)
+    {
+        g_nr_module = LoadLibraryW(dll_name);
+        if (!g_nr_module) { Log("[pure] LoadLibrary(%ls) failed %lu", dll_name, GetLastError()); return false; }
+        g_nr_init_ext = reinterpret_cast<PFN_NR_InitExt>(GetProcAddress(g_nr_module, "NVSDK_NGX_D3D12_Init_Ext"));
+        g_nr_create = reinterpret_cast<PFN_NR_Create>(GetProcAddress(g_nr_module, "NVSDK_NGX_D3D12_CreateFeature"));
+        g_nr_evaluate = reinterpret_cast<PFN_NR_Evaluate>(GetProcAddress(g_nr_module, "NVSDK_NGX_D3D12_EvaluateFeature"));
+        g_nr_release = reinterpret_cast<PFN_NR_Release>(GetProcAddress(g_nr_module, "NVSDK_NGX_D3D12_ReleaseFeature"));
+        if (!g_nr_init_ext || !g_nr_create || !g_nr_evaluate || !g_nr_release)
+        { Log("[pure] missing direct exports in nvngx_dlssnr.dll: Init_Ext=%s Create=%s Evaluate=%s Release=%s (GetLastError=%lu)",
+             g_nr_init_ext ? "ok" : "MISSING", g_nr_create ? "ok" : "MISSING",
+             g_nr_evaluate ? "ok" : "MISSING", g_nr_release ? "ok" : "MISSING",
+             GetLastError()); return false; }
+    }
     const auto r = g_nr_init_ext(0x1000000ULL, data_path, h.dev, NVSDK_NGX_Version_API, h.params);
-    Log("[pure] direct DLSSNR Init_Ext -> 0x%08X (%s)", r, NgxResultName(r));
+    Log("[pure] DLSSNR Init_Ext (%s) -> 0x%08X (%s)",
+        direct ? "from the worker" : "through the forwarder", r, NgxResultName(r));
     return NVSDK_NGX_SUCCEED(r);
 }
 
@@ -481,6 +558,7 @@ static bool InitDirectNr(const wchar_t *data_path)
 // ---------------------------------------------------------------------------
 
 static void LogDeviceRemoved(const char *where);   // defined below BeginCommands
+static bool WaitFenceValue(ID3D12Fence *f, UINT64 v, DWORD ms);  // defined below
 
 static bool BeginCommands()
 {
@@ -488,8 +566,10 @@ static bool BeginCommands()
     const UINT64 retire = h.alloc_fence[slot];
     if (retire != 0 && h.fence->GetCompletedValue() < retire)
     {
-        h.fence->SetEventOnCompletion(retire, h.fence_event);
-        if (WaitForSingleObject(h.fence_event, 2000) != WAIT_OBJECT_0)
+        // Through the same helper as every other wait: this one carried a
+        // second copy of the shared-event bug, and it also left a
+        // registration behind on a timeout for the next wait to trip over.
+        if (!WaitFenceValue(h.fence, retire, 2000))
         { Log("[host] GPU did not retire allocator slot %d", slot); return false; }
     }
     if (FAILED(h.alloc[slot]->Reset()))
@@ -556,13 +636,34 @@ static bool WaitFenceValue(ID3D12Fence *f, UINT64 v, DWORD ms)
     // false success (code review finding). Check it first.
     if (f->GetCompletedValue() == UINT64_MAX) return false;
     if (f->GetCompletedValue() >= v) return true;
-    f->SetEventOnCompletion(v, h.fence_event);
-    if (WaitForSingleObject(h.fence_event, ms) != WAIT_OBJECT_0) return false;
-    // The event can be signalled by a LATER fence value (the event is
-    // shared); re-check the actual value before declaring success.
-    const UINT64 now = f->GetCompletedValue();
-    if (now == UINT64_MAX) return false;
-    return now >= v;
+    // One auto-reset event serves every wait in this process - several
+    // fences among them - and SetEventOnCompletion is NOT cancelled when a
+    // wait returns. So the event can arrive already signalled by a
+    // registration made for an older value, or be signalled by one while
+    // this wait is asleep. Returning false on such a wake was the bug: the
+    // next wait inherited the next stale signal and the pipeline stayed
+    // exactly one completion out of step, for good. In the wild that read
+    // as 2766 consecutive "[cap] swizzle fence timeout" lines, every one of
+    // them 30 ms apart rather than the 10 s the timeout asks for, ending
+    // only when a monitor switch tore the pipeline down and built it again
+    // (issue #33: "NR worked on the second try").
+    //
+    // So: drop any stale signal, re-check, and treat an early wake as what
+    // it is - not this wait's completion. Keep waiting until the value is
+    // really reached or the deadline passes.
+    ResetEvent(h.fence_event);
+    if (f->GetCompletedValue() >= v) return true;
+    if (FAILED(f->SetEventOnCompletion(v, h.fence_event))) return false;
+    const ULONGLONG deadline = GetTickCount64() + ms;
+    for (;;)
+    {
+        const ULONGLONG now_ms = GetTickCount64();
+        const DWORD left = now_ms >= deadline ? 0 : (DWORD)(deadline - now_ms);
+        if (WaitForSingleObject(h.fence_event, left) != WAIT_OBJECT_0) return false;
+        const UINT64 now = f->GetCompletedValue();
+        if (now == UINT64_MAX) return false;
+        if (now >= v) return true;
+    }
 }
 
 static void CloseListGuarded()
@@ -835,6 +936,21 @@ static int SelectedAdapterIndex()
 }
 
 
+//: The adapter the network ACTUALLY runs on, as a DXGI index. NS_GPU is a
+//: wish: an index that is not a usable NVIDIA adapter falls back to the
+//: first one that is. The capture and the duplication have to land on the
+//: same card - the frame crosses to D3D12 through a shared handle, which
+//: does not cross adapters - so they ask this rather than NS_GPU, which is
+//: what they used to do (issue #34: a hybrid laptop ran the network on the
+//: 4090 and the capture on the iGPU, and showed nothing).
+static int g_adapter_index = -1;
+
+static int ActiveAdapterIndex()
+{
+    return g_adapter_index >= 0 ? g_adapter_index : SelectedAdapterIndex();
+}
+
+
 static bool InitDisguise()
 {
     // Pure D3D12 setup. No window, swapchain, ReShade, RenoDX, or DLSS carrier.
@@ -855,6 +971,8 @@ static bool InitDisguise()
     const int want = SelectedAdapterIndex();
     IDXGIAdapter1 *nvidia = nullptr;
     IDXGIAdapter1 *chosen = nullptr;
+    int nvidia_idx = -1;
+    int chosen_idx = -1;
     for (UINT i = 0; ; ++i)
     {
         IDXGIAdapter1 *candidate = nullptr;
@@ -865,8 +983,9 @@ static bool InitDisguise()
         const bool usable = desc.VendorId == 0x10DE &&
                             !(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE);
         if (want >= 0 && static_cast<int>(i) == want && usable)
-        { chosen = candidate; continue; }
-        if (nvidia == nullptr && usable) { nvidia = candidate; continue; }
+        { chosen = candidate; chosen_idx = static_cast<int>(i); continue; }
+        if (nvidia == nullptr && usable)
+        { nvidia = candidate; nvidia_idx = static_cast<int>(i); continue; }
         candidate->Release();
     }
     if (want >= 0 && chosen == nullptr)
@@ -876,9 +995,15 @@ static bool InitDisguise()
     {
         if (nvidia != nullptr) nvidia->Release();
         nvidia = chosen;
+        nvidia_idx = chosen_idx;
         Log("[host] adapter %d selected by NS_GPU", want);
     }
     if (nvidia == nullptr) { factory->Release(); Log("[host] no NVIDIA adapter found"); return false; }
+    // From here on this is THE adapter: the capture and the duplication read
+    // it instead of NS_GPU, so a wish that could not be granted cannot split
+    // the pipeline across two cards (issue #34).
+    g_adapter_index = nvidia_idx;
+    Log("[host] adapter %d runs the network and the capture", nvidia_idx);
 
     hr = create_device(nvidia, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device),
                        reinterpret_cast<void **>(&h.dev));
@@ -1188,6 +1313,11 @@ static constexpr uint32_t FRAME_FLAG_BYPASS = 0x10u;
 // in the header, and resizing it for a single number would break the protocol
 // on both sides.
 static constexpr uint32_t FRAME_FLAG_SPLIT = 0x20u;
+// bit 6: skip static frames - the capture has no new frame (DDA
+// WAIT_TIMEOUT, WGC empty pool), so the network is NOT re-run on the stale
+// texture. An empty OUT1 is the "nothing changed" answer; WANT_PIXELS wins
+// over this bit (a screenshot or a recording wants the picture either way).
+static constexpr uint32_t FRAME_FLAG_SKIP_STATIC = 0x40u;
 
 static UINT SplitXFromFlags(uint32_t reserved, UINT width)
 {
@@ -1438,6 +1568,20 @@ static void CloseHdrResources();
 
 static VideoHeader g_video_options = {};
 static uint32_t g_last_eval_result = 0;
+// Static-frame skipping (FRAME_FLAG_SKIP_STATIC): how many frames were skipped
+// since the last change, and whether the "idle" line was already written for
+// this stretch (one line per idle stretch, not per frame).
+//
+// Skipping must have no visual price, so a frame whose OUTPUT would change is
+// never skipped even on a frozen screen: a bypass toggle (NR on/off), a wipe
+// move, a fresh feature (RNSZ), a re-opened present window. The last output
+// state is kept to spot those transitions.
+static uint32_t g_skip_static_count = 0;
+static bool     g_skip_static_logged = false;
+static bool     g_last_out_bypass = false;
+static bool     g_last_out_split_on = false;
+static uint32_t g_last_out_split_x = 0;
+static bool     g_force_next_frame = false;   // render one frame even if unchanged
 static bool g_live_force = false;   // --live: treat the stream as unbounded even with frame_count > 0
 
 // Shared input frame (SHMI). Read-only view of the client's named section:
@@ -1470,6 +1614,11 @@ static D3D12_RESOURCE_BARRIER Transition(ID3D12Resource *r, D3D12_RESOURCE_STATE
                                          D3D12_RESOURCE_STATES after);
 
 static HWND                       g_present_hwnd;
+// Where the overlay window belongs on the virtual desktop: the origin of the
+// chosen monitor (the client puts it in NS_WINDOW_POS as "x,y"). Read on
+// every OpenPresent - a monitor switch restarts the worker anyway.
+static int                        g_present_x = 0;
+static int                        g_present_y = 0;
 static bool                       g_present_shown = false;      // visible right now (minimised target hides it)
 static bool                       g_present_revealed = false;   // the first Present already happened
 static RECT                       g_present_follow = {};   // where the target window was last seen
@@ -1528,6 +1677,21 @@ static LRESULT CALLBACK PresentWndProc(HWND w, UINT m, WPARAM wp, LPARAM lp)
 // The window lives on its own thread with its own message loop: the main thread
 // spends its life blocked in ReadExact on stdin and would never pump messages,
 // which Windows reports as a hung window after a few seconds.
+// NS_WINDOW_POS: where to put the overlay window, "x,y" in virtual-desktop
+// pixels. Without it the window was created at (0,0) - the primary monitor -
+// while the chosen monitor can sit at a nonzero origin: the picture landed on
+// the wrong screen (#28, #33).
+static void ReadPresentOrigin()
+{
+    g_present_x = 0;
+    g_present_y = 0;
+    char buf[32] = {};
+    const DWORD got = GetEnvironmentVariableA("NS_WINDOW_POS", buf, sizeof(buf));
+    if (got == 0 || got >= sizeof(buf)) return;
+    int x = 0, y = 0;
+    if (sscanf_s(buf, "%d,%d", &x, &y) == 2) { g_present_x = x; g_present_y = y; }
+}
+
 static DWORD WINAPI PresentWindowThread(LPVOID)
 {
     WNDCLASSEXW wc = {};
@@ -1543,7 +1707,7 @@ static DWORD WINAPI PresentWindowThread(LPVOID)
     g_present_hwnd = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT,
         wc.lpszClassName, L"NeuralScreen", WS_POPUP,
-        0, 0, static_cast<int>(g_present_w), static_cast<int>(g_present_h),
+        g_present_x, g_present_y, static_cast<int>(g_present_w), static_cast<int>(g_present_h),
         nullptr, nullptr, wc.hInstance, nullptr);
     if (g_present_hwnd == nullptr)
     {
@@ -1599,6 +1763,7 @@ static bool OpenPresent(UINT width, UINT height, uint32_t flags)
     }
     g_present_w = width;
     g_present_h = height;
+    ReadPresentOrigin();
     g_present_capturable = (flags & WINDOW_FLAG_CAPTURABLE) != 0;
     g_present_state = 0;
     g_present_thread = CreateThread(nullptr, 0, PresentWindowThread, nullptr, 0, &g_present_tid);
@@ -3139,14 +3304,18 @@ static bool EnsureCaptureDevice()
     IDXGIFactory1 *factory = nullptr;
     if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void **)&factory)))
     { Log("[cap] DXGI factory failed"); return false; }
-    // Adapter 0 unless NS_GPU says otherwise: the display normally hangs off
-    // the first adapter, and the capture has to be on the same card as the
-    // network (the frame crosses to D3D12 through a shared handle).
-    const int want = SelectedAdapterIndex();
+    // The adapter the network landed on - NOT the raw NS_GPU. The capture has
+    // to be on the same card as the network, because the frame crosses to
+    // D3D12 through a shared handle and a shared handle does not cross
+    // adapters. Reading NS_GPU here meant that an index the network had
+    // REJECTED (a hybrid laptop's iGPU at index 0, which is also the shipped
+    // default) still got the capture: the network on the 4090, the capture
+    // on the integrated chip, and nothing on screen (issue #34).
+    const int want = ActiveAdapterIndex();
     IDXGIAdapter1 *adapter = nullptr;
     if (FAILED(factory->EnumAdapters1(want >= 0 ? (UINT)want : 0, &adapter)))
     { Log("[cap] no adapter %d", want >= 0 ? want : 0); factory->Release(); return false; }
-    if (want >= 0) Log("[cap] adapter %d selected by NS_GPU", want);
+    if (want >= 0) Log("[cap] adapter %d, the one the network runs on", want);
     D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_0;
     const HRESULT hr = D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr,
                                          D3D11_CREATE_DEVICE_BGRA_SUPPORT, &fl, 1,
@@ -3158,6 +3327,44 @@ static bool EnsureCaptureDevice()
 }
 
 static void CloseWgc();
+
+// NS_OUTPUT: which OUTPUT of the chosen adapter to duplicate, by DXGI device
+// name ("\\\\.\\DISPLAY2"). Without it the worker duplicated output 0 - on a
+// multi-monitor machine that is the primary one, while the client was built
+// for the chosen monitor and showed an empty picture on it (#28, #33). The
+// name is the identity: it survives a reorder, an unplug or a dock change.
+// A name that is not on this adapter falls back to output 0 with a line in
+// the log - the capture is never taken down over it.
+static IDXGIOutput *EnumCaptureOutput(IDXGIAdapter1 *adapter)
+{
+    wchar_t want[64] = {};
+    const DWORD got = GetEnvironmentVariableW(L"NS_OUTPUT", want, 64);
+    UINT index = 0;
+    if (got > 0 && got < _countof(want))
+    {
+        bool found = false;
+        for (UINT i = 0; ; ++i)
+        {
+            IDXGIOutput *candidate = nullptr;
+            // Any failure ends the search, not just NOT_FOUND: on another
+            // error EnumOutputs leaves the pointer null and the GetDesc
+            // below would dereference it (audit, cpp-worker).
+            if (FAILED(adapter->EnumOutputs(i, &candidate)) || candidate == nullptr) break;
+            DXGI_OUTPUT_DESC desc = {};
+            candidate->GetDesc(&desc);
+            const bool match = wcscmp(desc.DeviceName, want) == 0;
+            candidate->Release();
+            if (match) { index = i; found = true; break; }
+        }
+        if (found)
+            Log("[dda] output %u selected by NS_OUTPUT (%ls)", index, want);
+        else
+            Log("[dda] NS_OUTPUT=%ls is not an output of this adapter - using output 0", want);
+    }
+    IDXGIOutput *output = nullptr;
+    if (FAILED(adapter->EnumOutputs(index, &output))) return nullptr;
+    return output;
+}
 
 static bool OpenDda(UINT w, UINT hgt)
 {
@@ -3171,12 +3378,45 @@ static bool OpenDda(UINT w, UINT hgt)
     if (FAILED(hr)) { Log("[dda] factory failed 0x%08X", hr); return false; }
     // Same adapter as the capture device, or DuplicateOutput would be asked
     // to duplicate an output that belongs to another card.
-    const int want_dda = SelectedAdapterIndex();
+    const int want_dda = ActiveAdapterIndex();
     IDXGIAdapter1 *adapter = nullptr;
     if (FAILED(factory->EnumAdapters1(want_dda >= 0 ? (UINT)want_dda : 0, &adapter)))
     { Log("[dda] no adapter %d", want_dda >= 0 ? want_dda : 0); factory->Release(); return false; }
-    IDXGIOutput *output = nullptr;
-    if (FAILED(adapter->EnumOutputs(0, &output))) { Log("[dda] no output"); adapter->Release(); factory->Release(); return false; }
+    IDXGIOutput *output = EnumCaptureOutput(adapter);
+    if (output == nullptr) { Log("[dda] no output"); adapter->Release(); factory->Release(); return false; }
+    // Is the captured display in HDR? The network is trained on SDR and the
+    // result on an HDR desktop reads as "everything is too bright, and the
+    // sliders do nothing" (issue #27 territory; a user asked for this notice
+    // in issue #33). Asked of the OUTPUT being captured, not of the registry:
+    // the registry answer is per monitor and says nothing about which one is
+    // on screen here.
+    {
+        IDXGIOutput6 *out6 = nullptr;
+        if (SUCCEEDED(output->QueryInterface(__uuidof(IDXGIOutput6), (void **)&out6)))
+        {
+            DXGI_OUTPUT_DESC1 d1 = {};
+            if (SUCCEEDED(out6->GetDesc1(&d1)))
+            {
+                // Every PQ (ST.2084) colour space counts, not just the one
+                // a display most commonly reports: full and studio range,
+                // RGB and YCbCr. Matching a single value would miss an HDR
+                // display that reports one of the others - a false NEGATIVE,
+                // which is the harmless direction but still wrong.
+                //
+                // The raw number is logged either way, so a case this list
+                // does not cover can be settled from a user's log instead of
+                // by guesswork.
+                const bool hdr =
+                    d1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 ||
+                    d1.ColorSpace == DXGI_COLOR_SPACE_RGB_STUDIO_G2084_NONE_P2020 ||
+                    d1.ColorSpace == DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020 ||
+                    d1.ColorSpace == DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_TOPLEFT_P2020;
+                Log("[dda] output colour space %d%s", (int)d1.ColorSpace,
+                    hdr ? " - HDR IS ON for the captured display" : "");
+            }
+            out6->Release();
+        }
+    }
     IDXGIOutput1 *output1 = nullptr;
     if (FAILED(output->QueryInterface(__uuidof(IDXGIOutput1), (void **)&output1)))
     { Log("[dda] no Output1"); output->Release(); adapter->Release(); factory->Release(); return false; }
@@ -4393,6 +4633,12 @@ static int RunVideo()
                 CloseMotionScaler();
                 CloseDda();
                 CloseGray();
+                // The Spout2 sender too: it holds a D3D11 device, a context
+                // and a 4K shared texture with an NT handle, and it was the
+                // one subsystem left to the process exit while everything
+                // around it was torn down explicitly (audit). Safe when the
+                // bridge was never enabled - every pointer is null.
+                SpoutBridgeShutdown();
                 return 0;
             }
             Log("[video] truncated frame %u", frame); return 5;
@@ -4451,6 +4697,7 @@ static int RunVideo()
             warmup_done = (h.feature == nullptr);   // only warm a real NR feature
             VideoResizeAck ack = { RESIZE_ACK_MAGIC, 1u, static_cast<uint32_t>(rr), 0u, fh.pts };
             if (!WriteExact(stdout, &ack, sizeof(ack))) return 10;
+            g_force_next_frame = true;   // the new setting must be shown on the next frame
             Log("[video] RNSZ applied: feature ready at %ux%u", rc.width, rc.height);
             continue;
         }
@@ -4508,6 +4755,7 @@ static int RunVideo()
             }
             else
                 ok = OpenPresent(wc.width, wc.height, wc.flags) ? 1u : 0u;
+            if (ok) g_force_next_frame = true;   // a fresh window gets a picture at once
             VideoWindowAck ack = { WINDOW_ACK_MAGIC, ok, 0u, 0u, wc.pts };
             if (!WriteExact(stdout, &ack, sizeof(ack))) return 10;
             continue;
@@ -4569,6 +4817,7 @@ static int RunVideo()
             uint32_t ok = 0;
             if (hwnd == nullptr) { CloseWgc(); ok = 1; }
             else ok = OpenWgc(hwnd) ? 1u : 0u;
+            if (ok) g_force_next_frame = true;   // the new source shows at once
             // The size the capture really produces - physical pixels, which is
             // what the client has to size its textures for.
             VideoWgcAck ack = { WGC_ACK_MAGIC, ok, ok ? g_dda_w : 0u,
@@ -4596,6 +4845,60 @@ static int RunVideo()
                 if (!WriteExact(stdout, &empty, sizeof(empty))) return 10;
                 continue;
             }
+            if (!got)
+            {
+                // No new frame: the desktop did not change (DDA timeout) or the
+                // window did not redraw (WGC empty pool). Re-running the network
+                // on the stale texture is pure waste - an idle desktop used to be
+                // a full load. The client asks for the skip in bit 6 and does not
+                // need pixels this frame; an empty OUT1 is the "nothing changed"
+                // answer. WANT_PIXELS wins: a screenshot or a recording wants the
+                // picture even when it did not change. So does anything that
+                // changes what the picture WOULD show - see g_last_out_*.
+                const bool want_bypass = (fh.reserved & FRAME_FLAG_BYPASS) != 0 ||
+                                         h.feature == nullptr;
+                const bool split_on = (fh.reserved & FRAME_FLAG_SPLIT) != 0;
+                const UINT split_cw = v.upscale ? v.full_w : v.w;
+                const uint32_t split_x = split_on
+                    ? SplitXFromFlags(fh.reserved, split_cw) : 0u;
+                const bool out_changed = want_bypass != g_last_out_bypass ||
+                                         split_on != g_last_out_split_on ||
+                                         (split_on && split_x != g_last_out_split_x) ||
+                                         g_force_next_frame;
+                const bool skip = (fh.reserved & FRAME_FLAG_SKIP_STATIC) != 0 &&
+                                  (fh.reserved & FRAME_FLAG_WANT_PIXELS) == 0 &&
+                                  !out_changed;
+                if (skip)
+                {
+                    if (!g_skip_static_logged)
+                    {
+                        g_skip_static_logged = true;
+                        Log("[skip] no new frame - the network is idle until the screen changes");
+                    }
+                    ++g_skip_static_count;
+                    // The picture itself does not change, but in one-window mode
+                    // the frame it sits in can still move - keep the overlay on it.
+                    FollowCapturedWindow();
+                    ReassertPresentTopmost();
+                    VideoResultHeader idle = { OUT_MAGIC, fh.index, 1u, 0u, g_last_eval_result, fh.pts };
+                    if (!WriteExact(stdout, &idle, sizeof(idle))) return 10;
+                    continue;
+                }
+            }
+            else if (g_skip_static_count != 0)
+            {
+                Log("[skip] the screen changed - %u frames skipped, the network resumes",
+                    g_skip_static_count);
+                g_skip_static_count = 0;
+                g_skip_static_logged = false;
+            }
+            // This frame is being processed: remember what it will show, so the
+            // next unchanged frame can tell whether anything differs.
+            g_last_out_bypass = (fh.reserved & FRAME_FLAG_BYPASS) != 0 || h.feature == nullptr;
+            g_last_out_split_on = (fh.reserved & FRAME_FLAG_SPLIT) != 0;
+            g_last_out_split_x = g_last_out_split_on
+                ? SplitXFromFlags(fh.reserved, v.upscale ? v.full_w : v.w) : 0u;
+            g_force_next_frame = false;
             const double t_up = PhaseNow();
             const bool up_ok = UploadMotionOnly(v, mv_ptr,
                                   (fh.reserved & FRAME_FLAG_MOTION_SMALL) != 0 && g_motion_w != 0);
@@ -4712,6 +5015,7 @@ static int RunVideo()
     CloseMotionScaler();
     CloseDda();
     CloseGray();
+    SpoutBridgeShutdown();
     return 0;
 }
 
@@ -4955,8 +5259,10 @@ static int Serve(DWORD game_pid)
         }
     }
     // Normal exit: release the NGX resources, otherwise a quick worker restart
-    // conflicts with the leftovers (exit 127 / a hang on frame 0).
+    // conflicts with the leftovers (exit 127 / a hang on frame 0). The Spout2
+    // sender goes the same way - a DX11 device and a 4K shared texture.
     CleanupVideoNgx();
+    SpoutBridgeShutdown();
     return 0;
 }
 

@@ -66,10 +66,15 @@ def paint(menu):
 
 
 def click(menu, item):
+    # Near the top of the row, not at its centre: a hint under a toggle makes
+    # the row taller and the hint is a caption, not a hit target - a stray
+    # click on the explanation must not flip a switch that restarts the
+    # worker. The centre of a two-line hinted row lands in the caption.
+    pos = (item.rect.x + item.rect.w // 2, item.rect.y + 2)
     out = menu.handle_event(pygame.event.Event(
-        pygame.MOUSEBUTTONDOWN, {"pos": item.rect.center, "button": 1}))
+        pygame.MOUSEBUTTONDOWN, {"pos": pos, "button": 1}))
     menu.handle_event(pygame.event.Event(
-        pygame.MOUSEBUTTONUP, {"pos": item.rect.center, "button": 1}))
+        pygame.MOUSEBUTTONUP, {"pos": pos, "button": 1}))
     return out
 
 
@@ -223,9 +228,7 @@ def main() -> int:
             out = click(menu, opts[1])
             if out != [("profile", "Strong / Cinematic")]:
                 failures.append(f"profile pick: expected Strong, got {out}")
-    for key, want in (("windows", [("capture", None)]),
-                      ("fullscreen", [("button", "window_mode")]),
-                      ("screenshot", [("button", "screenshot")]),
+    for key, want in (("screenshot", [("button", "screenshot")]),
                       ("record", [("button", "record")])):
         btn = find(menu, "button", key)
         if btn is None:
@@ -234,9 +237,48 @@ def main() -> int:
         out = click(menu, btn)
         if out != want:
             failures.append(f"button {key}: expected {want}, got {out}")
-        if key == "windows":
-            if menu.page != "windows":
-                failures.append("the windows button should open the windows page")
+
+    # 3b. The source segment carries what the Actions buttons used to: the
+    #     left cell returns to the whole screen (nothing to do when it is
+    #     already there), the right cell opens the window list.
+    seg = find(menu, "segmented", "source")
+    if seg is None:
+        failures.append("no source segment on the main page")
+    else:
+        cells = seg.extra.get("cells") or []
+        if len(cells) != 2:
+            failures.append(f"the source segment has {len(cells)} cells")
+        else:
+            out = menu.handle_event(pygame.event.Event(
+                pygame.MOUSEBUTTONDOWN,
+                {"pos": cells[0].center, "button": 1}))
+            menu.handle_event(pygame.event.Event(
+                pygame.MOUSEBUTTONUP, {"pos": cells[0].center, "button": 1}))
+            if out != []:
+                failures.append(f"whole screen while already there: {out}")
+            out = menu.handle_event(pygame.event.Event(
+                pygame.MOUSEBUTTONDOWN,
+                {"pos": cells[1].center, "button": 1}))
+            menu.handle_event(pygame.event.Event(
+                pygame.MOUSEBUTTONUP, {"pos": cells[1].center, "button": 1}))
+            if out != [("capture", None)] or menu.page != "windows":
+                failures.append(f"one window: expected the window page, got {out}")
+        # And from window mode the left cell is the way back out.
+        menu.page = "main"
+        menu.state["window_mode"] = True
+        menu.layout(3840, 2160)
+        paint(menu)
+        seg = find(menu, "segmented", "source")
+        cells = (seg.extra.get("cells") or []) if seg else []
+        if cells:
+            out = menu.handle_event(pygame.event.Event(
+                pygame.MOUSEBUTTONDOWN, {"pos": cells[0].center, "button": 1}))
+            menu.handle_event(pygame.event.Event(
+                pygame.MOUSEBUTTONUP, {"pos": cells[0].center, "button": 1}))
+            if out != [("button", "window_mode")]:
+                failures.append(f"leaving window mode: got {out}")
+        menu.state["window_mode"] = False
+        menu.page = "windows"
 
     # 4. The windows page: a window row and the back button.
     menu.layout(3840, 2160)
@@ -268,6 +310,25 @@ def main() -> int:
             failures.append(f"exit: expected [('button', 'exit')], got {out}")
 
     # 6. The sliders emit their commands.
+    #
+    # The resolution slider only exists while Boost is on: with Boost off the
+    # network runs at the full frame size whatever the slider says, and the
+    # output frames come back bit-identical at every position of it
+    # (measured, 12.09). A control that answers and does nothing is worse
+    # than no control, so it is simply not laid out then.
+    menu.layout(3840, 2160)
+    paint(menu)
+    if find(menu, "slider", "nr_res") is not None:
+        failures.append("the resolution slider is laid out with Boost off, "
+                        "where every position of it does the same thing")
+    boost = find(menu, "toggle", "boost")
+    if boost is None:
+        failures.append("no Boost switch on the main page")
+    else:
+        out = click(menu, boost)
+        if out != [("toggle", "boost")]:
+            failures.append(f"boost: expected [('toggle', 'boost')], got {out}")
+    menu.set_state({"nr_small": True, "work_size": "2496x1404"})
     menu.layout(3840, 2160)
     paint(menu)
     for key, want_prefix in (("intensity", "param"), ("split", "split"),

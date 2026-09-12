@@ -170,11 +170,17 @@ class OverlayMenu:
             # knows the screen size. The slider runs one step past it, and that
             # last step means "the whole screen" - the reduced mode off.
             "work_scale_cap": 1.0,
+            # The bottom of the resolution slider (WORK_SCALE_MIN), sent by
+            # main so a config value below the range cannot misplace the knob.
+            "work_scale_min": 0.1,
             "nr_small": False,
             "screen_size": "",
             "profile": "",
             "profiles": [],
             "params": {},
+            # The profile's own numbers, drawn as a tick under each
+            # parameter slider (see _draw_slider).
+            "param_defaults": {},
             "preset_active": False,
             "recording": False,
             "work_size": "",
@@ -182,6 +188,13 @@ class OverlayMenu:
             "rec_seconds": 0.0,
             "rec_indicator": True,
             "screenshot_dir": "",
+            # The Spout2 bridge flag (RECORDING section). It was missing here
+            # in v1.6.0, so set_state dropped it in silence and the toggle
+            # always drew as off while the action behind it fired normally.
+            "spout": False,
+            # Skip static frames (processing section): no new capture frame -
+            # the network idles instead of re-running.
+            "skip_static": True,
             "open_on_start": True,
             "split": 0.0,
             # Which card this is and whether NR runs on it. gpu_ok:
@@ -191,6 +204,11 @@ class OverlayMenu:
             "window_mode": False,
             "monitor": "0",
             "monitors": [],
+            # The current monitor's DXGI devicename - carried so a log or a
+            # future control can name the exact display the capture is on.
+            "monitor_devicename": "",
+            # True while the network is idling on an unchanged screen.
+            "idle": False,
             "gpu": "0",
             "gpus": [],
             "autostart": False,
@@ -206,9 +224,7 @@ class OverlayMenu:
         # visible.
         self.stats: dict = {}
         self.items: list[Item] = []
-        self._font = font_loader(self._u(FONT_SIZE))
-        self._title_font = font_loader(self._u(TITLE_SIZE))
-        self._small_font = font_loader(self._u(SMALL_SIZE))
+        self._build_fonts()
         # The language list shows every language in its own script (Русский,
         # 中文, 日本語, 한국어). The current UI font cannot render CJK - the
         # loader picks the font by the language, so dedicated CJK fonts are
@@ -304,9 +320,7 @@ class OverlayMenu:
         if abs(value - self.user_scale) < 0.01:
             return
         self.user_scale = value
-        self._font = self._load_font(self._u(FONT_SIZE))
-        self._title_font = self._load_font(self._u(TITLE_SIZE))
-        self._small_font = self._load_font(self._u(SMALL_SIZE))
+        self._build_fonts()
 
     def toggle(self) -> bool:
         self.visible = not self.visible
@@ -338,6 +352,37 @@ class OverlayMenu:
             elif k in self.state:
                 self.state[k] = v
 
+    def _load(self, size: int, mono: bool = False):
+        """One face, through the loader the caller handed us.
+
+        The live app passes display._load_font, which takes the role; the
+        offscreen renderers and the tests pass a one-argument callable, and
+        those get the proportional face for everything - which is what they
+        had before the split.
+        """
+        try:
+            return self._load_font(size, mono=mono)
+        except TypeError:
+            return self._load_font(size)
+
+    def _build_fonts(self) -> None:
+        """The menu's faces, built together.
+
+        Called from __init__ and after every scale/language change - the
+        sizes and the language both change what the loader returns. Which
+        faces those are lives in fonts.py; this only asks for them.
+
+        Two roles, as fonts.py divides them: the proportional face carries
+        language - titles, labels, hints, buttons - and the monospaced one
+        carries readings, where a fixed advance keeps digits from dancing
+        sideways as they change.
+        """
+        self._font = self._load(self._u(FONT_SIZE))
+        self._title_font = self._load(self._u(TITLE_SIZE))
+        self._small_font = self._load(self._u(SMALL_SIZE))
+        self._mono = self._load(self._u(FONT_SIZE), mono=True)
+        self._mono_small = self._load(self._u(SMALL_SIZE), mono=True)
+
     def _reload_fonts(self) -> None:
         """Recreate the fonts after a language switch.
 
@@ -345,9 +390,7 @@ class OverlayMenu:
         Consolas renders them as tofu boxes. The loader picks the font by
         the language, so the cached font objects must be rebuilt.
         """
-        self._font = self._load_font(self._u(FONT_SIZE))
-        self._title_font = self._load_font(self._u(TITLE_SIZE))
-        self._small_font = self._load_font(self._u(SMALL_SIZE))
+        self._build_fonts()
 
     def title_center(self) -> tuple[int, int]:
         """The centre of the title bar in screen coordinates.
@@ -450,53 +493,80 @@ class OverlayMenu:
             cy += sec_h
 
         def slider(key: str, lo: float, hi: float, value: float,
-                   label: str, hint: str = "", value_text: str = "") -> None:
+                   label: str, hint: str = "", value_text: str = "",
+                   mark: float | None = None,
+                   ends: tuple | None = None) -> None:
             nonlocal cy
             items.append(Item("slider", key,
                               pygame.Rect(pad, cy, inner_w, label_h + ctrl_h),
                               lo=lo, hi=hi, value=value,
                               extra={"label": label, "hint": hint,
+                                     "mark": mark, "ends": ends,
                                      "value_text": value_text,
                                      "label_h": label_h}))
-            cy += label_h + ctrl_h + (self._u(SMALL_SIZE) + 4 if hint else 0) + gap
+            # End captions take the same line a hint would: a slider has
+            # one or the other, never both (they would overprint).
+            cy += label_h + ctrl_h + (self._u(SMALL_SIZE) + 4
+                                      if (hint or ends) else 0) + gap
 
         def choice(key: str, label: str, current: str, options: list,
-                   labels: list | None = None) -> None:
+                   labels: list | None = None, hint: str = "") -> None:
             nonlocal cy
+            extra = {"label": label, "current": current,
+                     "labels": list(labels or options),
+                     "label_h": label_h}
+            hint_h = 0
+            if hint:
+                extra["hint"] = hint
+                line_h = self._small_font.get_height() + self._u(4)
+                # The last line carries no trailing space of its own: with it
+                # a hinted control sat further from its neighbour than two
+                # plain ones did.
+                hint_h = (self._u(8) + (str(hint).count("\n") + 1) * line_h
+                          - self._u(4))
             items.append(Item("choice", key,
-                              pygame.Rect(pad, cy, inner_w, label_h + ctrl_h),
+                              pygame.Rect(pad, cy, inner_w, label_h + ctrl_h + hint_h),
                               payload=list(options),
-                              extra={"label": label, "current": current,
-                                     "labels": list(labels or options),
-                                     "label_h": label_h}))
-            cy += label_h + ctrl_h + gap
+                              extra=extra))
+            cy += label_h + ctrl_h + hint_h + gap
 
         def segmented(key: str, label: str, current: str, options: list,
-                      labels: list | None = None) -> None:
+                      labels: list | None = None, height: int | None = None) -> None:
             """A two- or three-way switch instead of a drop-down list.
 
             A list for the sake of two values is an extra click and extra
             expand/collapse machinery; here both options are visible at once.
             """
             nonlocal cy
-            seg_w = min(inner_w - self._u(150), self._u(60) * len(options) + self._u(60))
-            rect = pygame.Rect(pad + inner_w - seg_w, cy, seg_w, ctrl_h)
+            if label:
+                seg_w = min(inner_w - self._u(150),
+                            self._u(60) * len(options) + self._u(60))
+            else:
+                # No label, no reason to squeeze: the captions are the
+                # control. "Window mode" ran off the panel at the old width.
+                seg_w = inner_w
+            seg_h = height or ctrl_h
+            rect = pygame.Rect(pad + inner_w - seg_w, cy, seg_w, seg_h)
             items.append(Item("segmented", key, rect, payload=list(options),
                               extra={"label": label, "current": current,
                                      "labels": list(labels or options)}))
-            cy += ctrl_h + gap
+            cy += seg_h + gap
 
-        def toggle(key: str, label: str, on: bool, hint: str = "") -> None:
+        def toggle(key: str, label: str, on: bool, hint: str = "",
+                   key_text: str = "") -> None:
             nonlocal cy
-            extra = {"label": label}
+            extra = {"label": label, "key_text": key_text}
             hint_h = 0
             if hint:
                 extra["hint"] = hint
                 # Multi-line hints: the Spout2 toggle explains two capture
                 # paths and does not fit one line at 1440p. The block is
-                # measured with the real font height.
+                # measured with the real font height, and the last line
+                # carries no trailing space of its own - with it a hinted
+                # control sat further from its neighbour than two plain ones.
                 line_h = self._small_font.get_height() + self._u(4)
-                hint_h = self._u(8) + (str(hint).count("\n") + 1) * line_h
+                hint_h = (self._u(8) + (str(hint).count("\n") + 1) * line_h
+                          - self._u(4))
             items.append(Item("toggle", key,
                               pygame.Rect(pad, cy, inner_w, ctrl_h + hint_h),
                               value=1.0 if on else 0.0,
@@ -539,7 +609,8 @@ class OverlayMenu:
             gpus = self.state.get("gpus") or []
             if len(gpus) > 1:
                 choice("gpu", s.get("gpu", "GPU"),
-                       str(self.state.get("gpu", gpus[0])), gpus)
+                       str(self.state.get("gpu", gpus[0])), gpus,
+                       hint=s.get("gpu_hint", ""))
             # The screenshot folder: a plain button that opens the folder
             # picker (issue #20). The current value is shown as the caption
             # so the user sees what is configured.
@@ -564,6 +635,14 @@ class OverlayMenu:
                    bool(self.state.get("rec_indicator", True)))
 
             section(s["sec_behaviour"])
+            # Idle screens: no new frame arrives (the desktop did not change,
+            # the window did not redraw) - the network waits instead of
+            # chewing the same picture again. No visual price, a real one on
+            # an idle desktop. Set once and forgotten, which is why it lives
+            # here and not on the main page.
+            toggle("skip_static", s.get("skip_static", "Skip static frames"),
+                   bool(self.state.get("skip_static", True)),
+                   hint=s.get("skip_static_hint", ""))
             toggle("open_on_start", s["open_on_start"],
                    bool(self.state.get("open_on_start")))
             toggle("autostart", s.get("autostart", "Autostart with Windows"),
@@ -581,7 +660,10 @@ class OverlayMenu:
                                          "key": self.hotkeys.get(cmd, "—"),
                                          "capturing": self.capturing == cmd}))
                 cy += field_h + self._u(6)
-            cy += gap
+            # The caption belongs to the rows above it, not to the section
+            # below: a full row gap on both sides left 96 px of nothing
+            # before APPEARANCE.
+            cy += self._u(8)
             self._hint_rel = pygame.Rect(pad, cy, inner_w,
                                          self._u(SMALL_SIZE) + self._u(6))
             cy += self._hint_rel.h + gap
@@ -617,38 +699,85 @@ class OverlayMenu:
             section(s["sec_processing"])
             nr_on = bool(self.state.get("nr"))
             hk_nr = self.hotkeys.get("toggle", "")
-            toggle("nr", f"{s['nr_on'] if nr_on else s['nr_off']}   {hk_nr}".rstrip(),
-                   nr_on)
+            toggle("nr", s["nr_on"] if nr_on else s["nr_off"], nr_on,
+                   key_text=hk_nr)
 
-            # The resolution the network runs at sits right under the
-            # DLSS 5 switch, not in a section of its own further down:
-            # it is the one control that trades quality for frames, and
-            # users did not connect it with the network at all (user
-            # report, 11.09).
-            section(s["sec_resolution"])
-            # One slider, not a toggle plus a slider. The two used to be
-            # separate, and with the toggle off the slider still moved, still
-            # showed a changing resolution and changed the picture by exactly
-            # nothing - measured, bit for bit. A control that answers and does
-            # nothing is worse than no control.
-            cap = float(self.state.get("work_scale_cap", 1.0))
-            full = not bool(self.state.get("nr_small"))
-            # The extra step past the cap is "the whole screen". Below the cap
-            # every position is a different resolution; above it they would all
-            # be the same one, so there is exactly one position up there.
-            pos = cap + 0.05 if full else float(self.state.get("work_scale", cap))
-            if full:
-                shown = str(self.state.get("screen_size")
-                            or self.stats.get("resolution") or "")
-                value_text = f"{shown} · {s['nr_res_full']}" if shown else s["nr_res_full"]
-            else:
-                value_text = str(self.state.get("work_size") or f"{pos:.2f}")
-            # The lower bound follows WORK_SCALE_MIN (0.1), not a hardcoded
-            # 0.30: a config value below the slider range would put the knob
-            # at the bottom while the label shows a different resolution.
-            lo = float(self.state.get("work_scale_min", 0.1))
-            slider("nr_res", lo, cap + 0.05, pos, s["nr_res"],
-                   hint=s["nr_res_hint"], value_text=value_text)
+            # Boost: the network runs at a reduced resolution and the detail
+            # comes back off the native frame (the matched residual
+            # composite). It sits directly under the DLSS 5 switch because it
+            # is the same subject - how hard the network works - and because
+            # nobody found it where it was.
+            #
+            # Measured on a 5070 Ti at 4K, 12.09: the network costs 16.0 ms
+            # against 5.0-7.3 ms, the whole program runs 45.7 -> 72.6 fps at
+            # 0.65, and at 1:1 on text, a game scene and photographic content
+            # the difference is not visible. The residual is what makes that
+            # true: without it the same setting is visibly soft.
+            boost = bool(self.state.get("nr_small"))
+            toggle("boost", s["boost"], boost, hint=s["boost_hint"])
+
+            # The resolution the network runs at - only while Boost is on.
+            #
+            # Without Boost this slider changes nothing whatsoever: the
+            # network runs at the full frame size no matter where the knob
+            # is, and the output frames come back bit-identical at every
+            # position (measured on four real 4K frames, 12.09). That is why
+            # the two used to be one control, with the top step standing in
+            # for "off" - a slider that answers and does nothing is worse
+            # than no slider. The switch above carries that meaning now, so
+            # the slider carries only the resolution, and it is simply not on
+            # screen when it would be inert.
+            if boost:
+                # No section heading of its own: the slider belongs to the
+                # switch above it, and "PROCESSING / Boost / RESOLUTION /
+                # Resolution the network runs at" says the same word three
+                # times before saying anything.
+                # The top of the range is the NGX cap where one binds (0.65
+                # on a 4K screen, where 2560x1440 is reached) and the whole
+                # source where it does not - on 1440p and below the scale
+                # runs all the way to 1.00.
+                cap = float(self.state.get("work_scale_cap", 1.0))
+                pos = float(self.state.get("work_scale", cap))
+                # The size the network actually runs at. It used to say
+                # "3840x2160 - full" at the top, which is not true on a 4K
+                # screen: NGX is capped at 2560x1440 and the network never
+                # saw more than that (user, 12.09).
+                work = str(self.state.get("work_size") or "")
+                value_text = work if work else f"{pos:.2f}"
+                # The lower bound follows WORK_SCALE_MIN (0.1), not a
+                # hardcoded 0.30: a config value below the slider range would
+                # put the knob at the bottom while the label shows a
+                # different resolution.
+                lo = float(self.state.get("work_scale_min", 0.1))
+                # The ends replace the hint here: the trade is named at both
+                # ends, in the place where the choice is actually made.
+                slider("nr_res", lo, cap, pos, s["nr_res"],
+                       value_text=value_text,
+                       ends=(s.get("nr_res_low", ""), s.get("nr_res_high", "")))
+
+            # What is being processed - the first question anyone has, and
+            # until now the only one answered on another page. The segment
+            # sends what the Actions buttons used to send; the list of
+            # windows still opens on its own page.
+            section(s["sec_source"])
+            in_window = bool(self.state.get("window_mode"))
+            segmented("source", "", "window" if in_window else "fullscreen",
+                      ["fullscreen", "window"],
+                      labels=[s["mode_fullscreen"], s["mode_window"]],
+                      height=act_h)
+            # Which window, only in window mode. On the whole screen the
+            # source is the monitor, and the monitor is chosen on the
+            # settings page - naming it here as well was the same thing
+            # said twice (user, 12.09).
+            if in_window:
+                current = str(self.state.get("window_current") or "").split(": ", 1)
+                items.append(Item("info", "source_now",
+                                  pygame.Rect(pad, cy, inner_w, self._u(LABEL_H)),
+                                  extra={"label": (current[1] if len(current) > 1
+                                                   else s["mode_window"]),
+                                         "value": str(self.state.get("work_size")
+                                                      or "")}))
+                cy += self._u(LABEL_H) + gap
 
             # The profile and the four effect sliders are their own subject -
             # what the picture looks like, not how hard the network works.
@@ -656,10 +785,12 @@ class OverlayMenu:
             choice("profile", s["profile"], str(self.state.get("profile", "")),
                    list(self.state.get("profiles") or []))
             params = self.state.get("params") or {}
+            defaults = self.state.get("param_defaults") or {}
             for key in PARAM_KEYS:
                 lo = SKIN_MIN if key == "skin_structure" else PARAM_MIN
                 val = float(params.get(key, 0.0))
-                slider(key, lo, PARAM_MAX, val, s[key], value_text=f"{val:.2f}")
+                slider(key, lo, PARAM_MAX, val, s[key], value_text=f"{val:.2f}",
+                       mark=defaults.get(key))
             # Save / Delete preset: the user presets live in the same list
             # as the built-in profiles. Delete is only offered while a user
             # preset is active - the built-in profiles are not deletable.
@@ -689,9 +820,10 @@ class OverlayMenu:
             # together in one section, the footer keeps only Exit).
             bgap = self._u(BTN_GAP)
             bw = (inner_w - bgap) // 2
+            # Select window and Fullscreen left this section for the source
+            # segment above: picking what to process is not an action, it is
+            # a setting, and it belongs where the source is named.
             rows = (
-                (("windows", s["windows_btn"]),
-                 ("fullscreen", s["fullscreen"])),
                 (("screenshot", s["screenshot"]),
                  ("record", s["record_stop_short"] if self.state.get("recording")
                   else s["record"])),
@@ -704,7 +836,6 @@ class OverlayMenu:
                                       extra={"label": label,
                                              "filled": False}))
                 cy += act_h + self._u(8)
-            cy += pad - self._u(8)
 
         # The footer: actions with the hotkey printed underneath. "Collapse"
         # and "Exit" used to look equally harmless, even though one hides the
@@ -720,13 +851,12 @@ class OverlayMenu:
                                      "filled": False}))
             cy += act_h + pad
         else:
-            exit_h = self._u(EXIT_H)
+            # The name and nothing else, centred: the key and the
+            # explanation under it turned one button into a paragraph.
             items.append(Item("action", "exit",
-                              pygame.Rect(pad, cy, inner_w, exit_h),
-                              extra={"label": s["exit_full"],
-                                     "hotkey": self.hotkeys.get("quit", ""),
-                                     "note": s["exit_note"], "danger": True}))
-            cy += exit_h + pad
+                              pygame.Rect(pad, cy, inner_w, act_h),
+                              extra={"label": s["exit_full"], "danger": True}))
+            cy += act_h + pad
 
         # The content height is known. The panel may be shorter - then the
         # content scrolls: at 1080p a full panel took up almost the whole
@@ -794,9 +924,12 @@ class OverlayMenu:
             if it.kind == "choice":
                 # The select field is computed here rather than at draw time:
                 # the layout of an expanded list is built before the first
-                # draw.
+                # draw. The strip is the CONTROL, not the whole row: a row
+                # with a hint is taller, and the strip must stay the height
+                # of the field or the value text and the list would centre
+                # on the hint below it.
                 it.extra["strip"] = pygame.Rect(
-                    it.rect.x, it.rect.y + label_h, it.rect.w, it.rect.h - label_h)
+                    it.rect.x, it.rect.y + label_h, it.rect.w, self._u(CTRL_H))
         self.items = items
 
         # The entries of the expanded list. They lie on top of the rows below,
@@ -1040,7 +1173,14 @@ class OverlayMenu:
                 # config.
                 self.user_height = (None if self._max_scroll == 0
                                     else self.panel_rect.h)
-        elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+        elif (event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE
+                and not self.open_choice):
+            # One Esc closes what is on top. With a drop-down open that is
+            # the drop-down (handled in the branch below, which used to be
+            # unreachable - this branch matched first and shut the whole
+            # panel while someone was stepping down the language list).
+            # Every toolkit on this desktop behaves that way, and the
+            # comment on the branch below already promised it (audit).
             out.append(("button", "close"))
         elif event.type == pygame.KEYDOWN and self.open_choice:
             # The expanded list is keyboard-navigable: Up/Down move the
@@ -1128,6 +1268,16 @@ class OverlayMenu:
             return [("monitor", value)]
         if key == "gpu":
             return [("gpu", value)]
+        if key == "source":
+            # The same two commands the Actions buttons sent: back to the
+            # whole screen, or the window list page.
+            if value == "window":
+                self.page = "windows"
+                self.scroll = 0
+                self.capturing = None
+                return [("capture", None)]
+            return ([("button", "window_mode")]
+                    if self.state.get("window_mode") else [])
         if key == "window":
             return [("window", value)]
         return []
@@ -1147,27 +1297,25 @@ class OverlayMenu:
             self.state["split"] = value
             return [("split", value)]
         if item.key == "nr_res":
-            cap = float(self.state.get("work_scale_cap", 1.0))
-            # Reflect the choice straight away so the label does not lag a
-            # frame behind the knob; main confirms it on the way back.
-            self.state["nr_small"] = value <= cap + 1e-6
-            if self.state["nr_small"]:
-                self.state["work_scale"] = value
-                # The label shows the work resolution; recompute it here so it
-                # follows the knob while dragging (main confirms on the way
-                # back). The formula mirrors _work_size in main.py.
-                try:
-                    sw, sh = (int(x) for x in
-                              str(self.state.get("screen_size", "0x0")).split("x"))
-                    w = max(64, int(round(sw * value / 2) * 2))
-                    h = max(64, int(round(sh * value / 2) * 2))
-                    if w > 2560 or h > 1440:
-                        k = min(2560 / w, 1440 / h)
-                        w = max(64, int(round(w * k / 2) * 2))
-                        h = max(64, int(round(h * k / 2) * 2))
-                    self.state["work_size"] = f"{w}x{h}"
-                except Exception:
-                    pass
+            # The slider is only on screen while Boost is on, so every
+            # position means a work resolution now - there is no "off" step
+            # at the top any more.
+            self.state["work_scale"] = value
+            # The label shows the work resolution; recompute it here so it
+            # follows the knob while dragging (main confirms on the way
+            # back). The formula mirrors _work_size in main.py.
+            try:
+                sw, sh = (int(x) for x in
+                          str(self.state.get("screen_size", "0x0")).split("x"))
+                w = max(64, int(round(sw * value / 2) * 2))
+                h = max(64, int(round(sh * value / 2) * 2))
+                if w > 2560 or h > 1440:
+                    k = min(2560 / w, 1440 / h)
+                    w = max(64, int(round(w * k / 2) * 2))
+                    h = max(64, int(round(h * k / 2) * 2))
+                self.state["work_size"] = f"{w}x{h}"
+            except Exception:
+                pass
             return [("nr_res", value)]
         params = dict(self.state.get("params") or {})
         params[item.key] = value
@@ -1210,6 +1358,10 @@ class OverlayMenu:
             if item.kind == "toggle" and item.extra.get("hint") and \
                     pos[1] > item.rect.y + self._u(CTRL_H):
                 continue
+            if item.kind == "choice" and item.extra.get("hint"):
+                strip = item.extra.get("strip")
+                if strip is not None and pos[1] > strip.bottom:
+                    continue
             return item
         return None
 
@@ -1251,7 +1403,7 @@ class OverlayMenu:
         # 2026-09-08).
         ver = self.state.get("version") or ""
         if ver:
-            ver_text = self._small_font.render(f"v{ver}", True,
+            ver_text = self._mono_small.render(f"v{ver}", True,
                                                _rgb(self.c["muted"]))
             surface.blit(ver_text, (r.x + pad + title.get_width() + self._u(10),
                                     r.y + self._u(22)))
@@ -1298,6 +1450,7 @@ class OverlayMenu:
             {"toggle": self._draw_toggle, "slider": self._draw_slider,
              "choice": self._draw_choice, "button": self._draw_button,
              "segmented": self._draw_segmented,
+             "info": self._draw_info,
              "action": self._draw_action,
              "hotkey": self._draw_hotkey,
              # The header icons sit above the scroll area - we draw them after
@@ -1369,8 +1522,13 @@ class OverlayMenu:
         fps = st.get("fps")
         mode = (s["mode_window"] if self.state.get("window_mode")
                 else s["mode_fullscreen"])
+        # An idle network is not a stalled one: the loop still runs at full
+        # speed, it just does not process an unchanged screen. Saying so
+        # here is the only visible sign that the skip is doing its job.
+        idling = bool(self.state.get("idle"))
         rows = (
-            (("FPS", f"{fps:.1f}" if isinstance(fps, (int, float)) else "—"),
+            (("FPS", s.get("idle_short", "idle") if idling
+              else f"{fps:.1f}" if isinstance(fps, (int, float)) else "—"),
              ("RES", str(st.get("resolution", "—"))),
              ("MODE", mode)),
             (("FRAMES", str(st.get("frames", "—"))),
@@ -1383,8 +1541,8 @@ class OverlayMenu:
             y = rect.y + pad + ri * self._u(STAT_LINE_H)
             for ci, (name, value) in enumerate(row):
                 cx = rect.x + pad + ci * cell
-                k = self._small_font.render(name, True, _rgb(self.c["muted"]))
-                v = self._small_font.render(value, True, _rgb(self.c["accent"]))
+                k = self._mono_small.render(name, True, _rgb(self.c["muted"]))
+                v = self._mono_small.render(value, True, _rgb(self.c["accent"]))
                 surface.blit(k, (cx, y))
                 surface.blit(v, (cx + k.get_width() + self._u(6), y))
 
@@ -1461,25 +1619,53 @@ class OverlayMenu:
     def _draw_toggle(self, surface, item: Item, s: dict) -> None:
         on = item.value > 0.5
         size = self._u(20)
-        box = pygame.Rect(item.rect.x, item.rect.centery - size // 2, size, size)
+        # A switch, not a checkbox: the track is a pill and the knob sits at
+        # the end that matches the state. A square box could only be read by
+        # the word beside it, and this one is read from the corner of the eye
+        # while a game is running.
+        track_w = int(size * 1.8)
+        box = pygame.Rect(item.rect.x, item.rect.centery - size // 2,
+                          track_w, size)
         # A hint grows the row; the box and the label stay on the first
         # line - only the hint is pushed under them.
         hint = item.extra.get("hint")
         if hint:
             box.y = item.rect.y + (self._u(CTRL_H) - size) // 2
-        pygame.draw.rect(surface, _rgb(self.c["accent"] if on else self.c["surface"]), box,
-                         border_radius=self._u(4))
+        radius = size // 2
+        pygame.draw.rect(surface,
+                         _rgb(self.c["accent"] if on else self.c["surface"]),
+                         box, border_radius=radius)
         if not on:
             pygame.draw.rect(surface, _rgb(self.c["border"]), box, self._u(1),
-                             border_radius=self._u(4))
+                             border_radius=radius)
+        knob_r = max(3, size // 2 - self._u(3))
+        knob_x = (box.right - knob_r - self._u(3)) if on else (
+            box.x + knob_r + self._u(3))
+        pygame.draw.circle(surface,
+                           _rgb(self.c["bg"] if on else self.c["muted"]),
+                           (knob_x, box.centery), knob_r)
         text = item.extra.get("label")
         if not text:
             text = s["nr_on"] if on else s["nr_off"]
+        # The key caption is a reading, not language: it takes the
+        # monospaced face and sits after the label, so "Num1" here matches
+        # the key fields on the settings page.
+        key_text = item.extra.get("key_text") or ""
+        key_img = (self._mono.render(key_text, True, _rgb(self.c["muted"]))
+                   if key_text else None)
+        room = item.rect.right - box.right - self._u(12)
+        if key_img is not None:
+            room -= key_img.get_width() + self._u(12)
         label = self._clip(self._font, text,
                            _rgb(self.c["text"] if on else self.c["muted"]),
-                           item.rect.right - box.right - self._u(12))
+                           room)
         surface.blit(label, (box.right + self._u(12),
                              box.y + (box.h - label.get_height()) // 2))
+        if key_img is not None:
+            surface.blit(key_img,
+                         (box.right + self._u(12) + label.get_width()
+                          + self._u(12),
+                          box.y + (box.h - key_img.get_height()) // 2))
         if hint:
             y = box.bottom + self._u(8)
             for line in str(hint).split("\n"):
@@ -1494,7 +1680,7 @@ class OverlayMenu:
         # The value sits on the label line, right-aligned; a long localized
         # label (FR: "Résolution de traitement du réseau") would run under
         # it - clip the label to the space left of the value instead.
-        val = self._font.render(value_text, True, _rgb(self.c["accent"]))
+        val = self._mono.render(value_text, True, _rgb(self.c["accent"]))
         label_max = item.rect.right - val.get_width() - self._u(12) - item.rect.x
         label = self._clip(self._font, item.extra.get("label", item.key),
                            _rgb(self.c["text"]), label_max)
@@ -1510,8 +1696,35 @@ class OverlayMenu:
         fill = pygame.Rect(track.x, track.y, int(track.w * frac), track.h)
         pygame.draw.rect(surface, _rgb(self.c["accent"]), fill,
                          border_radius=self._u(SLIDER_H // 2 or 1))
+        # Where this value sits by default - the profile's own number, or
+        # zero for a slider that runs both ways. Without it "how far have I
+        # moved this" is a thing to remember rather than to see.
+        mark = item.extra.get("mark")
+        if mark is None and item.lo < 0.0 < item.hi:
+            mark = 0.0
+        if mark is not None and item.lo <= mark <= item.hi:
+            mx = int(track.x + ((mark - item.lo) / span) * track.w)
+            pygame.draw.rect(
+                surface, _rgb(self.c["muted"]),
+                pygame.Rect(mx - max(1, self._u(1)),
+                            track.y - self._u(3),
+                            max(2, self._u(2)),
+                            track.h + self._u(6)),
+                border_radius=max(1, self._u(1)))
         cx = int(track.x + frac * track.w)
         pygame.draw.circle(surface, _rgb(self.c["accent"]), (cx, track.centery), self._u(KNOB_R))
+        # What the two ends mean. A number like 0.35 says nothing about
+        # which way is more.
+        ends = item.extra.get("ends")
+        if ends:
+            left, right = ends
+            y = track.bottom + self._u(6)
+            if left:
+                surface.blit(self._small_font.render(
+                    left, True, _rgb(self.c["muted"])), (track.x, y))
+            if right:
+                img = self._small_font.render(right, True, _rgb(self.c["muted"]))
+                surface.blit(img, (track.right - img.get_width(), y))
         pygame.draw.circle(surface, _rgb(self.c["bg"]), (cx, track.centery), self._u(KNOB_R) // 2)
         item.extra["track"] = track
 
@@ -1525,8 +1738,14 @@ class OverlayMenu:
         label = self._font.render(item.extra.get("label", item.key), True, _rgb(self.c["text"]))
         surface.blit(label, (item.rect.x, item.rect.y))
 
-        strip = pygame.Rect(item.rect.x, item.rect.y + label_h,
-                            item.rect.w, item.rect.h - label_h)
+        # The field is the CONTROL, not the rest of the row. A row with a
+        # hint is taller, and taking "everything under the label" drew the
+        # box over the hint - and, worse, wrote that rectangle back into
+        # extra["strip"], which is the hit target: a click on the
+        # explanation opened the drop-down (audit). The layout already
+        # measured it; this only falls back to the same height.
+        strip = item.extra.get("strip") or pygame.Rect(
+            item.rect.x, item.rect.y + label_h, item.rect.w, self._u(CTRL_H))
         pygame.draw.rect(surface, _rgb(self.c["surface"]), strip,
                          border_radius=self._u(RADIUS // 2))
         pygame.draw.rect(surface, _rgb(self.c["border"]), strip, self._u(1),
@@ -1548,6 +1767,14 @@ class OverlayMenu:
                [(cx - size, cy - size // 2), (cx + size, cy - size // 2), (cx, cy + size)])
         pygame.draw.polygon(surface, _rgb(self.c["accent"]), pts)
         item.extra["strip"] = strip
+        hint = item.extra.get("hint")
+        if hint:
+            y = strip.bottom + self._u(8)
+            for line in str(hint).split("\n"):
+                img = self._clip(self._small_font, line, _rgb(self.c["muted"]),
+                                 item.rect.w)
+                surface.blit(img, (item.rect.x, y))
+                y += self._small_font.get_height() + self._u(4)
 
     def _draw_options(self, surface) -> None:
         """The entries of the expanded list - above the rest of the content.
@@ -1627,6 +1854,21 @@ class OverlayMenu:
             img = self._small_font.render(s["hotkey_hint"], True,
                                           _rgb(self.c["muted"]))
             surface.blit(img, (hint.x, hint.y))
+
+
+    def _draw_info(self, surface, item: Item, s: dict) -> None:
+        """A read-only line: what on the left, how big on the right."""
+        value = str(item.extra.get("value") or "")
+        val = self._mono_small.render(value, True, _rgb(self.c["muted"]))
+        room = item.rect.w - val.get_width() - self._u(12)
+        label = self._clip(self._font, str(item.extra.get("label") or ""),
+                           _rgb(self.c["text"]), room)
+        y = item.rect.centery
+        surface.blit(label, (item.rect.x, y - label.get_height() // 2))
+        if value:
+            surface.blit(val, (item.rect.right - val.get_width(),
+                               y - val.get_height() // 2))
+
 
     def _draw_segmented(self, surface, item: Item, s: dict) -> None:
         """Two or three options side by side: the chosen one is accent-filled."""
@@ -1726,10 +1968,15 @@ class OverlayMenu:
         else:
             pygame.draw.rect(surface, _rgb(self.c["surface"]), rect,
                              border_radius=radius)
-            pygame.draw.rect(surface,
-                             _rgb(self.c["accent"] if hot else self.c["border"]),
-                             rect, self._u(1), border_radius=radius)
-            name_col = self.c["danger"] if danger else self.c["text"]
+            # The danger tone marks the EDGE, not the label. As a label it
+            # sat one step from the accent that paints every number on the
+            # page, so the one destructive action read as another value.
+            edge = (self.c["danger"] if danger
+                    else self.c["accent"] if hot else self.c["border"])
+            pygame.draw.rect(surface, _rgb(edge), rect,
+                             self._u(2) if danger else self._u(1),
+                             border_radius=radius)
+            name_col = self.c["text"]
             key_col = self.c["muted"]
         name = self._font.render(item.extra.get("label", ""), True,
                                  _rgb(name_col))
@@ -1780,8 +2027,8 @@ class OverlayMenu:
             pygame.draw.rect(surface,
                              _rgb(self.c["accent"] if hot else self.c["border"]),
                              field, self._u(1), border_radius=radius)
-            txt = self._small_font.render(str(item.extra.get("key", "—")), True,
-                                          _rgb(self.c["text"]))
+            txt = self._mono_small.render(str(item.extra.get("key", "—")),
+                                          True, _rgb(self.c["text"]))
         surface.blit(txt, (field.centerx - txt.get_width() // 2,
                            field.centery - txt.get_height() // 2))
         item.extra["field"] = field

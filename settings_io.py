@@ -19,6 +19,7 @@ from pathlib import Path
 
 from paths import BASE_DIR
 from capture import devicename_for_output_idx, list_adapters, list_monitors
+from i18n import STRINGS as UI_STRINGS
 # The work caps are the worker's contract, not a setting: the same two
 # numbers size the shared motion buffer in the SHMI handshake.
 from protocol import WORK_MAX_H, WORK_MAX_W  # noqa: F401
@@ -114,7 +115,7 @@ def _set_autostart(enabled: bool) -> bool:
 
 # The version shown in the menu header. Kept in sync with native/launcher.rc
 # (FileVersion/ProductVersion) and build_release_zip.py at release time.
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.7.0"
 
 
 # The channel label: the header shows the version, the channel lives in the
@@ -348,6 +349,16 @@ def _menu_layout_payload(cfg: dict, params: dict, monitor: int, lang: str,
         # DXGI enumerates adapters - the same number the worker takes
         # in NS_GPU and prints in its "[host] adapter N" lines.
         "gpu": int(cfg.get("gpu", 0)),
+        # Skip static frames: no new frame from the capture - the network
+        # idles instead of re-running on the same picture. A per-frame flag,
+        # so it survives a restart through the config alone.
+        "skip_static": bool(cfg.get("skip_static", True)),
+        # The user's saved presets. Without this key "Save preset" wrote
+        # everything EXCEPT the preset: the menu said "Preset saved", the
+        # save really did succeed, and the preset was gone on the next
+        # launch - the code's own "it will not survive a restart" branch
+        # could never fire, because nothing had failed (audit F1).
+        "presets": dict(cfg.get("presets") or {}),
     }
 
 
@@ -364,6 +375,35 @@ def work_scale_cap(st) -> float:
     return max(0.35, int(raw / 0.05) * 0.05)
 
 
+#: What the worker says about the neural pass, in its own words. ONE set,
+#: read by both places that ask: settings_io.refresh_gpu_ok (which drives
+#: the dot in the menu and the alert) and pipeline.gpu_came_up (which
+#: decides whether a GPU switch is kept or reverted). They used to carry a
+#: token list each, and the lists had already drifted apart - a rename in
+#: the worker would have blinded one of them and left the other working,
+#: which is the worst shape for a bug like this to take.
+NR_VERDICT_OK = ("feature 18 ready",)
+NR_VERDICT_FAIL = ("feature 18 create failed",   # [pure], the direct refusal
+                   "NR feature unavailable",     # [video], SAFE PASSTHROUGH
+                   "NGX unavailable",            # [host], nothing came up
+                   "no NVIDIA adapter found")    # [host], nothing to run on
+
+
+def nr_verdict(lines):
+    """True / False / None from the worker's log lines, NEWEST FIRST.
+
+    None means the worker has not said yet - which is not a failure. A card
+    that takes its time still works, and treating silence as a refusal
+    would be worse than the bug the callers guard against.
+    """
+    for line in lines:
+        if any(token in line for token in NR_VERDICT_OK):
+            return True
+        if any(token in line for token in NR_VERDICT_FAIL):
+            return False
+    return None
+
+
 def refresh_gpu_ok(st) -> None:
     """Whether NR works - from the worker's answer, not the architecture.
 
@@ -374,18 +414,96 @@ def refresh_gpu_ok(st) -> None:
     """
     if st.gpu_ok is not None:
         return
-    for line in reversed(st.worker_logs[-80:]):
-        if "feature 18 ready" in line:
-            st.gpu_ok = True
+    # The refusal lines are named once, in nr_verdict: the real one from the
+    # worker is "[pure] direct feature 18 create failed" ("Unsupported GPU
+    # architecture" lives inside nvngx_dlssnr.dll and never reaches its
+    # stderr), and SAFE PASSTHROUGH is the same verdict - the worker stays
+    # alive and shows the raw frame, so: no feature, no NR.
+    verdict = nr_verdict(reversed(st.worker_logs[-80:]))
+    if verdict is None:
+        return
+    st.gpu_ok = verdict
+    if not verdict:
+        # The red dot alone was not enough: in issue #29 the user picked a
+        # card that cannot run the pass and nothing on screen said so. One
+        # alert per verdict - a fresh worker clears gpu_ok and the alert can
+        # speak again.
+        if not st.gpu_alerted:
+            st.gpu_alerted = True
+            st.display.alert(UI_STRINGS[st.lang].get(
+                "gpu_nr_fail",
+                "This GPU cannot run the neural pass - the picture stays unprocessed"))
+
+
+def warn_hdr(st) -> None:
+    """Say once that the captured display is in HDR.
+
+    The worker asks the OUTPUT it duplicates for its colour space, so this
+    is about the screen being processed rather than about some monitor in
+    the registry. The network is trained on SDR and an HDR desktop comes
+    out looking blown out with sliders that appear to do nothing - a report
+    we have had (issue #27) and a notice a user asked for (issue #33).
+    """
+    if st.hdr_alerted:
+        return
+    for line in reversed(st.worker_logs[-200:]):
+        if "HDR IS ON for the captured display" in line:
+            st.hdr_alerted = True
+            st.display.alert(UI_STRINGS[st.lang].get(
+                "hdr_on",
+                "HDR is on for this display - the picture will look wrong. "
+                "Turn HDR off for it."), duration=6.0)
+            print("[main] HDR is on for the captured display - the network "
+                  "is trained on SDR")
             return
-        # The real refusal line from the worker is "[pure] direct
-        # feature 18 create failed"; "Unsupported GPU architecture"
-        # lives inside nvngx_dlssnr.dll and never reaches its stderr.
-        # SAFE PASSTHROUGH (the worker stays alive and shows the raw
-        # frame) is the same verdict: no feature, no NR.
-        if "feature 18 create failed" in line or "NR feature unavailable" in line:
-            st.gpu_ok = False
-            return
+
+
+def _gpu_label(index) -> str:
+    """"<dxgi index>: <name>" for the picker - the card that will really run.
+
+    The value in the config is a DXGI index and it can name something that
+    is not an NVIDIA card (a hybrid laptop's integrated GPU sits at 0, which
+    is the shipped default) or nothing at all. The worker treats the index
+    as a wish and falls back to the first usable card; the menu has to agree
+    with it, or the picker shows an empty field on the machines where the
+    setting matters most (issue #34).
+    """
+    adapters = list_adapters()
+    if not adapters:
+        return ""
+    try:
+        wanted = int(index)
+    except (TypeError, ValueError):
+        wanted = None
+    for i, name in adapters:
+        if i == wanted:
+            return f"{i}: {name}"
+    i, name = adapters[0]
+    return f"{i}: {name}"
+
+
+def _worker_idle(st) -> bool:
+    """Is the network idling on an unchanged screen right now?
+
+    The worker announces a stretch ONCE - "[skip] no new frame" - and
+    announces its end when the screen moves again. So the state is the
+    LATEST of those two markers, not the presence of the first one in the
+    last few lines: the menu used to look at worker_logs[-3:], and one
+    unrelated line was enough to push the single announcement out and turn
+    the readout back into a frame rate while nothing was being processed
+    (audit).
+
+    The window is bounded because this runs on every frame the menu is open:
+    during a stretch the worker is otherwise quiet, so 200 lines is a long
+    way past the marker, and a scan of the whole 2000-line buffer sixty
+    times a second is not worth the difference.
+    """
+    for line in reversed(st.worker_logs[-200:]):
+        if "[skip] no new frame" in line:
+            return True
+        if "[skip] the screen changed" in line:
+            return False
+    return False
 
 
 def menu_payload(st) -> dict:
@@ -412,6 +530,15 @@ def menu_payload(st) -> dict:
         "params": {k: st.params[k] for k in
                    ("intensity", "local_tone",
                     "local_structure", "skin_structure")},
+        # What the CURRENT profile puts each parameter at. The menu draws it
+        # as a tick under the slider, so "how far have I moved this from
+        # Natural" is visible instead of remembered.
+        "param_defaults": {
+            k: float(v) for k, v in
+            (PROFILES.get(st.cfg["profile"])
+             or st.presets.get(st.cfg["profile"]) or {}).items()
+            if k in ("intensity", "local_tone", "local_structure",
+                     "skin_structure")},
         "lang": st.lang,
         "recording": st.recorder is not None,
         "work_size": f"{st.work_w}x{st.work_h}",
@@ -419,9 +546,20 @@ def menu_payload(st) -> dict:
         "rec_indicator": bool(st.cfg.get("rec_indicator", True)),
         "screenshot_dir": st.cfg.get("screenshot_dir") or "",
         "spout": bool(st.cfg.get("spout", False)),
+        "skip_static": bool(st.cfg.get("skip_static", True)),
+        # Is the network idling on an unchanged screen right now? The
+        # worker says so in its log; without this the menu shows a
+        # healthy FPS while nothing is being processed, and the skip
+        # reads as "it does not work" (user, 12.09).
+        "idle": _worker_idle(st),
         "gpus": [f"{i}: {name}" for i, name in list_adapters()],
-        "gpu": next((f"{i}: {name}" for i, name in list_adapters()
-                     if i == int(st.cfg.get("gpu", 0))), ""),
+        # The saved index may name no NVIDIA card at all. On a hybrid laptop
+        # adapter 0 is the integrated GPU and "gpu": 0 is what the program
+        # ships with, so the picker came up EMPTY on exactly the machines
+        # where the setting matters most (issue #34). The worker already
+        # falls back to the first usable card in that case - the menu says
+        # the same thing now instead of showing a blank.
+        "gpu": _gpu_label(st.cfg.get("gpu")),
         "open_on_start": st.startup_menu,
         "autostart": _autostart_enabled(),
         "split": st.split_pos,

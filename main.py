@@ -131,7 +131,8 @@ from winapi import (DWMWA_EXTENDED_FRAME_BOUNDS, _RECT,  # noqa: F401
 from protocol import (  # noqa: F401
     DDA_ACK_FMT, DDA_ACK_MAGIC, DDA_FMT, DDA_MAGIC, FRAME_FLAG_BYPASS,
     FRAME_FLAG_MOTION_SMALL, FRAME_FLAG_NO_COLOR, FRAME_FLAG_SHM,
-    FRAME_FLAG_SPLIT, FRAME_FLAG_WANT_PIXELS, FRAME_FMT, FRAME_MAGIC,
+    FRAME_FLAG_SKIP_STATIC, FRAME_FLAG_SPLIT, FRAME_FLAG_WANT_PIXELS,
+    FRAME_FMT, FRAME_MAGIC,
     GRAY_ACK_FMT, GRAY_ACK_MAGIC, GRAY_FMT, GRAY_MAGIC, HEADER_FMT,
     MOTION_ACK_FMT, MOTION_ACK_MAGIC, MOTION_FMT, MOTION_MAGIC,
     OUTS_ACK_FMT, OUTS_ACK_MAGIC, OUTS_FMT, OUTS_MAGIC, OUT_BYTES_IN_SHM,
@@ -187,8 +188,30 @@ def _hard_failure(logs: list[str]) -> bool:
     ever clear it, and retrying only spins the restart loop. Transient
     failures (0x00000000 no-frame, timeouts, driver hiccups) can clear
     on their own - those are the ones worth an automatic revive.
+
+    The whole log is scanned, newest line first, and the first decisive one
+    wins. It used to be the last forty lines: the worker says this once, on
+    frame 0, and then keeps running and keeps logging, so forty later
+    diagnostics buried the verdict and a permanently broken card started
+    reading as a transient failure - the restart storm this classifier
+    exists to prevent (audit).
+
+    Reading newest-first is what keeps the tail window's one good property:
+    if the feature DID come up after the refusal (NGX is reinitialised in
+    place after repeated failures), the success is the newer line and it
+    wins. An unconditional "0xBAD00001 anywhere" would have lost that.
+
+    The list is per worker process - a restart hands out a fresh one - and
+    capped at 2000 lines, so "the whole log" is bounded and cannot carry a
+    verdict across a restart that might have cleared it. This runs when a
+    worker dies, not per frame.
     """
-    return any("0xBAD00001" in line for line in logs[-40:])
+    for line in reversed(logs):
+        if "0xBAD00001" in line:
+            return True
+        if "feature 18 ready" in line:
+            return False
+    return False
 
 
 
@@ -222,7 +245,10 @@ class _Pipeline:
         "mon_resize",
         "frame_index",
         "gpu_ok",
+        "gpu_alerted",
+        "gpu_switch_pending",
         "gray_active",
+        "mon_origin",
         "guide_fails",
         "guides",
         "height",
@@ -279,6 +305,8 @@ class _Pipeline:
         "cfg_path",
         "gpu_text",
         "warmup",
+        "effective_warmup",
+        "hdr_alerted",
     )
 
 
@@ -375,7 +403,8 @@ def main() -> int:
                     print("[main] auto-reviving the worker after the transient failure")
                     try:
                         st.worker, st.worker_logs, st.reader, st.worker_stop = restart_worker(
-                            st.worker, st.params, st.work_w, st.work_h, st.warmup,
+                            st.worker, st.params, st.work_w, st.work_h,
+                            st.effective_warmup,
                             st.width if (st.work_w != st.width or st.work_h != st.height) else 0,
                             st.height if (st.work_w != st.width or st.work_h != st.height) else 0,
                             st.worker_stop, st.shm)
@@ -473,6 +502,29 @@ def main() -> int:
             if st.want_out_shm and not st.out_shm and not st.out_attempted:
                 channels.enable_out_shm(st)
 
+            # Has the worker said whether the neural pass came up on this
+            # card? The answer fires the "this GPU cannot run the neural
+            # pass" alert, and it used to be asked only inside menu_payload
+            # - which the loop builds only while the menu is OPEN. With the
+            # menu closed (the usual state) a refused feature arrived in
+            # total silence: the red dot was there for nobody to see. That
+            # is the issue #29 gap the alert was added to close, still open
+            # (audit F12).
+            #
+            # refresh_gpu_ok caches its verdict, so this costs one attribute
+            # check once the worker has spoken; every thirtieth frame is
+            # twice a second before that, which is soon enough for an alert
+            # and far from the per-frame work that cost 29 FPS the last time
+            # something was added to this loop.
+            if st.frame_index % 30 == 0:
+                settings_io.refresh_gpu_ok(st)
+                # And whether the display being captured is in HDR. The
+                # network is trained on SDR: on an HDR desktop the result
+                # reads as "everything is too bright and the sliders do
+                # nothing", which is a report we have had (issue #27) and a
+                # notice a user asked for (issue #33). Once per session.
+                settings_io.warn_hdr(st)
+
             # --- Input for the overlay menu --------------------------
             # Events are read only while the menu is open: the rest of the
             # time the window is click-through, there are no events, and an
@@ -555,7 +607,8 @@ def main() -> int:
                            motion_small=st.motion_small,
                            no_color=bool(st.dda_mode),
                            bypass=bypass,
-                           split=st.split_pos)
+                           split=st.split_pos,
+                           skip_static=bool(st.cfg.get("skip_static", True)))
                 _perf("send", t0)
             except (BrokenPipeError, OSError, EOFError, RuntimeError) as exc:
                 st.consecutive_restarts += 1
@@ -798,6 +851,9 @@ def main() -> int:
                 except Exception:
                     pass
                 st.display = Display(st.width, st.height, fullscreen=bool(st.cfg["fullscreen"]))
+                # A fresh window starts at (0,0): put it back on the chosen
+                # monitor (the origin belongs to the pipeline, not to SDL).
+                st.display.set_origin(*getattr(st, "mon_origin", (0, 0)))
                 st.display.set_lang(st.lang)
                 # In one-window mode the overlay must stay visible to outside
                 # recorders: the NEW window comes up with the WDA flag set

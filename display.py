@@ -101,6 +101,7 @@ except Exception:
 import numpy as np
 import pygame
 
+import fonts
 from overlay_ui import OverlayMenu, palette as ui_palette
 
 from i18n import STRINGS
@@ -118,12 +119,10 @@ CHROMA_KEY = (0xFF, 0x00, 0xFF)
 LWA_COLORKEY = 0x1
 LWA_ALPHA = 0x2
 
-FONT_NAME = "consolas"
-# The CJK scripts (zh/ja/ko) have no glyphs in Consolas - it renders them
-# as tofu boxes. Each script gets its own font: YaHei for Chinese, Yu
-# Gothic for Japanese (kanji), Malgun Gothic for Korean (hangul). The
-# loader is called with the current language.
-CJK_FONTS = {"zh": "microsoftyahei", "ja": "yugothic", "ko": "malgungothic"}
+# Which faces the program draws with lives in fonts.py - including the
+# per-script CJK families, re-exported here because the docs renderer and
+# the offscreen menu renderer import them from this module.
+CJK_FONTS = fonts.CJK_FONTS
 # The base layout sizes are set for 1440p. On taller screens the interface is
 # scaled up, on shorter ones it stays as is: there is nowhere left to shrink to,
 # the text would become unreadable. Hence the "up only" rule (see ui_scale).
@@ -200,6 +199,10 @@ class Display:
             ctypes.windll.user32.ShowWindow(hwnd, 0)  # SW_HIDE
         except Exception:
             pass
+        # Where this monitor's top-left corner is on the virtual desktop.
+        # (0,0) is the primary monitor; a second one can sit anywhere. Set
+        # through set_origin() once the monitor is known (main owns that).
+        self._origin = (0, 0)
         self._move_to_origin()
         # Force the physical window size: even if DPI awareness did not apply
         # (a 3072x1728 window instead of 3840x2160), we stretch the window to
@@ -216,15 +219,19 @@ class Display:
         # Interface scale and the layout sizes derived from it.
         self.ui_scale = ui_scale_for(self.height)
         self.font_size = max(8, int(round(FONT_SIZE * self.ui_scale)))
+        # HUD language (NR ON/NR OFF), see set_lang(). Must exist before the
+        # menu: the loader picks the face by the language, and OverlayMenu
+        # builds its fonts inside its constructor - with this assignment
+        # below the menu, that first build fell through to pygame's default
+        # face instead of ours.
+        self._lang = "ru"
         # The settings menu lives in this same layer. A separate window on top
         # of the game would steal focus and fight for topmost, whereas here we
         # are already above the frame and already transparent by key.
         self.menu = OverlayMenu(self.ui_scale, self._load_font)
-        # HUD language (NR ON/NR OFF), see set_lang(). Must exist before the
-        # fonts: the loader picks the font by the language (CJK scripts
-        # have no glyphs in the default font).
-        self._lang = "ru"
-        self._font = self._load_font(size=self.font_size)
+        # The HUD is nothing but readings - fps, resolution, frame counter -
+        # so it takes the monospaced face whole; the menu picks per element.
+        self._font = self._load_font(size=self.font_size, mono=True)
         self._alert_font = self._load_font(
             size=max(10, int(round(ALERT_FONT_SIZE * self.ui_scale))))
         # Disable vsync: flip() must not wait for vblank (otherwise the FPS is
@@ -294,8 +301,12 @@ class Display:
             self._lang = lang
             # The HUD/alert fonts follow the language: CJK scripts have no
             # glyphs in the default font (tofu boxes).
-            self._font = self._load_font(size=self.font_size)
-            self._alert_font = self._load_font(size=ALERT_FONT_SIZE)
+            self._font = self._load_font(size=self.font_size, mono=True)
+            # Scaled, the way __init__ builds it. Without the ui_scale the
+            # alert shrank the first time the language changed and stayed
+            # small - on a 125% display 45 px became 37 (audit).
+            self._alert_font = self._load_font(
+                size=max(10, int(round(ALERT_FONT_SIZE * self.ui_scale))))
 
     def set_visible(self, visible: bool) -> None:
         """Show/hide the window (SW_SHOW/SW_HIDE).
@@ -360,27 +371,42 @@ class Display:
         except Exception as exc:
             print(f"Display: WARNING could not move the overlay: {exc}")
 
+    def set_origin(self, x: int, y: int) -> None:
+        """Where this monitor's top-left corner sits on the virtual desktop.
+
+        The overlay is the size of ONE monitor; only the primary has its
+        corner at (0,0). A window created at (0,0) while the capture runs
+        on a second monitor covers the PRIMARY screen - the user sees
+        nothing where they are looking (issues #28, #33).
+        """
+        self._origin = (int(x), int(y))
+        self._move_to_origin()
+
     def _move_to_origin(self) -> None:
-        """Move the window to (0,0) - the monitor's top left corner."""
+        """Move the window to the monitor's top-left corner (self._origin)."""
         try:
             hwnd = pygame.display.get_wm_info()["window"]
+            x, y = getattr(self, "_origin", (0, 0))
             # NO SWP_SHOWWINDOW here: the window is created hidden
             # (SDL_WINDOW_HIDDEN) and revealed only after the first real
             # frame - otherwise the blank window flashes over the desktop
             # during the NGX warm-up.
-            ctypes.windll.user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0,
-                                              0x0001 | 0x0002 | 0x0010)  # SWP_NOSIZE|NOMOVE|NOACTIVATE
+            flags = 0x0001 | 0x0010  # SWP_NOSIZE | SWP_NOACTIVATE
+            if (x, y) == (0, 0):
+                # The primary monitor: SDL already placed it there, and the
+                # pre-multi-monitor behaviour (no move at all) stays intact.
+                flags |= 0x0002  # SWP_NOMOVE
+            ctypes.windll.user32.SetWindowPos(hwnd, 0, x, y, 0, 0, flags)
         except Exception:
             pass
 
     # -- window plumbing --------------------------------------------------
 
-    def _load_font(self, size: int = FONT_SIZE):
-        try:
-            name = CJK_FONTS.get(self._lang, FONT_NAME)
-            return pygame.font.SysFont(name, size)
-        except Exception:
-            return pygame.font.Font(None, size)
+    def _load_font(self, size: int = FONT_SIZE, mono: bool = False,
+                   bold: bool = False):
+        """The loader handed to the menu - see fonts.py for the faces."""
+        return fonts.load(size, mono=mono, bold=bold,
+                          lang=getattr(self, "_lang", "en"))
 
     def _set_click_through(self) -> bool:
         """Click-through: WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_LAYERED.
@@ -551,6 +577,9 @@ class Display:
             return
         self.screen = pygame.display.set_mode((w, h), self._flags)
         self.width, self.height = w, h
+        # A set_mode can recreate the physical window; put it back on the
+        # chosen monitor (the origin belongs to the pipeline, not to SDL).
+        self._move_to_origin()
         self.set_hud_only(self._hud_only, force=True)
         self.set_menu_opaque(self.menu.visible)
         self.set_excluded_from_capture(self._excluded)
@@ -583,9 +612,11 @@ class Display:
             self.screen = pygame.display.set_mode((full_w, full_h), self._flags)
             self.width, self.height = full_w, full_h
             # set_mode alone does NOT resize the physical window in SDL2 -
-            # force it, exactly like __init__ does (SWP_NOZORDER, with size).
+            # force it, exactly like __init__ does (SWP_NOZORDER, with size),
+            # at the chosen monitor's origin.
             hwnd = pygame.display.get_wm_info()['window']
-            user32.SetWindowPos(hwnd, 0, 0, 0, full_w, full_h, 0x0004)
+            x, y = getattr(self, "_origin", (0, 0))
+            user32.SetWindowPos(hwnd, 0, x, y, full_w, full_h, 0x0004)
             self._set_topmost()
             # The recreated window lost EVERYTHING: the layered attributes
             # (colorkey + alpha), the capture affinity and the input styles.
@@ -735,7 +766,8 @@ class Display:
         try:
             self.screen = pygame.display.set_mode((fw, fh), self._flags)
             hwnd = pygame.display.get_wm_info()["window"]
-            ctypes.windll.user32.SetWindowPos(hwnd, 0, 0, 0, fw, fh, 0x0004)
+            x, y = getattr(self, "_origin", (0, 0))
+            ctypes.windll.user32.SetWindowPos(hwnd, 0, x, y, fw, fh, 0x0004)
             self._set_topmost()
             user32.SetLayeredWindowAttributes(hwnd, 0, SWITCH_ALPHA, LWA_ALPHA)
             # set_mode re-created the window: every exstyle bit is gone
@@ -932,7 +964,15 @@ class Display:
                 return
             if rect.right <= rect.left or rect.bottom <= rect.top:
                 return
-            r = pygame.Rect(rect.left, rect.top,
+            # GetWindowRect answers in VIRTUAL-DESKTOP coordinates; this
+            # surface is the chosen monitor, whose corner is self._origin.
+            # Without the subtraction the outline drew at the window's
+            # absolute x - off the right edge on a second monitor, and on
+            # the wrong place on any monitor that is not the primary. The
+            # same origin mistake as issues #28/#33/#35, in the one place
+            # that had not been fixed.
+            ox, oy = getattr(self, "_origin", (0, 0))
+            r = pygame.Rect(rect.left - ox, rect.top - oy,
                             rect.right - rect.left, rect.bottom - rect.top)
             lw = 3
             pygame.draw.rect(self.screen, (0x0D, 0x11, 0x17), r, lw + 2,

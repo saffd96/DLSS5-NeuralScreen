@@ -160,6 +160,55 @@ def list_adapters() -> list[tuple[int, str]]:
     return out
 
 
+def _devicename_at(x: int, y: int) -> str:
+    """The device name of the monitor whose rectangle contains (x, y).
+
+    MONITOR_DEFAULTTONULL: a point on no monitor answers nothing rather
+    than the nearest guess - the caller wants the truth or silence.
+    """
+    try:
+        hmon = ctypes.windll.user32.MonitorFromPoint(
+            wintypes.POINT(int(x), int(y)), 0)   # 0 = MONITOR_DEFAULTTONULL
+        if not hmon:
+            return ""
+        info = _MONITORINFOEXW()
+        info.cbSize = ctypes.sizeof(_MONITORINFOEXW)
+        if not ctypes.windll.user32.GetMonitorInfoW(ctypes.c_void_p(hmon),
+                                                    ctypes.byref(info)):
+            return ""
+        return "".join(info.szDevice).rstrip("\x00")
+    except Exception:
+        return ""
+
+
+def monitor_origin(devicename: str) -> tuple[int, int] | None:
+    """The chosen monitor's top-left corner on the virtual desktop, or None.
+
+    Windows places every monitor on one virtual desktop whose origin is the
+    PRIMARY monitor's corner - a second monitor can sit at x=1920 or even
+    x=-1080. The overlay (pygame layer) and the worker's output window were
+    both created at (0,0) regardless of which monitor was chosen, so the
+    picture landed on the primary screen while the capture ran on the
+    chosen one (issues #28, #33).
+    """
+    found: list[tuple[int, int]] = []
+
+    def _cb(hmon, _hdc, lprect, _lparam) -> bool:
+        info = _MONITORINFOEXW()
+        info.cbSize = ctypes.sizeof(_MONITORINFOEXW)
+        if ctypes.windll.user32.GetMonitorInfoW(hmon, ctypes.byref(info)):
+            if "".join(info.szDevice).rstrip("\x00") == devicename:
+                r = lprect.contents
+                found.append((r.left, r.top))
+        return True
+
+    MONITORENUMPROC = ctypes.WINFUNCTYPE(
+        wintypes.BOOL, wintypes.HMONITOR, wintypes.HDC,
+        ctypes.POINTER(wintypes.RECT), wintypes.LPARAM)
+    ctypes.windll.user32.EnumDisplayMonitors(0, 0, MONITORENUMPROC(_cb), 0)
+    return found[0] if found else None
+
+
 def monitor_size(devicename: str) -> tuple[int, int] | None:
     """The CURRENT size of one monitor, by DXGI devicename, or None.
 
@@ -339,9 +388,23 @@ class ScreenCapture:
         self._monitor = self._mss.monitors[real_idx]
         self.resolution = (int(self._monitor["width"]),
                            int(self._monitor["height"]))
-        self.devicename = f"\\\\.\\DISPLAY{monitor_idx + 1}"
-        print(f"[capture] mss (GDI) capture active: {self.resolution}",
-              file=sys.stderr)
+        # The identity of the monitor that was ACTUALLY opened, asked of
+        # Windows by the corner mss reported. It used to be synthesised from
+        # the index - "\\.\DISPLAY{idx+1}" - and DXGI output order and
+        # DISPLAYn numbering are not guaranteed to agree (this module's own
+        # docstring says so). On a machine where they disagree the guess
+        # named ANOTHER monitor, and the overlay origin, NS_OUTPUT and the
+        # identity saved to the config all followed the guess while the
+        # capture itself was on the right screen (audit).
+        #
+        # No answer means no answer: an empty name makes _apply_monitor_env
+        # keep output 0 and the primary corner, and say so in the log. That
+        # is the old behaviour, arrived at honestly instead of by a guess
+        # that looks like knowledge.
+        self.devicename = _devicename_at(int(self._monitor.get("left", 0)),
+                                         int(self._monitor.get("top", 0))) or ""
+        print(f"[capture] mss (GDI) capture active: {self.resolution} "
+              f"on {self.devicename or 'an unknown monitor'}", file=sys.stderr)
 
     @classmethod
     def resolve_monitor(cls, devicename: str) -> int | None:

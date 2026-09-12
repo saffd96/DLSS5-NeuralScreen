@@ -17,7 +17,7 @@ from pathlib import Path
 BASE = Path(__file__).resolve().parent
 os.chdir(BASE)
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 # The bundle is architecture-agnostic by design: the dcc0dc24 runtime and
 # the 0x1B0 spoof work on RTX 30/40/50 (v1.3.0 behaviour). The manifest
 # still records what is inside so a mismatch is catchable.
@@ -30,6 +30,9 @@ extra = [
     "NeuralScreen-diag.vbs",
     "README.ru.md",
     "native/nvngx.dll",
+    # The module the NGX calls leave from. Its file name is what the
+    # feature library checks; without it Neural Rendering does not start.
+    "native/nvngx.dll_ns-forwarder.dll",
     "native/nvngx_dlssnr.dll",
 ]
 # tcl/tk stays out of the archive: the tkinter settings window is gone and the

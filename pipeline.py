@@ -40,8 +40,45 @@ from i18n import STRINGS as UI_STRINGS
 from paths import NATIVE_DIR, WORKER_EXE
 from protocol import (HEADER_FMT, VIDEO_MAGIC, SharedFrameBuffer,
                       WorkerReader, _negotiate_shm, send_dda, send_resize)
-from settings_io import _work_size, hotkey_labels
+from settings_io import _work_size, hotkey_labels, nr_verdict
 from winapi import window_frame_rect
+
+
+# Worker lines that always reach the shared log. These are the ones a user
+# needs to answer "which card is running the network, and did it come up":
+# the adapter list and the NS_GPU pick ([host]), the NGX create/init result
+# ([pure]), the architecture spoof ([arch]), the capture path ([cap]) and
+# the overlay/spout lifecycle. Before this they were gated behind
+# NS_PHASE=1 and a user's log could not tell a working GPU from a Turing
+# card that silently fell into SAFE PASSTHROUGH (issue #29: the 2060 Super
+# case - the network never came up and nothing said so).
+#: Always let through: the pipeline diagnostics. NS_PHASE=1 adds the
+#: per-frame profiler lines ([phase]/[pw]) on top of these.
+_LOG_ALWAYS = ("[host]", "[pure]", "[arch]", "[cap]", "[dda]", "[present]",
+               "[spout]", "[wgc]", "[video]", "[skip]")
+#: [video] lines that are a heartbeat rather than a diagnostic: the "delivered
+#: frame N" line is printed every 30 frames and would bury the log.
+_LOG_SKIP = ("delivered frame",)
+
+
+def _log_wanted(line: str) -> bool:
+    """Whether a worker stderr line goes into the shared log.
+
+    The diagnostics above always do; the per-frame profiler only under
+    NS_PHASE=1 (a line per frame would otherwise bury the log). [video]
+    carries the one line that says the network never came up - "NR feature
+    unavailable (0xBAD00001) - SAFE PASSTHROUGH" - and in issue #29 a user's
+    log had no way to show it.
+    """
+    for skip in _LOG_SKIP:
+        if skip in line:
+            return False
+    for tag in _LOG_ALWAYS:
+        if tag in line:
+            return True
+    if os.environ.get("NS_PHASE") == "1":
+        return "[phase]" in line or "[pw]" in line
+    return False
 
 
 def _drain_stderr(worker, logs: list[str], stop: threading.Event) -> None:
@@ -63,18 +100,7 @@ def _drain_stderr(worker, logs: list[str], stop: threading.Event) -> None:
             # - every consumer reads only the tail, so we keep 2000.
             if len(logs) > 2000:
                 del logs[: len(logs) - 2000]
-            # The worker log goes into the shared log, but only when the
-            # profiler is on (NS_PHASE=1): otherwise it just sits in the
-            # buffer and is seen only when something crashed. Besides the
-            # phase measurements we let [pure]/[host] through: they carry the
-            # NGX result code and the chosen model preset, and without them
-            # there is no telling what was actually created. [present] is
-            # let through too: the overlay window lifecycle (created, hidden,
-            # revealed, resize) is part of the startup/shutdown diagnostics.
-            if "[present]" in line or "[spout]" in line or "[arch]" in line or (
-                    os.environ.get("NS_PHASE") == "1" and (
-                        "[phase]" in line or "[pure]" in line or "[host]" in line
-                        or "[cap]" in line or "[dda]" in line or "[pw]" in line)):
+            if _log_wanted(line):
                 print(line)
     except Exception:
         pass
@@ -251,7 +277,8 @@ def rebuild_pipeline(st, note: str) -> None:
     full_h = st.height if (st.work_w != st.width or st.work_h != st.height) else 0
     st.shm = SharedFrameBuffer(st.width, st.height)
     st.worker, st.worker_logs, st.reader, st.worker_stop = start_worker(
-        st.params, st.work_w, st.work_h, st.warmup, full_w, full_h, st.shm)
+        st.params, st.work_w, st.work_h, st.effective_warmup, full_w, full_h,
+        st.shm)
     # The window and the menu are rebuilt, keeping the user settings.
     # A soft resize instead of close()+recreate: the old code went
     # through pygame.quit() and built a fresh window - the screen went
@@ -279,6 +306,9 @@ def rebuild_pipeline(st, note: str) -> None:
         except Exception:
             pass
         st.display = Display(st.width, st.height, fullscreen=bool(st.cfg["fullscreen"]))
+        # A fresh window starts at (0,0) - the primary monitor. The origin
+        # belongs to the CHOSEN monitor and must survive the rebuild.
+        st.display.set_origin(*getattr(st, "mon_origin", (0, 0)))
         recreated = True
     # In one-window mode the overlay stops hiding from screen capture:
     # the input is that window, not the desktop, so there is no
@@ -329,6 +359,7 @@ def rebuild_pipeline(st, note: str) -> None:
     st.out_shm = False
     st.out_attempted = False
     st.gpu_ok = None  # a new worker means a new verdict on feature 18
+    st.gpu_alerted = False           # and a fresh chance for the alert to speak
     st.frame_index = 0
     st.pts = 0
     st.work_frame = None
@@ -377,7 +408,7 @@ def switch_monitor(st, new_monitor: int | str) -> None:
         st.capture.close()
     except Exception:
         pass
-    # The new monitor: its real resolution.
+    # The new monitor: its real resolution, and where it sits.
     st.monitor = new_monitor
     st.cfg["monitor"] = st.monitor
     try:
@@ -395,6 +426,12 @@ def switch_monitor(st, new_monitor: int | str) -> None:
         st.display.alert(UI_STRINGS[st.lang]["mon_fail"])
     st.width, st.height = st.capture.resolution
     st.work_w, st.work_h = _work_size(st.width, st.height, st.work_scale)
+    # The worker reads NS_OUTPUT / NS_WINDOW_POS at every OpenDda/OpenPresent,
+    # and the overlay is rebuilt below - so the new monitor's identity goes
+    # out before the rebuild (issues #28, #33).
+    from startup import _apply_monitor_env
+    st.mon_origin = _apply_monitor_env(st.capture)
+    st.display.set_origin(*st.mon_origin)
     rebuild_pipeline(st, f"Monitor {st.monitor}: {st.width}x{st.height}")
 
 
@@ -565,14 +602,65 @@ def apply_gpu(st, index: int) -> None:
     fails in the worker, with the reason in the log, rather than showing
     a black picture.
     """
-    if int(index) == int(st.cfg.get("gpu", 0)):
+    previous = int(st.cfg.get("gpu", 0))
+    if int(index) == previous:
         return
     st.cfg["gpu"] = int(index)
     os.environ["NS_GPU"] = str(int(index))
-    settings_io.save_menu_layout(st)
+    # If the chosen card turns out to drive no display, the capture stays on
+    # the display card and every frame crosses through shared memory - a
+    # split pipeline. That is worth one alert, and only after a deliberate
+    # switch (on an Optimus laptop it is the normal state from launch).
+    st.gpu_switch_pending = True
     print(f"[main] GPU: adapter {index} - restarting the worker")
     teardown_pipeline(st)
     rebuild_pipeline(st, UI_STRINGS[st.lang].get("gpu_switched", "GPU switched"))
+    if gpu_came_up(st):
+        # Only now: a config that remembers a card the network cannot use
+        # comes back on the same dead card at the next launch, and the menu
+        # to change it back is inside the overlay that a dead worker hides
+        # (issue #33).
+        settings_io.save_menu_layout(st)
+        return
+    print(f"[main] adapter {index} cannot run the network - back to {previous}",
+          file=sys.stderr)
+    st.cfg["gpu"] = previous
+    os.environ["NS_GPU"] = str(previous)
+    st.gpu_switch_pending = False
+    teardown_pipeline(st)
+    rebuild_pipeline(st, UI_STRINGS[st.lang].get(
+        "gpu_reverted", "That GPU cannot run the neural pass - previous card"))
+    st.display.alert(UI_STRINGS[st.lang].get(
+        "gpu_reverted", "That GPU cannot run the neural pass - previous card"))
+
+
+#: How long a fresh worker is given to say whether the network came up on
+#: the card just chosen. NGX answers in well under a second; five seconds
+#: is the margin for a cold driver, and a slower one is not called failed.
+GPU_VERDICT_TIMEOUT = 5.0
+
+
+def gpu_came_up(st, timeout: float = GPU_VERDICT_TIMEOUT) -> bool:
+    """Did the network come up on the card the worker was just started on?
+
+    The worker says so itself, and the lines are named in exactly one
+    place - settings_io.nr_verdict, which the menu's own verdict reads too.
+    A process that exited says it without words.
+
+    Silence is NOT failure. A card that takes its time still works, and
+    turning a slow start into an automatic revert would be worse than the
+    bug this guards against.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        worker = getattr(st, "worker", None)
+        if worker is not None and worker.poll() is not None:
+            return False
+        verdict = nr_verdict(reversed(st.worker_logs[-120:]))
+        if verdict is not None:
+            return verdict
+        time.sleep(0.1)
+    return True
 
 
 def follow_window(st) -> None:

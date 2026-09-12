@@ -45,10 +45,41 @@ def fresh_worker():
     return True, f"{dll.stat().st_size} bytes, the hook is there, fresh"
 
 
+def personal_config_keys():
+    """Every config key the program itself can write over a user's session.
+
+    The archive's config.json comes from git HEAD, and this is what catches
+    "a maintainer committed a personal value". It used to be a hand-written
+    tuple, and it stopped growing: skip_static, gpu, screenshot_dir,
+    rec_indicator and monitor were all written by _menu_layout_payload and
+    none of them was ever compared. Adding those five would have restarted
+    the same clock, so the set is asked of the payload itself - a key the
+    menu learns to save is covered the day it is added.
+
+    "hotkeys" is included by hand because it is saved on its own path, not
+    through the menu payload.
+    """
+    # autocheck is run both through run_tests.py (which puts the project
+    # root on the path) and on its own, where it is not there.
+    import sys
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    import settings_io
+    payload = settings_io._menu_layout_payload(
+        {"profile": "Natural", "gpu": 0, "spout": False, "skip_static": True,
+         "rec_indicator": True, "screenshot_dir": "", "presets": {}},
+        {"intensity": 1.0, "local_tone": 1.0, "local_structure": 1.0,
+         "skin_structure": -1.0},
+        0, "en", 0.65, 0.0, True, False,
+        type("M", (), {"user_scale": 1.0, "user_height": None,
+                       "state": {"theme": "light"}, "offset": [0, 0]})())
+    return sorted(set(payload) | {"hotkeys"})
+
+
 def zip_integrity():
-    zpath = ROOT / "neuralscreen-v1.6.0-full.zip"
+    zpath = ROOT / "neuralscreen-v1.7.0-full.zip"
     if not zpath.is_file():
-        return False, "no neuralscreen-v1.6.0-full.zip"
+        return False, "no neuralscreen-v1.7.0-full.zip"
     required = [
         "main.py", "gpuinfo.py", "overlay_ui.py", "i18n.py", "recorder.py",
         "display.py", "guides.py", "hotkeys.py", "tray.py", "capture.py",
@@ -59,10 +90,18 @@ def zip_integrity():
         "TECHNICAL.md", "TECHNICAL.ru.md",
         "README.md", "README.ru.md", "NeuralScreen.vbs", "NeuralScreen.bat",
         "native/nvngx.dll", "native/nvngx_dlssnr.dll",
+        # Neural Rendering does not start without it: the NGX calls
+        # have to leave a module whose path carries "nvngx.dll".
+        "native/nvngx.dll_ns-forwarder.dll",
         # Loaded at run time, and both have a silent fallback: left out
         # of the archive the program ships with the wrong icons and says
         # nothing about it.
         "native/neuralscreen.ico",
+        # The interface faces travel with the program: a Windows that
+        # lacks Segoe UI (or ships a different cut of it) would draw
+        # the menu in whatever it has.
+        "fonts/IBMPlexSans-Regular.ttf", "fonts/IBMPlexMono-Regular.ttf",
+        "fonts/OFL.txt",
         "runtime/pythonw.exe", "VERSION.txt",
     ]
     with zipfile.ZipFile(zpath) as z:
@@ -110,10 +149,7 @@ def zip_integrity():
         except Exception:
             head_cfg = {}
         leak = []
-        for key in ("menu_offset", "menu_scale", "theme", "lang",
-                    "open_menu_on_start", "split", "menu_height",
-                    "hotkeys", "work_scale", "nr_small", "record_audio",
-                    "spout"):
+        for key in personal_config_keys():
             if key not in head_cfg:
                 continue
             if cfg.get(key) != head_cfg[key]:
@@ -132,8 +168,8 @@ def zip_integrity():
         zsha = hashlib.sha256(zip_dll).hexdigest()
         if f"sha256 {zsha}" not in vt:
             return False, "VERSION.txt runtime sha != the DLL inside the archive"
-        if "NeuralScreen 1.6.0" not in vt:
-            return False, "VERSION.txt version does not match v1.6.0"
+        if "NeuralScreen 1.7.0" not in vt:
+            return False, "VERSION.txt version does not match v1.7.0"
     return True, f"{zpath.stat().st_size} bytes, all files, the hook, a default config, a truthful manifest"
 
 
@@ -249,10 +285,22 @@ def release_notes_short():
         encoding="utf-8", errors="replace")
     if r.returncode != 0:
         return False, f"gh: {r.stderr.strip()[:100]}"
-    en_part = r.stdout.split("---")[0]
-    if len(en_part) > 2500:
-        return False, f"the EN part is {len(en_part)} characters - too long"
-    return True, f"the EN part is {len(en_part)} characters"
+    body = r.stdout
+    # The WHOLE body, not the part before the first "---". That split dates
+    # from when the notes were written in two languages and the rule "one
+    # language" (user, 12.09) retired it - and it had quietly made this
+    # check vacuous: a markdown table starts with a |---| row, so the split
+    # fired on the first table and measured 505 characters of a 4639
+    # character body.
+    #
+    # 5000, and the purpose is unchanged: the notes must not drift into a
+    # manual. 1.7.0 is the first release to carry a feature, an
+    # architectural change and twenty fixes at once, and the user asked for
+    # the fixes to be spelled out ("the things that were fixed - describe
+    # them, definitely").
+    if len(body) > 5000:
+        return False, f"the release body is {len(body)} characters - too long"
+    return True, f"the release body is {len(body)} characters"
 
 
 # --- driving the running program (the GUI and smoke checks share this) ---
