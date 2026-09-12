@@ -1560,3 +1560,7 @@ for _table in STRINGS.values():
     _table["gpu_motion_hint"] = "May distort fast motion. Off: CPU DIS. Switching restarts processing."
 STRINGS["ru"]["gpu_motion"] = "Расчёт движения на GPU (эксперимент)"
 STRINGS["ru"]["gpu_motion_hint"] = "При резком движении возможны искажения.\nВыключено: CPU DIS. Смена режима перезапускает обработку."
+
+for _table in STRINGS.values():
+    _table["dlss_sr_hint"] += "\n100%: DLAA (native-resolution anti-aliasing; additional GPU work)."
+STRINGS["ru"]["dlss_sr_hint"] = "На пониженном разрешении DLSS восстанавливает размер кадра.\n100%: DLAA — сглаживание без апскейла, с дополнительной нагрузкой на GPU."
