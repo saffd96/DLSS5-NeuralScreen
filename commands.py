@@ -182,6 +182,8 @@ def apply_menu_action(st, action: tuple) -> None:
         st.cfg["rec_indicator"] = not bool(st.cfg.get("rec_indicator", True))
         settings_io.save_menu_layout(st)
         print(f"[main] recording indicator: {'on' if st.cfg['rec_indicator'] else 'off'}")
+    elif kind == "toggle" and action[1] == "gpu_motion":
+        pipeline.apply_gpu_motion(st, not bool(st.cfg.get("gpu_motion", False)))
     elif kind == "toggle" and action[1] == "ui_detection":
         st.cfg["ui_detection"] = not bool(st.cfg.get("ui_detection", False))
         settings_io.save_menu_layout(st)

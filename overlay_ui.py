@@ -769,6 +769,7 @@ class OverlayMenu:
                        value_text=f"×{multiplier}", ends=("×2", "×4"))
 
             toggle("ui_detection", s["ui_detection"], bool(self.state.get("ui_detection")))
+            toggle("gpu_motion", s["gpu_motion"], bool(self.state.get("gpu_motion", False)), hint=s["gpu_motion_hint"])
 
             boost = bool(self.state.get("nr_small"))
             toggle("boost", s["boost"], boost, hint=s["boost_hint"] + "\n" + s["nr_min_hint"])

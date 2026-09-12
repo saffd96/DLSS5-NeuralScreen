@@ -269,6 +269,7 @@ def load_config(path: Path) -> dict:
         sr_scale = .65
     cfg["dlss_sr_scale"] = min(1.0, max(.25, sr_scale))
     cfg["dlss_sr"] = bool(cfg.get("dlss_sr", False))
+    cfg["gpu_motion"] = cfg.get("gpu_motion") is True
     cfg["ui_detection"] = bool(cfg.get("ui_detection", False))
     cfg["frame_generation"] = bool(cfg.get("frame_generation", False))
     try:
@@ -385,6 +386,7 @@ def _menu_layout_payload(cfg: dict, params: dict, monitor: int, lang: str,
         "skip_static": bool(cfg.get("skip_static", True)),
         "dlss_sr_scale": float(cfg.get("dlss_sr_scale", .65)),
         "dlss_sr": bool(cfg.get("dlss_sr", False)),
+        "gpu_motion": cfg.get("gpu_motion") is True,
         "ui_detection": bool(cfg.get("ui_detection", False)),
         "frame_generation": bool(cfg.get("frame_generation", False)),
         "frame_multiplier": min(4, max(2, int(cfg.get("frame_multiplier", 2)))),
@@ -599,6 +601,7 @@ def menu_payload(st) -> dict:
         "skip_static": bool(st.cfg.get("skip_static", True)),
         "dlss_sr_scale": float(st.cfg.get("dlss_sr_scale", .65)),
         "dlss_sr": bool(st.cfg.get("dlss_sr", False)),
+        "gpu_motion": st.cfg.get("gpu_motion") is True,
         "ui_detection": bool(st.cfg.get("ui_detection", False)),
         "frame_generation": bool(st.cfg.get("frame_generation", False)),
         "frame_multiplier": min(4, max(2, int(st.cfg.get("frame_multiplier", 2)))),
