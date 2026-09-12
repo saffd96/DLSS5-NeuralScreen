@@ -25,6 +25,11 @@ TARGET_ARCHS = "RTX 30/40/50 (sm_86/89/120 kernels, spoof 0x1B0; RTX 20 cannot r
 
 files = subprocess.check_output(["git", "ls-files"], text=True).splitlines()
 extra = [
+    "library_updates.py",
+    "resolution_limits.py",
+    "ui_detection.py",
+    "native/nvngx_dlss.dll",
+    "native/nvngx_dlssg.dll",
     "NeuralScreen.exe",
     "NeuralScreen.vbs",
     "NeuralScreen-diag.vbs",
@@ -35,6 +40,10 @@ extra = [
     "native/nvngx.dll_ns-forwarder.dll",
     "native/nvngx_dlssnr.dll",
 ]
+required = tuple(extra)
+missing = [name for name in required if not (BASE / name).is_file()]
+if missing:
+    raise SystemExit("Missing required release files: " + ", ".join(missing))
 # tcl/tk stays out of the archive: the tkinter settings window is gone and the
 # whole interface lives in the overlay menu. Nothing in the project imports
 # tkinter (PIL/_tkinter_finder pulls it lazily and only for ImageTk).
@@ -278,6 +287,11 @@ version_txt = (
     f"targets: {TARGET_ARCHS}\n"
     f"built: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
 )
+for name in ("nvngx_dlss.dll", "nvngx_dlssg.dll"):
+    with (BASE / "native" / name).open("rb") as stream:
+        version_txt += f"library: {name} sha256 {hashlib.file_digest(stream, 'sha256').hexdigest()}\n"
+if subprocess.check_output(["git", "status", "--porcelain"], text=True).strip():
+    version_txt += "worktree: modified (archive includes local changes)\n"
 
 with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
     z.writestr("VERSION.txt", version_txt)

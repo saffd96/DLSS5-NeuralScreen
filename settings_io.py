@@ -24,6 +24,23 @@ from i18n import STRINGS as UI_STRINGS
 # numbers size the shared motion buffer in the SHMI handshake.
 from protocol import WORK_MAX_H, WORK_MAX_W  # noqa: F401
 from winapi import list_capturable_windows
+from resolution_limits import safe_processing_size
+from library_updates import checker as library_checker
+
+
+def show_update_notice(st):
+    if not library_checker.take_notice():
+        return
+    menu = st.display.menu
+    menu.set_state(menu_payload(st))
+    menu.page = "updates"
+    menu.scroll = 0
+    menu.open_choice = None
+    menu.capturing = None
+    menu.visible = True
+    st.display.set_menu_opaque(True)
+    st.display.set_menu_input(True)
+    print('[libraries] startup update notice opened')
 
 
 def _work_size(width: int, height: int, scale: float) -> tuple[int, int]:
@@ -46,6 +63,7 @@ def _work_size(width: int, height: int, scale: float) -> tuple[int, int]:
     else:
         w = max(64, int(width * scale) // 2 * 2)
         h = max(64, int(height * scale) // 2 * 2)
+    w, h = safe_processing_size(int(width), int(height), min(w, int(width)), min(h, int(height)))
     if w > WORK_MAX_W or h > WORK_MAX_H:
         k = min(WORK_MAX_W / w, WORK_MAX_H / h)
         w = max(64, int(w * k) // 2 * 2)
@@ -245,6 +263,18 @@ def load_config(path: Path) -> dict:
     if lang not in UI_STRINGS:
         lang = DEFAULT_LANG
     cfg["lang"] = lang
+    try:
+        sr_scale = float(cfg.get("dlss_sr_scale", .65))
+    except (TypeError, ValueError):
+        sr_scale = .65
+    cfg["dlss_sr_scale"] = min(1.0, max(.25, sr_scale))
+    cfg["dlss_sr"] = bool(cfg.get("dlss_sr", False))
+    cfg["ui_detection"] = bool(cfg.get("ui_detection", False))
+    cfg["frame_generation"] = bool(cfg.get("frame_generation", False))
+    try:
+        cfg["frame_multiplier"] = min(4, max(2, int(cfg.get("frame_multiplier", 2))))
+    except (ValueError, TypeError, OverflowError):
+        cfg["frame_multiplier"] = 2
     return cfg
 
 
@@ -353,6 +383,11 @@ def _menu_layout_payload(cfg: dict, params: dict, monitor: int, lang: str,
         # idles instead of re-running on the same picture. A per-frame flag,
         # so it survives a restart through the config alone.
         "skip_static": bool(cfg.get("skip_static", True)),
+        "dlss_sr_scale": float(cfg.get("dlss_sr_scale", .65)),
+        "dlss_sr": bool(cfg.get("dlss_sr", False)),
+        "ui_detection": bool(cfg.get("ui_detection", False)),
+        "frame_generation": bool(cfg.get("frame_generation", False)),
+        "frame_multiplier": min(4, max(2, int(cfg.get("frame_multiplier", 2)))),
         # The user's saved presets. Without this key "Save preset" wrote
         # everything EXCEPT the preset: the menu said "Preset saved", the
         # save really did succeed, and the preset was gone on the next
@@ -435,26 +470,41 @@ def refresh_gpu_ok(st) -> None:
                 "This GPU cannot run the neural pass - the picture stays unprocessed"))
 
 
-def warn_hdr(st) -> None:
-    """Say once that the captured display is in HDR.
+def refresh_sr(st) -> None:
+    """Report actual SR failure and reflect the active fallback in the checkbox."""
+    if not st.cfg.get("dlss_sr", False):
+        return
+    for line in reversed(st.worker_logs):
+        if "[sr]" not in line:
+            continue
+        if "failed" in line or "unavailable" in line:
+            st.cfg["dlss_sr"] = False
+            save_menu_layout(st)
+            st.display.alert(UI_STRINGS[st.lang]["dlss_sr_failed"], duration=6.0)
+        return
 
-    The worker asks the OUTPUT it duplicates for its colour space, so this
-    is about the screen being processed rather than about some monitor in
-    the registry. The network is trained on SDR and an HDR desktop comes
-    out looking blown out with sliders that appear to do nothing - a report
-    we have had (issue #27) and a notice a user asked for (issue #33).
+
+def warn_hdr(st) -> None:
+    """Warn only when an HDR display actually uses the SDR capture path.
+
+    Display discovery precedes the first frame. Wait for its capture format:
+    FP16 scRGB uses an SDR neural proxy and preserves the original HDR signal.
     """
     if st.hdr_alerted:
         return
-    for line in reversed(st.worker_logs[-200:]):
-        if "HDR IS ON for the captured display" in line:
+    capture_sdr = None
+    for line in reversed(st.worker_logs):
+        if capture_sdr is None and "[hdr] capture=" in line:
+            capture_sdr = "capture=SDR;" in line
+        if "[dda] output colour space " in line:
+            if "HDR IS ON for the captured display" not in line or capture_sdr is not True:
+                return
             st.hdr_alerted = True
             st.display.alert(UI_STRINGS[st.lang].get(
                 "hdr_on",
-                "HDR is on for this display - the picture will look wrong. "
-                "Turn HDR off for it."), duration=6.0)
-            print("[main] HDR is on for the captured display - the network "
-                  "is trained on SDR")
+                "HDR display is using SDR capture. HDR brightness and colours "
+                "are not preserved."), duration=6.0)
+            print("[main] HDR display is using SDR capture; HDR is not preserved")
             return
 
 
@@ -547,6 +597,11 @@ def menu_payload(st) -> dict:
         "screenshot_dir": st.cfg.get("screenshot_dir") or "",
         "spout": bool(st.cfg.get("spout", False)),
         "skip_static": bool(st.cfg.get("skip_static", True)),
+        "dlss_sr_scale": float(st.cfg.get("dlss_sr_scale", .65)),
+        "dlss_sr": bool(st.cfg.get("dlss_sr", False)),
+        "ui_detection": bool(st.cfg.get("ui_detection", False)),
+        "frame_generation": bool(st.cfg.get("frame_generation", False)),
+        "frame_multiplier": min(4, max(2, int(st.cfg.get("frame_multiplier", 2)))),
         # Is the network idling on an unchanged screen right now? The
         # worker says so in its log; without this the menu shows a
         # healthy FPS while nothing is being processed, and the skip
@@ -577,6 +632,7 @@ def menu_payload(st) -> dict:
             (f"{h:X}: {t}" for h, t in wins if h == st.window_hwnd), ""),
         "version": APP_VERSION,
         "channel": CHANNEL_LABEL,
+        "library_updates": library_checker.snapshot(),
     }
 
 

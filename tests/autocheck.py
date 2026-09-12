@@ -85,11 +85,12 @@ def zip_integrity():
         "display.py", "guides.py", "hotkeys.py", "tray.py", "capture.py",
         "audio.py", "protocol.py", "winapi.py", "dialogs.py", "channels.py",
         "settings_io.py", "paths.py", "pipeline.py", "commands.py",
-        "startup.py",
+        "startup.py", "library_updates.py", "resolution_limits.py", "ui_detection.py",
         "NeuralScreen.exe",
         "TECHNICAL.md", "TECHNICAL.ru.md",
         "README.md", "README.ru.md", "NeuralScreen.vbs", "NeuralScreen.bat",
         "native/nvngx.dll", "native/nvngx_dlssnr.dll",
+        "native/nvngx_dlss.dll", "native/nvngx_dlssg.dll",
         # Neural Rendering does not start without it: the NGX calls
         # have to leave a module whose path carries "nvngx.dll".
         "native/nvngx.dll_ns-forwarder.dll",

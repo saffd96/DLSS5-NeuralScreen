@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 import cv2
 import numpy as np
+from ui_detection import UIRegionDetector
 
 
 @dataclass(slots=True)
@@ -11,6 +12,7 @@ class GuideFrame:
     motion: np.ndarray
     reset: bool
     scene_score: float
+    ui_regions: tuple = ()
 
 
 class TemporalGuideGenerator:
@@ -33,6 +35,7 @@ class TemporalGuideGenerator:
         self.flow_height = max(64, int(round(height * scale / 2) * 2))
         self.emit_small = emit_small
         self.previous_gray: np.ndarray | None = None
+        self.ui_detector = UIRegionDetector()
         self._zero_motion = np.zeros((self.height, self.width, 2), dtype=np.float16)
         self._zero_small = np.zeros((self.flow_height, self.flow_width, 2), dtype=np.float16)
         self._flow_f16 = np.empty((self.flow_height, self.flow_width, 2), dtype=np.float16)
@@ -49,9 +52,8 @@ class TemporalGuideGenerator:
         # static desktop produces small noise vectors (capture noise,
         # cursor jitter, UI shimmer). Vectors below the noise floor are
         # zeroed - NGX would otherwise treat them as real motion and smear
-        # text/UI. The floor is in flow-resolution pixels: 0.5 px at a
-        # 320-wide flow is ~6 px at 4K work resolution, far below any real
-        # motion (a 2 px scroll at 4K is 0.17 px in flow space).
+        # text/UI. The floor is in work-resolution pixels. Applying it on
+        # the small flow grid erased real 1–6 pixel scrolling at high resolution.
         self._flow_noise_floor = 0.5
 
     @property
@@ -77,7 +79,7 @@ class TemporalGuideGenerator:
         return GuideFrame(motion=motion, reset=True, scene_score=1.0)
 
     def process(self, rgba: np.ndarray | None = None,
-                gray: np.ndarray | None = None) -> GuideFrame:
+                gray: np.ndarray | None = None, detect_ui: bool = False) -> GuideFrame:
         """Compute the guides: motion/reset/scene_score.
 
         Either rgba (full-res BGR/RGBA — downsampled here) or a ready gray
@@ -117,8 +119,6 @@ class TemporalGuideGenerator:
                 # vectors even on a static screen (capture noise, cursor
                 # jitter); NGX would smear text/UI on them. The mask is
                 # computed on the flow grid (115k elements, not 3M).
-                mag = np.hypot(cur_to_prev[..., 0], cur_to_prev[..., 1])
-                cur_to_prev[mag < self._flow_noise_floor] = 0.0
                 # Scale BEFORE the upscale: 115k elements instead of 3M, and
                 # exactly equivalent because resize is linear (verified: the
                 # two orders differ by 0.002, i.e. float16 rounding).
@@ -126,6 +126,8 @@ class TemporalGuideGenerator:
                             out=self._flow_scaled[..., 0])
                 np.multiply(cur_to_prev[..., 1], self.height / self.flow_height,
                             out=self._flow_scaled[..., 1])
+                mag = np.hypot(self._flow_scaled[..., 0], self._flow_scaled[..., 1])
+                self._flow_scaled[mag < self._flow_noise_floor] = 0.0
                 if self.emit_small:
                     # The worker upscales it on the GPU — all that is left
                     # here is converting 115k values to float16.
@@ -136,6 +138,11 @@ class TemporalGuideGenerator:
                                dst=self._motion_f32, interpolation=cv2.INTER_LINEAR)
                     np.copyto(self._motion_f16, self._motion_f32, casting="same_kind")
                     motion = self._motion_f16
+        if detect_ui:
+            ui_regions = self.ui_detector.process(current, reset=reset)
+        else:
+            self.ui_detector.reset()
+            ui_regions = ()
         self.previous_gray = current
         expected = (self.flow_width * self.flow_height if self.emit_small else pixels)
         assert motion.size == expected * 2
@@ -148,4 +155,5 @@ class TemporalGuideGenerator:
             motion=motion,
             reset=reset,
             scene_score=scene_score,
+            ui_regions=ui_regions,
         )

@@ -37,6 +37,7 @@ import sys
 import threading
 import time
 import uuid
+import warnings
 from pathlib import Path
 
 
@@ -69,7 +70,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import cv2
 import numpy as np
-import pygame  # HUD overlay on the recorded frame (image.frombuffer)
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+with warnings.catch_warnings():
+    # pygame 2.6 uses this deprecated API internally; keep other warnings visible.
+    warnings.filterwarnings("ignore", message=r"pkg_resources is deprecated as an API.*",
+                            category=UserWarning, module=r"pygame\.pkgdata")
+    import pygame  # HUD overlay on the recorded frame (image.frombuffer)
 
 from capture import (ScreenCapture, devicename_for_output_idx, list_monitors,
                      resolve_output_idx)
@@ -141,7 +147,7 @@ from protocol import (  # noqa: F401
     SHM_MAGIC, VIDEO_MAGIC, WGC_ACK_FMT, WGC_ACK_MAGIC, WGC_FMT,
     WGC_MAGIC, WINDOW_ACK_FMT, WINDOW_ACK_MAGIC, WINDOW_FLAG_CAPTURABLE,
     WINDOW_FLAG_DISABLE, WINDOW_FMT, WINDOW_MAGIC, WorkerReader,
-    _read_exact, send_dda, send_frame, send_gray, send_motion_size,
+    _read_exact, sync_sr_scale, prepare_capture, send_ui_regions, send_dda, send_frame, send_gray, send_motion_size,
     send_out, send_resize, send_wgc, send_window)
 
 
@@ -329,6 +335,13 @@ def main() -> int:
     if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
         print("[main] another NeuralScreen is already running - this copy exits", file=sys.stderr)
         return 1
+
+    # The 320x180 motion field is too small to benefit from a large thread
+    # pool: 32 threads measured 6.5-7 ms versus 2.8 ms with four, with identical
+    # motion vectors. Configure once before capture/recording threads start;
+    # keep a lower thread count if the environment already selected one.
+    cv2.setNumThreads(min(4, max(1, cv2.getNumThreads())))
+    print(f"[main] OpenCV threads: {cv2.getNumThreads()}")
 
     # The config file's path, kept in the state: the settings module writes
     # back into it and has no business knowing what argparse is.
@@ -524,6 +537,8 @@ def main() -> int:
                 # nothing", which is a report we have had (issue #27) and a
                 # notice a user asked for (issue #33). Once per session.
                 settings_io.warn_hdr(st)
+                settings_io.refresh_sr(st)
+                settings_io.show_update_notice(st)
 
             # --- Input for the overlay menu --------------------------
             # Events are read only while the menu is open: the rest of the
@@ -573,33 +588,39 @@ def main() -> int:
             # parameters and carries on. This is the last line of defence:
             # the program does not fall over.
             try:
-                t0 = time.perf_counter()
-                if st.gray_active:
-                    guide = st.guides.process(gray=st.shm.read_gray())
-                else:
-                    guide = st.guides.process(st.work_frame)
-                _perf("guides", t0)
-            except Exception as guide_exc:
-                # guides is not critical: ValueError/TypeError/cv2.error (the
-                # shape of the gray frame, a division by zero) must not take
-                # the process down. We skip the frame - the worker gets the
-                # next one. But a persistent error (an incompatible gray
-                # channel, a broken shape) would spin main at 100% CPU -
-                # after 5 failures in a row we fall back to zero motion: the
-                # frames keep flowing and the picture does not freeze.
-                print(f"[main] guides.process failed ({guide_exc}) - frame skipped",
-                      file=sys.stderr)
-                st.guide_fails += 1
-                if st.guide_fails >= 5:
-                    print(f"[main] guides.process is unstable - zero motion "
-                          f"(frames keep flowing)", file=sys.stderr)
-                    st.guide_fails = 0
-                    guide = st.guides.zero_guide()
-                else:
-                    continue
-            try:
                 check_worker(st.worker, st.worker_logs)
+                sync_sr_scale(st.worker, st.reader, float(st.cfg.get("dlss_sr_scale", .65)))
+                if st.gray_active:
+                    prepare_capture(st.worker, st.reader, st.frame_index, st.pts)
+                try:
+                    t0 = time.perf_counter()
+                    detect_ui = bool(st.cfg.get("ui_detection", False) and
+                                     st.cfg.get("frame_generation", False))
+                    if st.gray_active:
+                        guide = st.guides.process(gray=st.shm.read_gray(), detect_ui=detect_ui)
+                    else:
+                        guide = st.guides.process(st.work_frame, detect_ui=detect_ui)
+                    _perf("guides", t0)
+                except Exception as guide_exc:
+                    # guides is not critical: ValueError/TypeError/cv2.error (the
+                    # shape of the gray frame, a division by zero) must not take
+                    # the process down. We skip the frame - the worker gets the
+                    # next one. But a persistent error (an incompatible gray
+                    # channel, a broken shape) would spin main at 100% CPU -
+                    # after 5 failures in a row we fall back to zero motion: the
+                    # frames keep flowing and the picture does not freeze.
+                    print(f"[main] guides.process failed ({guide_exc}) - frame skipped",
+                          file=sys.stderr)
+                    st.guide_fails += 1
+                    if st.guide_fails >= 5:
+                        print(f"[main] guides.process is unstable - zero motion "
+                              f"(frames keep flowing)", file=sys.stderr)
+                        st.guide_fails = 0
+                        guide = st.guides.zero_guide()
+                    else:
+                        continue
                 t0 = time.perf_counter()
+                send_ui_regions(st.worker, st.frame_index, guide.ui_regions)
                 send_frame(st.worker, st.frame_index, st.work_frame, guide.motion, guide.reset,
                            st.pts, st.shm, want_pixels=(st.pending_shot is not None
                                                    or (st.recorder is not None
@@ -608,7 +629,11 @@ def main() -> int:
                            no_color=bool(st.dda_mode),
                            bypass=bypass,
                            split=st.split_pos,
-                           skip_static=bool(st.cfg.get("skip_static", True)))
+                           skip_static=bool(st.cfg.get("skip_static", True)),
+                           frame_generation=bool(st.cfg.get("frame_generation", False)),
+                           frame_multiplier=int(st.cfg.get("frame_multiplier", 2)),
+                           prepared=bool(st.gray_active),
+                           dlss_sr=bool(st.cfg.get("dlss_sr", False)))
                 _perf("send", t0)
             except (BrokenPipeError, OSError, EOFError, RuntimeError) as exc:
                 st.consecutive_restarts += 1

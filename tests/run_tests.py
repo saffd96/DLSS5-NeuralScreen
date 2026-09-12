@@ -14,8 +14,8 @@ Two of the stages take over the screen for a few seconds each (the overlay is
 raised for real) and the machine should be left alone while they run. Nothing
 here needs the network except the release-notes check inside autocheck.
 
-Only tests tracked by git are run: the working copy also holds throwaway
-probes, and those are nobody's regression suite.
+All tests/test_*.py files are discovered, including newly added regressions.
+Use --gpu to include the opt-in native SR/FG/capture and shader tests.
 """
 from __future__ import annotations
 
@@ -113,15 +113,15 @@ ABOUT = {
 
 
 def tracked_tests() -> list:
-    try:
-        out = subprocess.check_output(["git", "ls-files", "tests/test_*.py"], cwd=ROOT,
-                                      text=True, encoding="utf-8", errors="replace")
-        names = [n.strip() for n in out.splitlines() if n.strip()]
-        if names:
-            return sorted(names)
-    except Exception as exc:
-        print(f"(git ls-files failed: {exc!r} - falling back to a glob)")
-    return sorted(p.name for p in ROOT.glob("tests/test_*.py"))
+    return sorted(p.relative_to(ROOT).as_posix() for p in ROOT.glob("tests/test_*.py"))
+
+
+GPU_ARGS = {
+    "test_super_resolution.py": ["--run"],
+    "test_prepared_capture.py": ["--run"],
+    "test_frame_generation.py": ["--hdr", "--dynamic", "--sr", "--check-pixels", "--ui"],
+    "test_quality_gpu.py": ["--run"],
+}
 
 
 def settle(limit: float = SETTLE_LIMIT) -> float:
@@ -203,7 +203,11 @@ def main() -> int:
     for name in tracked_tests():
         if only is not None and only not in name:
             continue
-        results.append(run(name, [name], ABOUT.get(name, "")))
+        flags = GPU_ARGS.get(Path(name).name)
+        if flags is not None and "--gpu" not in sys.argv:
+            print(f"SKIP {name}: requires --gpu")
+            continue
+        results.append(run(name, [name] + (flags or []), ABOUT.get(Path(name).name, "")))
     if only is None and "--no-smoke" not in sys.argv:
         results.append(run("smoke", ["autocheck.py", "--smoke"],
                            "launch -> processing -> exit"))
@@ -212,6 +216,9 @@ def main() -> int:
                            "launch -> record -> exit"))
 
     print("\n" + "=" * 70)
+    if not results:
+        print("No tests ran for this selection (GPU tests require --gpu).")
+        return 1
     width = max(len(r["label"]) for r in results)
     for r in results:
         print(f"{'PASS' if r['ok'] else 'FAIL'}  {r['label']:<{width}}  {r['took']:6.1f}s")

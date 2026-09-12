@@ -225,6 +225,8 @@ def configure(st) -> None:
     not. Everything else lands on the state: the config, the NR parameters,
     the presets, the monitor and the resolution the pipeline will run at.
     """
+    from library_updates import apply_pending
+    apply_pending()
     st.cfg = load_config(st.cfg_path)
     st.params = resolve_params(st.cfg)
     st.presets = load_presets(st.cfg)
@@ -498,3 +500,5 @@ def bring_up(st) -> None:
     st.next_auto_revive = 0.0      # monotonic deadline; 0 = no revive pending
     st.consecutive_restarts = 0
     st.guide_fails = 0
+    from library_updates import checker as library_checker
+    library_checker.start()

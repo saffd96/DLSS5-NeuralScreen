@@ -94,7 +94,7 @@ STRINGS = {
         "nr_res_full": "full",
         "boost": "Boost",
         "boost_hint": "the network runs at a lower resolution;\ndetail comes back off the native frame",
-        "hdr_on": "HDR is on for this display - the picture will look wrong. Turn HDR off for it.",
+        "hdr_on": "HDR display is using SDR capture. HDR brightness and colours are not preserved.",
         "win_mode_on": "One window: processing the focused window",
         "win_mode_off": "Full screen again",
         "spout_on": "Spout2 output ON",
@@ -215,7 +215,7 @@ STRINGS = {
         "nr_res_full": "весь экран",
         "boost": "Boost",
         "boost_hint": "сеть работает на пониженном разрешении;\nдетали возвращаются с нативного кадра",
-        "hdr_on": "На этом дисплее включён HDR - картинка будет неправильной. Выключите HDR для него.",
+        "hdr_on": "Дисплей работает в HDR, но захват идёт в SDR. Яркость и цвета HDR не сохраняются.",
         "win_mode_on": "Одно окно: обрабатывается активное окно",
         "win_mode_off": "Снова весь экран",
         "spout_on": "Вывод в Spout2 включён",
@@ -336,7 +336,7 @@ STRINGS = {
         "nr_res_full": "plein",
         "boost": "Boost",
         "boost_hint": "le réseau travaille en résolution réduite ;\nle détail revient de l'image native",
-        "hdr_on": "Le HDR est actif sur cet écran - l'image sera fausse. Désactivez-le pour cet écran.",
+        "hdr_on": "Écran HDR capturé en SDR. La luminosité et les couleurs HDR ne sont pas préservées.",
         "win_mode_on": "Une fenêtre : traitement de la fenêtre active",
         "win_mode_off": "Retour au plein écran",
         "spout_on": "Sortie Spout2 activée",
@@ -457,7 +457,7 @@ STRINGS = {
         "nr_res_full": "voll",
         "boost": "Boost",
         "boost_hint": "das Netz arbeitet mit geringerer Auflösung;\ndie Details kommen aus dem nativen Bild",
-        "hdr_on": "HDR ist für diesen Bildschirm aktiv - das Bild wird falsch. Schalten Sie HDR dafür aus.",
+        "hdr_on": "Der HDR-Bildschirm wird in SDR erfasst. HDR-Helligkeit und -Farben bleiben nicht erhalten.",
         "win_mode_on": "Ein Fenster: das aktive Fenster wird verarbeitet",
         "win_mode_off": "Wieder Vollbild",
         "spout_on": "Spout2-Ausgabe AN",
@@ -578,7 +578,7 @@ STRINGS = {
         "nr_res_full": "completo",
         "boost": "Boost",
         "boost_hint": "la red trabaja a menor resolución;\nel detalle vuelve del fotograma nativo",
-        "hdr_on": "El HDR está activado en esta pantalla - la imagen saldrá mal. Desactívalo para ella.",
+        "hdr_on": "La pantalla HDR se captura en SDR. No se conservan el brillo ni los colores HDR.",
         "win_mode_on": "Una ventana: se procesa la ventana activa",
         "win_mode_off": "Volver a pantalla completa",
         "spout_on": "Salida Spout2 activada",
@@ -699,7 +699,7 @@ STRINGS = {
         "nr_res_full": "completo",
         "boost": "Boost",
         "boost_hint": "la rete lavora a risoluzione ridotta;\nil dettaglio torna dal fotogramma nativo",
-        "hdr_on": "L'HDR è attivo su questo schermo - l'immagine sarà sbagliata. Disattivalo per questo schermo.",
+        "hdr_on": "Lo schermo HDR viene acquisito in SDR. Luminosità e colori HDR non vengono conservati.",
         "win_mode_on": "Una finestra: elaborazione della finestra attiva",
         "win_mode_off": "Di nuovo schermo intero",
         "spout_on": "Uscita Spout2 attiva",
@@ -820,7 +820,7 @@ STRINGS = {
         "nr_res_full": "completo",
         "boost": "Boost",
         "boost_hint": "a rede trabalha em resolução menor;\no detalhe volta do quadro nativo",
-        "hdr_on": "O HDR está ligado neste ecrã - a imagem vai sair errada. Desligue o HDR para ele.",
+        "hdr_on": "O ecrã HDR está a ser capturado em SDR. O brilho e as cores HDR não são preservados.",
         "win_mode_on": "Uma janela: processando a janela ativa",
         "win_mode_off": "Tela cheia novamente",
         "spout_on": "Saída Spout2 ativada",
@@ -941,7 +941,7 @@ STRINGS = {
         "nr_res_full": "pełny",
         "boost": "Boost",
         "boost_hint": "sieć pracuje w niższej rozdzielczości;\ndetal wraca z natywnej klatki",
-        "hdr_on": "Na tym ekranie włączony jest HDR - obraz będzie nieprawidłowy. Wyłącz dla niego HDR.",
+        "hdr_on": "Ekran HDR jest przechwytywany w SDR. Jasność i kolory HDR nie są zachowywane.",
         "win_mode_on": "Jedno okno: przetwarzane jest aktywne okno",
         "win_mode_off": "Znowu pełny ekran",
         "spout_on": "Wyjście Spout2 włączone",
@@ -1062,7 +1062,7 @@ STRINGS = {
         "nr_res_full": "весь екран",
         "boost": "Boost",
         "boost_hint": "мережа працює на зниженій роздільності;\nдеталі повертаються з нативного кадру",
-        "hdr_on": "На цьому дисплеї увімкнено HDR - зображення буде неправильним. Вимкніть для нього HDR.",
+        "hdr_on": "Дисплей працює в HDR, але захоплення йде в SDR. Яскравість і кольори HDR не зберігаються.",
         "win_mode_on": "Одне вікно: обробляється активне вікно",
         "win_mode_off": "Знову весь екран",
         "spout_on": "Вивід у Spout2 увімкнено",
@@ -1183,7 +1183,7 @@ STRINGS = {
         "nr_res_full": "全屏",
         "boost": "Boost",
         "boost_hint": "网络以较低分辨率运行；\n细节取自原生画面",
-        "hdr_on": "此显示器已开启 HDR，画面会不正确。请为它关闭 HDR。",
+        "hdr_on": "HDR 显示器正在以 SDR 格式捕获，无法保留 HDR 亮度和色彩。",
         "win_mode_on": "单窗口：处理当前活动窗口",
         "win_mode_off": "恢复全屏",
         "spout_on": "Spout2 输出已开启",
@@ -1304,7 +1304,7 @@ STRINGS = {
         "nr_res_full": "全画面",
         "boost": "Boost",
         "boost_hint": "ネットワークは低い解像度で動作します。\nディテールはネイティブ画面から戻します",
-        "hdr_on": "このディスプレイは HDR が有効です。映像が正しく出ません。HDR をオフにしてください。",
+        "hdr_on": "HDR ディスプレイを SDR でキャプチャしています。HDR の明るさと色は保持されません。",
         "win_mode_on": "1つのウィンドウ：アクティブなウィンドウを処理",
         "win_mode_off": "全画面に戻る",
         "spout_on": "Spout2 出力オン",
@@ -1425,7 +1425,7 @@ STRINGS = {
         "nr_res_full": "전체",
         "boost": "Boost",
         "boost_hint": "네트워크가 낮은 해상도로 동작합니다.\n디테일은 원본 화면에서 되살립니다",
-        "hdr_on": "이 디스플레이는 HDR이 켜져 있습니다. 화면이 잘못 보입니다. HDR을 꺼 주세요.",
+        "hdr_on": "HDR 디스플레이를 SDR로 캡처하고 있습니다. HDR 밝기와 색상이 보존되지 않습니다.",
         "win_mode_on": "단일 창: 활성 창 처리",
         "win_mode_off": "전체 화면으로 복귀",
         "spout_on": "Spout2 출력 켜짐",
@@ -1483,3 +1483,74 @@ STRINGS = {
 def tr(lang: str, key: str) -> str:
     """Translate a STRINGS key; an unknown key comes back unchanged."""
     return STRINGS.get(lang, STRINGS[DEFAULT_LANG]).get(key, key)
+
+# Frame generation controls use the same keys in every language.
+_FG_MULTIPLIER_LABELS = {
+    "en": "Output frame multiplier", "ru": "Множитель кадров",
+    "fr": "Multiplicateur d’images", "de": "Bildmultiplikator",
+    "es": "Multiplicador de fotogramas", "it": "Moltiplicatore dei fotogrammi",
+    "pt": "Multiplicador de quadros", "pl": "Mnożnik klatek",
+    "uk": "Множник кадрів", "zh": "帧数倍率", "ja": "フレーム倍率", "ko": "프레임 배수",
+}
+for _language, _strings in STRINGS.items():
+    _strings["frame_generation"] = "DLSS Frame Generation"
+    _strings["frame_multiplier"] = _FG_MULTIPLIER_LABELS.get(_language, "Output frame multiplier")
+
+for _table in STRINGS.values():
+    _table["dlss_sr"] = "DLSS Super Resolution"
+
+for _table in STRINGS.values():
+    _table["dlss_sr_hint"] = "the network runs at a lower resolution;\nDLSS restores the output resolution (experimental)"
+    _table["dlss_sr_failed"] = "DLSS Super Resolution failed. Neural rendering remains active."
+STRINGS["ru"]["dlss_sr_hint"] = "сеть работает на пониженном разрешении;\nDLSS восстанавливает размер кадра (эксперимент)"
+STRINGS["ru"]["dlss_sr_failed"] = "DLSS Super Resolution не сработал. Нейрорендеринг продолжает работать."
+
+for _table in STRINGS.values():
+    _table["dlss_sr_input"] = "DLSS input resolution"
+STRINGS["ru"]["dlss_sr_input"] = "Входное разрешение DLSS"
+
+for _table in STRINGS.values():
+    _table["ui_detection"] = "HUD protection in FG (experimental)"
+STRINGS["ru"]["ui_detection"] = "Защита UI при генерации (эксперимент)"
+
+for _table in STRINGS.values():
+    _table["nr_min_hint"] = "minimum processing size is limited automatically"
+STRINGS["ru"]["nr_min_hint"] = "минимальный размер обработки ограничен автоматически"
+
+for _table in STRINGS.values():
+    _table.update({
+        "lib_section": "DLSS library versions",
+        "lib_check": "Check official versions",
+        "lib_checking": "Checking versions…",
+        "lib_update": "Update available",
+        "lib_install": "Update",
+        "lib_notice": "Library updates available",
+        "lib_close": "Close",
+        "lib_downloading": "Downloading update…",
+        "lib_download_failed": "Download failed — retry",
+        "lib_install_failed": "Installation failed — retry update",
+        "lib_pending": "Update ready — restart the app",
+        "lib_current": "Matches official version",
+        "lib_newer": "Local version is newer",
+        "lib_no_source": "No public update source",
+        "lib_missing": "Library not found",
+        "lib_unknown": "Could not verify version",
+    })
+STRINGS["ru"].update({
+    "lib_section": "Версии библиотек DLSS",
+    "lib_check": "Проверить официальные версии",
+    "lib_checking": "Проверка версий…",
+    "lib_update": "Доступно обновление",
+    "lib_install": "Обновить",
+    "lib_notice": "Доступны новые версии библиотек",
+    "lib_close": "Закрыть",
+    "lib_downloading": "Загрузка обновления…",
+    "lib_download_failed": "Ошибка загрузки — повторите",
+    "lib_install_failed": "Ошибка установки — повторите обновление",
+    "lib_pending": "Загружено — перезапустите программу",
+    "lib_current": "Совпадает с официальной версией",
+    "lib_newer": "Локальная версия новее",
+    "lib_no_source": "Нет публичного источника обновлений",
+    "lib_missing": "Библиотека не найдена",
+    "lib_unknown": "Не удалось проверить версию",
+})
