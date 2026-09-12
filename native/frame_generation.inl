@@ -246,11 +246,16 @@ static bool EnsureFg(VideoState &v, DXGI_FORMAT format)
         if (!slot.real) return false;
         for (unsigned i = 0; i < g_fg_count; ++i)
         {
-            slot.interpolated[i].attach(MakeTex(w, height, format, false));
+            slot.interpolated[i].attach(MakeTex(w, height, format, true));
             if (!slot.interpolated[i]) return false;
         }
     }
     if (!BeginCommands()) return false;
+    for (unsigned i = 0; i < g_fg_count; ++i)
+    {
+        auto to_copy = Transition(g_fg.output[i].get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        h.list->ResourceBarrier(1, &to_copy);
+    }
     for (auto &slot : g_fg.slots) for (unsigned i = 0; i <= g_fg_count; ++i)
     {
         auto texture = i ? slot.interpolated[i - 1].get() : slot.real.get();
@@ -295,13 +300,13 @@ static void FgDump(ID3D12Resource *source, D3D12_RESOURCE_STATES state, unsigned
     if (FAILED(h.dev->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &bd,
         D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(rb.put()))) || !BeginCommands()) return;
     auto pre = Transition(source, state, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    h.list->ResourceBarrier(1, &pre);
+    if (state != D3D12_RESOURCE_STATE_COPY_SOURCE) h.list->ResourceBarrier(1, &pre);
     D3D12_TEXTURE_COPY_LOCATION from = {}, to = {};
     from.pResource = source; from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     to.pResource = rb.get(); to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; to.PlacedFootprint = fp;
     h.list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
     auto post = Transition(source, D3D12_RESOURCE_STATE_COPY_SOURCE, state);
-    h.list->ResourceBarrier(1, &post);
+    if (state != D3D12_RESOURCE_STATE_COPY_SOURCE) h.list->ResourceBarrier(1, &post);
     if (!WaitFenceValue(h.fence, EndCommands(), 30000)) return;
     BYTE *data = nullptr; D3D12_RANGE read = {0, static_cast<SIZE_T>(bytes)}, written = {0, 0};
     if (FAILED(rb->Map(0, &read, reinterpret_cast<void **>(&data)))) return;
@@ -351,7 +356,7 @@ static bool FgPresent(VideoState &v, ID3D12Resource *color, D3D12_RESOURCE_STATE
         ep.pOutputDisableInterpolation = g_fg.disable.get();
         auto pre = Transition(color, state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         if (state != D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) h.list->ResourceBarrier(1, &pre);
-        auto out_pre = Transition(g_fg.output[index].get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        auto out_pre = Transition(g_fg.output[index].get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         h.list->ResourceBarrier(1, &out_pre);
         const auto result = NGX_D3D12_EVALUATE_DLSSG(h.list, g_fg.feature, p, &ep, &opt);
         auto disable_pre = Transition(g_fg.disable.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -360,7 +365,7 @@ static bool FgPresent(VideoState &v, ID3D12Resource *color, D3D12_RESOURCE_STATE
         auto disable_post = Transition(g_fg.disable.get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         h.list->ResourceBarrier(1, &disable_post);
         if (NVSDK_NGX_SUCCEED(result)) ProtectFgUi(color, g_fg.output[index].get());
-        auto out_post = Transition(g_fg.output[index].get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+        auto out_post = Transition(g_fg.output[index].get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
         h.list->ResourceBarrier(1, &out_post);
         auto post = Transition(color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, state);
         if (state != D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) h.list->ResourceBarrier(1, &post);
@@ -379,11 +384,14 @@ static bool FgPresent(VideoState &v, ID3D12Resource *color, D3D12_RESOURCE_STATE
         if (!slot) { WaitFenceValue(h.fence, EndCommands(), 30000); return true; }
         slot->state = 1;
     }
-    for (unsigned i = 0; i <= g_fg_count; ++i)
+    // The reserved slot is invisible to the presenter until the fence completes.
+    // Hand it the generated textures and reuse its old buffers next frame.
+    for (unsigned i = 0; i < g_fg_count; ++i)
+        std::swap(g_fg.output[i], slot->interpolated[i]);
     {
-        auto source = i ? g_fg.output[i - 1].get() : color;
-        auto destination = i ? slot->interpolated[i - 1].get() : slot->real.get();
-        const auto rest = i ? D3D12_RESOURCE_STATE_COMMON : state;
+        auto source = color;
+        auto destination = slot->real.get();
+        const auto rest = state;
         D3D12_RESOURCE_BARRIER before[] = {
             Transition(source, rest, D3D12_RESOURCE_STATE_COPY_SOURCE),
             Transition(destination, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST)};
@@ -412,7 +420,7 @@ static bool FgPresent(VideoState &v, ID3D12Resource *color, D3D12_RESOURCE_STATE
     }
     else allow_interpolation = false;
     FgDump(color, state, 0);
-    for (unsigned i = 0; i < g_fg_count; ++i) FgDump(g_fg.output[i].get(), D3D12_RESOURCE_STATE_COMMON, i + 1);
+    for (unsigned i = 0; i < g_fg_count; ++i) FgDump(slot->interpolated[i].get(), D3D12_RESOURCE_STATE_COPY_SOURCE, i + 1);
     SpoutBridgeSend();
     {
         std::lock_guard<std::mutex> lock(g_fg.mutex);

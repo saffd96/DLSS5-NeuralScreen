@@ -8,6 +8,7 @@ import threading
 import numpy as np
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT))
+sys.path.insert(0,str(Path(__file__).resolve().parent))
 import protocol as wire
 from test_prepared_capture import exact
 
@@ -21,9 +22,9 @@ def run():
     def ack(fmt):return struct.unpack(fmt,exact(p.stdout,struct.calcsize(fmt)))
     try:
         p.stdin.write(struct.pack(wire.HEADER_FMT,wire.VIDEO_MAGIC,w,h,1,0,0,0,1,0,0,1.,1.,1.,-1.,ow,oh));p.stdin.flush()
-        for i in range(80):
-            if i in (20,25,30,75):
-                scale={20:50,25:25,30:50,75:100}[i]
+        for i in range(85):
+            if i in (0,15,20,25,30,75,80):
+                scale={0:100,15:65,20:50,25:25,30:50,75:100,80:50}[i]
                 p.stdin.write(struct.pack(wire.FRAME_FMT, wire.SR_SCALE_MAGIC, i, scale, 0, i));p.stdin.flush()
                 assert ack(wire.OUT_FMT)[1:3] == (i, 1)
             if i in (35,70):
@@ -32,13 +33,16 @@ def run():
                 wire.send_resize(p,params,w,h,1,ow,oh,nr_small=i!=70)
                 a=ack(wire.RACK_FMT);assert a[1]==1,a
             frame=np.full((oh,ow,4),(30,90,150,255),np.uint8)
-            frame[100:350,100+i*3:350+i*3,:3]=(210,80,30)
+            position=9 if i==10 else i
+            frame[100:350,100+position*3:350+position*3,:3]=(210,80,30)
             motion=np.zeros((h,w,2),np.float16);motion[:,:,0]=-3*w/ow
             bypass=45<=i<48
             sr=10<=i<55 or i>=60
-            wire.send_frame(p,i,frame,motion,i in (0,35,48,60),i,bypass=bypass,dlss_sr=sr)
+            wire.send_frame(p,i,frame,motion,i in (0,9,10,35,48,60),i,bypass=bypass,dlss_sr=sr)
             a=ack(wire.OUT_FMT);assert a[2]==1 and a[3]==ow*oh*4,a
             out=np.frombuffer(exact(p.stdout,a[3]),np.uint8).reshape(oh,ow,4)
+            if i==9:sr_off=out.copy()
+            if i==10:assert np.array_equal(out,sr_off),'100% SR changed the ordinary NR output'
             if bypass:assert np.array_equal(out,frame),'SR changed bypass'
             assert out[:,:,:3].mean()>20,'black output'
         p.stdin.close();p.wait(timeout=10)
@@ -52,7 +56,9 @@ def run():
     assert 'reduced 480x270 -> NR 320x180 -> SR input 480x270 -> 960x540' in log
     assert 'reduced 480x270 -> NR 256x144 -> SR input 480x270 -> 960x540' in log
     assert 'reduced 480x270 -> NR 480x270 -> SR input 480x270 -> 960x540' in log
-    assert 'reduced 960x540 -> NR 960x540 -> SR input 960x540 -> 960x540' in log
+    assert 'SR input 960x540 -> 960x540' not in log
+    first_scale = log.index('input scale: 65%')
+    assert '[sr] Init_Ext' not in log[:first_scale], '100% initialized SR'
     assert 'input scale: 50% (before NR; Boost ratio unchanged)' in log
     assert log.count('[sr] first evaluation succeeded')>=4,log
     assert '[sr] Evaluate failed' not in log and '[sr] CreateFeature failed' not in log
