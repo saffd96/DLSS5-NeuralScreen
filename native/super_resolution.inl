@@ -57,14 +57,6 @@ static bool EnsureSr(VideoState &v)
     UINT sw = std::max(64u, ((ow * g_sr.scale + 100) / 200) * 2);
     UINT sh = std::max(64u, ((oh * g_sr.scale + 100) / 200) * 2);
     SafeProcessingSize(ow,oh,sw,sh);
-    // Equal effective dimensions need neither reconstruction nor DLAA.
-    // Keep the UI request so reducing the scale enables SR again.
-    if (sw == ow && sh == oh)
-    {
-        if (g_sr.feature) CloseSrResources();
-        g_sr.history = false;
-        return false;
-    }
     // Boost is relative to the already reduced SR input, independently of
     // the motion grid. No full-size NR/composite is needed on this path.
     UINT nw = v.nr_small ? std::max(64u, UINT((uint64_t(sw)*v.nr_w + ow)/(2*ow))*2) : sw;
