@@ -591,13 +591,15 @@ def main() -> int:
                 check_worker(st.worker, st.worker_logs)
                 sync_sr_scale(st.worker, st.reader, float(st.cfg.get("dlss_sr_scale", .65)))
                 if st.gray_active:
+                    t_prepare = time.perf_counter()
                     prepare_capture(st.worker, st.reader, st.frame_index, st.pts)
+                    st.perf.setdefault("prepare_capture", []).append((time.perf_counter()-t_prepare)*1000)
                 try:
                     t0 = time.perf_counter()
                     detect_ui = bool(st.cfg.get("ui_detection", False) and
                                      st.cfg.get("frame_generation", False))
                     if st.gray_active:
-                        guide = st.guides.process(gray=st.shm.read_gray(), detect_ui=detect_ui)
+                        guide = st.guides.process(gray=st.shm.read_gray(), detect_ui=detect_ui, compute_motion=os.environ.get("NS_GPU_FLOW_EXPERIMENT") != "1")
                     else:
                         guide = st.guides.process(st.work_frame, detect_ui=detect_ui)
                     _perf("guides", t0)
@@ -949,8 +951,8 @@ def main() -> int:
 
             if now - last_perf_log >= PERF_LOG_INTERVAL:
                 parts = []
-                for key in PERF_KEYS:
-                    samples = st.perf[key]
+                for key in (*PERF_KEYS, "prepare_capture"):
+                    samples = st.perf.get(key, [])
                     if samples:
                         parts.append(f"{key} {sum(samples) / len(samples):.1f}ms")
                     samples.clear()
