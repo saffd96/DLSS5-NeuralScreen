@@ -141,7 +141,7 @@ from protocol import (  # noqa: F401
     SHM_MAGIC, VIDEO_MAGIC, WGC_ACK_FMT, WGC_ACK_MAGIC, WGC_FMT,
     WGC_MAGIC, WINDOW_ACK_FMT, WINDOW_ACK_MAGIC, WINDOW_FLAG_CAPTURABLE,
     WINDOW_FLAG_DISABLE, WINDOW_FMT, WINDOW_MAGIC, WorkerReader,
-    _read_exact, sync_sr_scale, prepare_capture, send_dda, send_frame, send_gray, send_motion_size,
+    _read_exact, sync_sr_scale, prepare_capture, send_ui_regions, send_dda, send_frame, send_gray, send_motion_size,
     send_out, send_resize, send_wgc, send_window)
 
 
@@ -580,10 +580,12 @@ def main() -> int:
                     prepare_capture(st.worker, st.reader, st.frame_index, st.pts)
                 try:
                     t0 = time.perf_counter()
+                    detect_ui = bool(st.cfg.get("ui_detection", False) and
+                                     st.cfg.get("frame_generation", False))
                     if st.gray_active:
-                        guide = st.guides.process(gray=st.shm.read_gray())
+                        guide = st.guides.process(gray=st.shm.read_gray(), detect_ui=detect_ui)
                     else:
-                        guide = st.guides.process(st.work_frame)
+                        guide = st.guides.process(st.work_frame, detect_ui=detect_ui)
                     _perf("guides", t0)
                 except Exception as guide_exc:
                     # guides is not critical: ValueError/TypeError/cv2.error (the
@@ -604,6 +606,7 @@ def main() -> int:
                     else:
                         continue
                 t0 = time.perf_counter()
+                send_ui_regions(st.worker, st.frame_index, guide.ui_regions)
                 send_frame(st.worker, st.frame_index, st.work_frame, guide.motion, guide.reset,
                            st.pts, st.shm, want_pixels=(st.pending_shot is not None
                                                    or (st.recorder is not None

@@ -27,6 +27,18 @@ import numpy as np
 from paths import BASE_DIR  # noqa: F401
 
 
+def send_ui_regions(worker, index: int, regions) -> None:
+    """UIR1: frame-bound normalized rectangles; no acknowledgement or GPU readback."""
+    regions = tuple(regions)
+    if len(regions) > 32 or any(not (0 <= x < r <= 65535 and 0 <= y < b <= 65535)
+                               for x, y, r, b in regions):
+        raise ValueError("invalid UI regions")
+    # An empty packet is needed only once after disabling detection.
+    if not regions and not getattr(worker, "_ui_regions_sent", False):
+        return
+    payload = b"".join(struct.pack("<4H", *rect) for rect in regions)
+    worker.stdin.write(struct.pack("<4Iq", 0x31524955, index, len(regions), 0, 0) + payload)
+    worker._ui_regions_sent = bool(regions)
 
 
 # NGX feature 18 goes silent at 3840x2160 (verified in isolation: the worker

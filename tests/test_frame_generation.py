@@ -30,7 +30,7 @@ def exact(pipe, count):
     return result
 
 
-def run(hdr=False, dynamic=False, check_pixels=False, sr=False):
+def run(hdr=False, dynamic=False, check_pixels=False, sr=False, ui=False):
     w, h = 640, 360
     work_w, work_h = (428, 240) if sr else (w, h)
     if hdr:
@@ -94,6 +94,10 @@ def run(hdr=False, dynamic=False, check_pixels=False, sr=False):
                 prepared = struct.unpack(wire.OUT_FMT, exact(worker.stdout, struct.calcsize(wire.OUT_FMT)))
                 assert prepared[1] == i and prepared[2] == 1
                 flags |= wire.FRAME_FLAG_NO_COLOR | wire.FRAME_FLAG_PREPARED
+            if ui:
+                # Deliberately includes a moving boundary: exact equality proves
+                # post-FG compositing, rather than coincidentally stable pixels.
+                wire.send_ui_regions(worker, i, ((12000, 17000, 26000, 39000),))
             worker.stdin.write(struct.pack(wire.FRAME_FMT, wire.FRAME_MAGIC, i,
                                            int(i % 80 == 0 or i == 130), flags, i))
             if not hdr:
@@ -162,6 +166,11 @@ def run(hdr=False, dynamic=False, check_pixels=False, sr=False):
                 if generated == real_path:
                     continue
                 frame = decode(generated)
+                if ui:
+                    real_bits = np.fromfile(real_path, np.uint32).reshape(h, w)
+                    generated_bits = np.fromfile(generated, np.uint32).reshape(h, w)
+                    box = np.s_[17000*h//65535:39000*h//65535, 12000*w//65535:26000*w//65535]
+                    assert np.array_equal(real_bits[box], generated_bits[box]), "HUD changed after FG"
                 assert np.isfinite(frame).all()
                 ratio = frame[25:55, 525:595].mean() / white
                 assert .9 < ratio < 1.1, (generated.name, "HDR brightness flicker", ratio)
@@ -175,6 +184,6 @@ def run(hdr=False, dynamic=False, check_pixels=False, sr=False):
 
 if __name__ == "__main__":
     if "--run" in sys.argv or "--hdr" in sys.argv or "--dynamic" in sys.argv:
-        run("--hdr" in sys.argv, "--dynamic" in sys.argv, "--check-pixels" in sys.argv, "--sr" in sys.argv)
+        run("--hdr" in sys.argv, "--dynamic" in sys.argv, "--check-pixels" in sys.argv, "--sr" in sys.argv, "--ui" in sys.argv)
     else:
         print("SKIP: opt-in DLSS-G/GPU test; pass --run")
