@@ -293,6 +293,9 @@ def load_config(path: Path) -> dict:
         cfg["frame_multiplier"] = min(4, max(2, int(cfg.get("frame_multiplier", 2))))
     except (ValueError, TypeError, OverflowError):
         cfg["frame_multiplier"] = 2
+    from motion_backend import normalize_backend
+    cfg["motion_backend"] = normalize_backend(cfg.get("motion_backend", "gpu" if cfg.get("gpu_motion") else "cpu"))
+    cfg["gpu_motion"] = cfg["motion_backend"] == "gpu"
     return cfg
 
 
@@ -396,6 +399,7 @@ def _menu_layout_payload(cfg: dict, params: dict, monitor: int, lang: str,
         # HDR compatibility, the same hand-off: the worker reads NS_HDR at
         # startup and main sets it from this flag. Experimental, off.
         "hdr": bool(cfg.get("hdr", False)),
+        "motion_backend": cfg.get("motion_backend", "cpu"),
         # Which card runs the network and the capture. An index, as
         # DXGI enumerates adapters - the same number the worker takes
         # in NS_GPU and prints in its "[host] adapter N" lines.
@@ -631,6 +635,7 @@ def menu_payload(st) -> dict:
         "screenshot_dir": st.cfg.get("screenshot_dir") or "",
         "spout": bool(st.cfg.get("spout", False)),
         "hdr": bool(st.cfg.get("hdr", False)),
+        "motion_backend": st.cfg.get("motion_backend", "cpu"),
         "skip_static": bool(st.cfg.get("skip_static", True)),
         "dlss_sr_scale": float(st.cfg.get("dlss_sr_scale", .65)),
         "dlss_sr": bool(st.cfg.get("dlss_sr", False)),

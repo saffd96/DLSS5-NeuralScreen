@@ -55,7 +55,7 @@ from winapi import window_frame_rect
 #: Always let through: the pipeline diagnostics. NS_PHASE=1 adds the
 #: per-frame profiler lines ([phase]/[pw]) on top of these.
 _LOG_ALWAYS = ("[host]", "[pure]", "[arch]", "[cap]", "[dda]", "[present]",
-               "[spout]", "[wgc]", "[video]", "[skip]", "[sr]", "[fg]", "[hdr]", "[gpu-flow]")
+               "[spout]", "[wgc]", "[video]", "[skip]", "[sr]", "[fg]", "[hdr]", "[gpu-flow]", "[nvofa]")
 #: [video] lines that are a heartbeat rather than a diagnostic: the "delivered
 #: frame N" line is printed every 30 frames and would bury the log.
 _LOG_SKIP = ("delivered frame",)
@@ -665,6 +665,21 @@ def apply_hdr(st, enabled: bool) -> None:
         "HDR compatibility ON" if enabled else "HDR compatibility OFF"))
 
 
+def apply_motion_backend(st, value: str) -> None:
+    from motion_backend import normalize_backend
+    value = normalize_backend(value)
+    if value == normalize_backend(st.cfg.get("motion_backend")):
+        return
+    st.cfg["motion_backend"] = value
+    st.cfg["gpu_motion"] = value == "gpu"
+    os.environ["NS_GPU_FLOW_EXPERIMENT"] = "1" if value == "gpu" else "0"
+    os.environ["NS_MOTION_BACKEND"] = value
+    settings_io.save_menu_layout(st)
+    teardown_pipeline(st)
+    rebuild_pipeline(st, UI_STRINGS[st.lang].get(
+        "motion_restarted", "Motion backend changed - worker restarted"))
+
+
 def follow_monitor(st) -> None:
     """Rebuild when the desktop resolution changes under a running pipeline.
 
@@ -1025,6 +1040,8 @@ def request_apply(st, new_scale: float, new_profile: str, new_params: dict,
 
 def apply_gpu_motion(st, enabled: bool) -> None:
     st.cfg["gpu_motion"] = bool(enabled)
+    st.cfg["motion_backend"] = "gpu" if enabled else "cpu"
+    os.environ["NS_MOTION_BACKEND"] = "cpu"
     os.environ["NS_GPU_FLOW_EXPERIMENT"] = "1" if enabled else "0"
     settings_io.save_menu_layout(st)
     print(f"[main] motion backend: {'GPU LK (experimental)' if enabled else 'CPU DIS'} - restarting worker")

@@ -81,6 +81,7 @@ from capture import (ScreenCapture, devicename_for_output_idx, list_monitors,
                      resolve_output_idx)
 from display import Display
 from guides import TemporalGuideGenerator
+from motion_backend import MotionBackendStatus
 from hotkeys import (HotkeyController, build_bindings,
                      describe as describe_hotkeys, numlock_needed, numlock_on,
                      parse_binding)
@@ -386,6 +387,7 @@ def main() -> int:
         last_log = time.monotonic()
         last_fps = 0.0
         last_perf_log = time.monotonic()
+        motion_status = MotionBackendStatus()
         # Stage timings: mean ms over PERF_LOG_INTERVAL (the [perf] log)
         st.perf = {k: [] for k in PERF_KEYS}
 
@@ -599,7 +601,14 @@ def main() -> int:
                     detect_ui = bool(st.cfg.get("ui_detection", False) and
                                      st.cfg.get("frame_generation", False))
                     if st.gray_active:
-                        guide = st.guides.process(gray=st.shm.read_gray(), detect_ui=detect_ui, compute_motion=os.environ.get("NS_GPU_FLOW_EXPERIMENT") != "1")
+                        was_failed = motion_status.failed and motion_status.worker is st.worker
+                        hardware_motion = motion_status.update(st.worker, st.worker_logs)
+                        if motion_status.failed and not was_failed:
+                            st.display.alert(UI_STRINGS[st.lang]["motion_fallback"])
+                        nvofa = st.cfg.get("motion_backend") == "nvofa"
+                        skip_dis = hardware_motion if nvofa else os.environ.get("NS_GPU_FLOW_EXPERIMENT") == "1"
+                        guide = st.guides.process(gray=st.shm.read_gray(), detect_ui=detect_ui,
+                                                  compute_motion=not skip_dis)
                     else:
                         guide = st.guides.process(st.work_frame, detect_ui=detect_ui)
                     _perf("guides", t0)
