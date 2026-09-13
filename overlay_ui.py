@@ -177,6 +177,7 @@ class OverlayMenu:
             "nr_small": False,
             "dlss_sr_scale": .65,
             "dlss_sr": False,
+            "ui_detection": False,
             "frame_generation": False,
             "frame_multiplier": 2,
             "screen_size": "",
@@ -750,6 +751,7 @@ class OverlayMenu:
                 slider("frame_multiplier", 2, 4, multiplier, s["frame_multiplier"],
                        value_text=f"×{multiplier}", ends=("×2", "×4"))
 
+            toggle("ui_detection", s["ui_detection"], bool(self.state.get("ui_detection")))
 
             boost = bool(self.state.get("nr_small"))
             toggle("boost", s["boost"], boost, hint=s["boost_hint"] + "\n" + s["nr_min_hint"])

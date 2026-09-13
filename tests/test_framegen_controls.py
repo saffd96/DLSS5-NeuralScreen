@@ -25,6 +25,17 @@ def main():
     pygame.init()
     menu = build()
     paint(menu)
+    ui_state = SimpleNamespace(cfg={})
+    with patch.object(settings_io, "save_menu_layout"), patch.object(commands.pipeline, "request_apply") as apply:
+        ui_toggle = find(menu, "toggle", "ui_detection")
+        assert ui_toggle is not None
+        actions = click(menu, ui_toggle)
+        assert actions == [("toggle", "ui_detection")]
+        commands.apply_menu_action(ui_state, actions[0])
+        assert ui_state.cfg["ui_detection"]
+        commands.apply_menu_action(ui_state, actions[0])
+        assert not ui_state.cfg["ui_detection"]
+        apply.assert_not_called()
     assert find(menu, "slider", "frame_multiplier") is None
     toggle = find(menu, "toggle", "frame_generation")
     assert toggle is not None

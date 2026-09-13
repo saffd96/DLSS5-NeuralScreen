@@ -1,6 +1,37 @@
 // Experimental desktop DLSS-G. Capture has no engine depth: use a flat plane
 // and the estimated motion field. Keep this opt-in; UI/occlusions can distort.
 static PFN_NR_Evaluate g_fg_evaluate = nullptr;
+// Rectangles belong to exactly one submitted frame; never reuse stale HUD areas.
+struct UiRegion { uint16_t left, top, right, bottom; };
+static_assert(sizeof(UiRegion) == 8, "UIR1 rectangle size");
+static std::vector<UiRegion> g_ui_pending, g_ui_regions;
+static uint32_t g_ui_index = 0;
+static bool g_ui_valid = false;
+
+static void ProtectFgUi(ID3D12Resource *real, ID3D12Resource *generated)
+{
+    if (g_ui_regions.empty()) return;
+    D3D12_RESOURCE_BARRIER before[] = {
+        Transition(real, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE),
+        Transition(generated, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST)};
+    h.list->ResourceBarrier(2, before);
+    D3D12_TEXTURE_COPY_LOCATION src = {}, dst = {};
+    src.pResource = real; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dst.pResource = generated; dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    const auto desc = real->GetDesc();
+    for (const auto &r : g_ui_regions) {
+        D3D12_BOX box = {UINT(uint64_t(r.left) * desc.Width / 65535),
+                        UINT(uint64_t(r.top) * desc.Height / 65535), 0,
+                        UINT(uint64_t(r.right) * desc.Width / 65535),
+                        UINT(uint64_t(r.bottom) * desc.Height / 65535), 1};
+        if (box.right > box.left && box.bottom > box.top)
+            h.list->CopyTextureRegion(&dst, box.left, box.top, 0, &src, &box);
+    }
+    D3D12_RESOURCE_BARRIER after[] = {
+        Transition(real, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+        Transition(generated, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)};
+    h.list->ResourceBarrier(2, after);
+}
 static NVSDK_NGX_Result FgEvaluateBridge(ID3D12GraphicsCommandList *list,
     NVSDK_NGX_Handle *handle, NVSDK_NGX_Parameter *params, PFN_NVSDK_NGX_ProgressCallback cb)
 { return g_fg_evaluate(list, handle, params, cb); }
@@ -333,6 +364,7 @@ static bool FgPresent(VideoState &v, ID3D12Resource *color, D3D12_RESOURCE_STATE
         h.list->CopyBufferRegion(g_fg.disable_readback.get(), index * 4, g_fg.disable.get(), 0, 4);
         auto disable_post = Transition(g_fg.disable.get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         h.list->ResourceBarrier(1, &disable_post);
+        if (NVSDK_NGX_SUCCEED(result)) ProtectFgUi(color, g_fg.output[index].get());
         auto out_post = Transition(g_fg.output[index].get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
         h.list->ResourceBarrier(1, &out_post);
         auto post = Transition(color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, state);

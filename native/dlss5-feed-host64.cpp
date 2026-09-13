@@ -4873,6 +4873,15 @@ static int ReadVideoMessage(VideoState &v, VideoFrameHeader &fh, std::vector<BYT
                             const BYTE **color_ptr, const BYTE **mv_ptr)
 {
     if (!ReadExact(stdin, &fh, sizeof(fh))) return 0;
+    if (fh.magic == 0x31524955u) { // UIR1: bounded, frame-specific UI rectangles
+        if (fh.reset > 32 || fh.reserved != 0) return 0;
+        g_ui_pending.resize(fh.reset);
+        if (!ReadExact(stdin, g_ui_pending.data(), g_ui_pending.size() * sizeof(UiRegion))) return 0;
+        for (const auto &r : g_ui_pending)
+            if (r.left >= r.right || r.top >= r.bottom) return 0;
+        g_ui_index = fh.index; g_ui_valid = true;
+        return 12;
+    }
     if (fh.magic == 0x31435353u) return 11; // SSC1: independent SR input scale
     if (fh.magic == CAPTURE_MAGIC) return 10;
     if (fh.magic == FRAME_MAGIC)
@@ -5330,7 +5339,8 @@ static int RunVideo()
         const BYTE *mv_ptr = nullptr;
         const int msg = ReadVideoMessage(v, fh, color, mv, rc, sc, wc, mc, dc, gc,
                                          oc, &color_ptr, &mv_ptr);
-        if (msg != 1 && msg != 10) prepared = false;
+        if (msg != 1 && msg != 10 && msg != 12) prepared = false;
+        if (msg != 1 && msg != 10 && msg != 12) g_ui_valid = false;
         if (msg == 0)
         {
             if (live)
@@ -5572,6 +5582,7 @@ static int RunVideo()
             if (!WriteExact(g_wire, &ack, sizeof(ack))) return 10;
             continue;
         }
+        if (msg == 12) continue;
         if (msg == 11)
         {
             const unsigned scale=std::clamp(fh.reset,25u,100u);
@@ -5599,6 +5610,9 @@ static int RunVideo()
         }
         ConfigureSrFrame(fh.reserved);
         ConfigureFgFrame(fh.reserved);
+        g_ui_regions.clear();
+        if (g_ui_valid && g_ui_index == fh.index) g_ui_regions = g_ui_pending;
+        g_ui_valid = false;
         const double t_frame = PhaseNow();
         const bool phase_on = PhaseEnabled();
         if (phase_on && !(fh.reserved & FRAME_FLAG_PREPARED)) g_frame_stamp = {};

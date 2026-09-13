@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 import cv2
 import numpy as np
+from ui_detection import UIRegionDetector
 
 
 @dataclass(slots=True)
@@ -11,6 +12,7 @@ class GuideFrame:
     motion: np.ndarray
     reset: bool
     scene_score: float
+    ui_regions: tuple = ()
 
 
 class TemporalGuideGenerator:
@@ -33,6 +35,7 @@ class TemporalGuideGenerator:
         self.flow_height = max(64, int(round(height * scale / 2) * 2))
         self.emit_small = emit_small
         self.previous_gray: np.ndarray | None = None
+        self.ui_detector = UIRegionDetector()
         self._zero_motion = np.zeros((self.height, self.width, 2), dtype=np.float16)
         self._zero_small = np.zeros((self.flow_height, self.flow_width, 2), dtype=np.float16)
         self._flow_f16 = np.empty((self.flow_height, self.flow_width, 2), dtype=np.float16)
@@ -76,7 +79,7 @@ class TemporalGuideGenerator:
         return GuideFrame(motion=motion, reset=True, scene_score=1.0)
 
     def process(self, rgba: np.ndarray | None = None,
-                gray: np.ndarray | None = None) -> GuideFrame:
+                gray: np.ndarray | None = None, detect_ui: bool = False) -> GuideFrame:
         """Compute the guides: motion/reset/scene_score.
 
         Either rgba (full-res BGR/RGBA — downsampled here) or a ready gray
@@ -135,6 +138,11 @@ class TemporalGuideGenerator:
                                dst=self._motion_f32, interpolation=cv2.INTER_LINEAR)
                     np.copyto(self._motion_f16, self._motion_f32, casting="same_kind")
                     motion = self._motion_f16
+        if detect_ui:
+            ui_regions = self.ui_detector.process(current, reset=reset)
+        else:
+            self.ui_detector.reset()
+            ui_regions = ()
         self.previous_gray = current
         expected = (self.flow_width * self.flow_height if self.emit_small else pixels)
         assert motion.size == expected * 2
@@ -147,4 +155,5 @@ class TemporalGuideGenerator:
             motion=motion,
             reset=reset,
             scene_score=scene_score,
+            ui_regions=ui_regions,
         )
