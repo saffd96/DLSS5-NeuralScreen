@@ -17,7 +17,7 @@ from pathlib import Path
 BASE = Path(__file__).resolve().parent
 os.chdir(BASE)
 
-VERSION = "1.7.0"
+VERSION = "1.8.2"
 # The bundle is architecture-agnostic by design: the dcc0dc24 runtime and
 # the 0x1B0 spoof work on RTX 30/40/50 (v1.3.0 behaviour). The manifest
 # still records what is inside so a mismatch is catchable.
@@ -25,6 +25,8 @@ TARGET_ARCHS = "RTX 30/40/50 (sm_86/89/120 kernels, spoof 0x1B0; RTX 20 cannot r
 
 files = subprocess.check_output(["git", "ls-files"], text=True).splitlines()
 extra = [
+    "resolution_limits.py",
+    "native/nvngx_dlss.dll",
     "NeuralScreen.exe",
     "NeuralScreen.vbs",
     "NeuralScreen-diag.vbs",

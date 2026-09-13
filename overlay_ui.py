@@ -25,6 +25,7 @@ from typing import Any, Callable
 import pygame
 
 from i18n import STRINGS
+from resolution_limits import safe_processing_size
 
 # --- Themes. The accent is shared; background and text change ------------
 THEMES = {
@@ -174,6 +175,8 @@ class OverlayMenu:
             # main so a config value below the range cannot misplace the knob.
             "work_scale_min": 0.1,
             "nr_small": False,
+            "dlss_sr_scale": .65,
+            "dlss_sr": False,
             "screen_size": "",
             "profile": "",
             "profiles": [],
@@ -192,6 +195,11 @@ class OverlayMenu:
             # in v1.6.0, so set_state dropped it in silence and the toggle
             # always drew as off while the action behind it fired normally.
             "spout": False,
+            # HDR compatibility (CAPTURE section): experimental, off. Same
+            # reason it is listed here as spout was - a key missing from
+            # this dict is dropped by set_state in silence, and the toggle
+            # then draws as off while the action behind it fires normally.
+            "hdr": False,
             # Skip static frames (processing section): no new capture frame -
             # the network idles instead of re-running.
             "skip_static": True,
@@ -619,6 +627,14 @@ class OverlayMenu:
                 choice("gpu", s.get("gpu", "GPU"),
                        str(self.state.get("gpu", gpus[0])), gpus,
                        hint=s.get("gpu_hint", ""))
+            # HDR compatibility. It belongs to CAPTURE because that is what
+            # it changes first: the display is duplicated in FP16 scRGB
+            # instead of 8-bit, and everything after follows from that.
+            # Experimental, off by default, and a worker restart - which is
+            # why it is here and not on the main page.
+            toggle("hdr", s.get("hdr_mode", "HDR compatibility"),
+                   bool(self.state.get("hdr")),
+                   hint=s.get("hdr_mode_hint", ""))
             # The screenshot folder: a plain button that opens the folder
             # picker (issue #20). The current value is shown as the caption
             # so the user sees what is configured.
@@ -689,7 +705,9 @@ class OverlayMenu:
                    labels=[STRINGS[L].get(f"lang_{L}", L) for L in langs])
             segmented("theme", s["theme"], self.state.get("theme", "light"),
                       ["light", "dark"], [s["theme_light"], s["theme_dark"]])
-            cy += gap
+            # No extra gap here: segmented() already ends with one, and
+            # section() opens with its own - three stacked was a hole
+            # (user, 13.09: the padding below is excessive).
 
             # The channel label: the header shows the version, the channel
             # lives here (user rule 2026-09-08). A button item - the only
@@ -702,7 +720,9 @@ class OverlayMenu:
                 items.append(Item("button", "channel",
                                   pygame.Rect(pad, cy, inner_w, act_h),
                                   extra={"label": channel, "filled": False}))
-                cy += act_h + pad
+                # The footer below opens with its own rule and spacing; a
+                # full PAD on top of that was the second hole.
+                cy += act_h + self._u(6)
         else:
             section(s["sec_processing"])
             nr_on = bool(self.state.get("nr"))
@@ -722,7 +742,7 @@ class OverlayMenu:
             # the difference is not visible. The residual is what makes that
             # true: without it the same setting is visibly soft.
             boost = bool(self.state.get("nr_small"))
-            toggle("boost", s["boost"], boost, hint=s["boost_hint"])
+            toggle("boost", s["boost"], boost, hint=s["boost_hint"] + "\n" + s["nr_min_hint"])
 
             # The resolution the network runs at - only while Boost is on.
             #
@@ -751,6 +771,19 @@ class OverlayMenu:
                 # screen: NGX is capped at 2560x1440 and the network never
                 # saw more than that (user, 12.09).
                 work = str(self.state.get("work_size") or "")
+                if self.state.get("dlss_sr"):
+                    try:
+                        fw, fh = (int(x) for x in self.state["screen_size"].split("x"))
+                        bw, bh = (int(x) for x in work.split("x")) if work else (int(fw*pos), int(fh*pos))
+                        percent = min(100, max(25, int(float(self.state.get("dlss_sr_scale", .65))*100+.5)))
+                        sw, sh = (max(64, ((size*percent+100)//200)*2) for size in (fw, fh))
+                        sw, sh = safe_processing_size(fw, fh, sw, sh)
+                        nw, nh = (max(64, ((size*boost+full)//(2*full))*2)
+                                  for size, boost, full in ((sw,bw,fw),(sh,bh,fh)))
+                        nw, nh = safe_processing_size(sw, sh, nw, nh)
+                        work = f"{nw}x{nh}"
+                    except (ValueError, KeyError, ZeroDivisionError):
+                        pass
                 value_text = work if work else f"{pos:.2f}"
                 # The lower bound follows WORK_SCALE_MIN (0.1), not a
                 # hardcoded 0.30: a config value below the slider range would
@@ -762,6 +795,23 @@ class OverlayMenu:
                 slider("nr_res", lo, cap, pos, s["nr_res"],
                        value_text=value_text,
                        ends=(s.get("nr_res_low", ""), s.get("nr_res_high", "")))
+
+            sr = bool(self.state.get("dlss_sr"))
+            toggle("dlss_sr", s["dlss_sr"], sr)
+            if sr:
+                sr_scale = float(self.state.get("dlss_sr_scale", .65))
+                sr_size = f"{sr_scale:.0%}"
+                try:
+                    sw, sh = (int(x) for x in str(self.state.get("screen_size", "0x0")).split("x"))
+                    if sw > 0 and sh > 0:
+                        iw, ih = safe_processing_size(sw, sh, max(64, int(sw * sr_scale / 2 + .5) * 2), max(64, int(sh * sr_scale / 2 + .5) * 2))
+                        sr_size = f"{iw}x{ih}"
+                except ValueError:
+                    pass
+                if sr_scale >= 1.0:
+                    sr_size += " (DLAA)"
+                slider("dlss_sr_scale", .25, 1.0, sr_scale, s["dlss_sr_input"],
+                       value_text=sr_size, ends=("25%", "100% (DLAA)"))
 
             # What is being processed - the first question anyone has, and
             # until now the only one answered on another page. The segment
@@ -1304,6 +1354,9 @@ class OverlayMenu:
         if item.key == "split":
             self.state["split"] = value
             return [("split", value)]
+        if item.key == "dlss_sr_scale":
+            self.state["dlss_sr_scale"] = value
+            return [("dlss_sr_scale", value)]
         if item.key == "nr_res":
             # The slider is only on screen while Boost is on, so every
             # position means a work resolution now - there is no "off" step
@@ -1321,6 +1374,7 @@ class OverlayMenu:
                     k = min(2560 / w, 1440 / h)
                     w = max(64, int(round(w * k / 2) * 2))
                     h = max(64, int(round(h * k / 2) * 2))
+                w, h = safe_processing_size(sw, sh, w, h)
                 self.state["work_size"] = f"{w}x{h}"
             except Exception:
                 pass
