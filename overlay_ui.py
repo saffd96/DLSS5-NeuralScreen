@@ -198,6 +198,11 @@ class OverlayMenu:
             # in v1.6.0, so set_state dropped it in silence and the toggle
             # always drew as off while the action behind it fired normally.
             "spout": False,
+            # HDR compatibility (CAPTURE section): experimental, off. Same
+            # reason it is listed here as spout was - a key missing from
+            # this dict is dropped by set_state in silence, and the toggle
+            # then draws as off while the action behind it fires normally.
+            "hdr": False,
             # Skip static frames (processing section): no new capture frame -
             # the network idles instead of re-running.
             "skip_static": True,
@@ -625,6 +630,14 @@ class OverlayMenu:
                 choice("gpu", s.get("gpu", "GPU"),
                        str(self.state.get("gpu", gpus[0])), gpus,
                        hint=s.get("gpu_hint", ""))
+            # HDR compatibility. It belongs to CAPTURE because that is what
+            # it changes first: the display is duplicated in FP16 scRGB
+            # instead of 8-bit, and everything after follows from that.
+            # Experimental, off by default, and a worker restart - which is
+            # why it is here and not on the main page.
+            toggle("hdr", s.get("hdr_mode", "HDR compatibility"),
+                   bool(self.state.get("hdr")),
+                   hint=s.get("hdr_mode_hint", ""))
             # The screenshot folder: a plain button that opens the folder
             # picker (issue #20). The current value is shown as the caption
             # so the user sees what is configured.
@@ -695,7 +708,9 @@ class OverlayMenu:
                    labels=[STRINGS[L].get(f"lang_{L}", L) for L in langs])
             segmented("theme", s["theme"], self.state.get("theme", "light"),
                       ["light", "dark"], [s["theme_light"], s["theme_dark"]])
-            cy += gap
+            # No extra gap here: segmented() already ends with one, and
+            # section() opens with its own - three stacked was a hole
+            # (user, 13.09: the padding below is excessive).
 
             # The channel label: the header shows the version, the channel
             # lives here (user rule 2026-09-08). A button item - the only
@@ -708,7 +723,9 @@ class OverlayMenu:
                 items.append(Item("button", "channel",
                                   pygame.Rect(pad, cy, inner_w, act_h),
                                   extra={"label": channel, "filled": False}))
-                cy += act_h + pad
+                # The footer below opens with its own rule and spacing; a
+                # full PAD on top of that was the second hole.
+                cy += act_h + self._u(6)
         else:
             section(s["sec_processing"])
             nr_on = bool(self.state.get("nr"))
@@ -803,8 +820,10 @@ class OverlayMenu:
                         sr_size = f"{iw}x{ih}"
                 except ValueError:
                     pass
+                if sr_scale >= 1.0:
+                    sr_size += " (DLAA)"
                 slider("dlss_sr_scale", .25, 1.0, sr_scale, s["dlss_sr_input"],
-                       value_text=sr_size, ends=("25%", "100%"))
+                       value_text=sr_size, ends=("25%", "100% (DLAA)"))
 
             # What is being processed - the first question anyone has, and
             # until now the only one answered on another page. The segment

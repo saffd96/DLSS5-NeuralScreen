@@ -93,6 +93,18 @@ def _apply_spout_env(cfg: dict) -> None:
     os.environ["NS_SPOUT"] = "1" if cfg.get("spout") else "0"
 
 
+def _apply_hdr_env(cfg: dict) -> None:
+    """The HDR compatibility flag reaches the worker the same way.
+
+    HdrEnabled() in the worker reads NS_HDR once, at process start, and
+    everything downstream of it is decided then: the duplication format,
+    the swap chain format, the colour space. So the switch goes through a
+    worker restart (pipeline.apply_hdr), exactly like the Spout bridge.
+    Off unless the config says otherwise - the mode is experimental.
+    """
+    os.environ["NS_HDR"] = "1" if cfg.get("hdr") else "0"
+
+
 def _apply_monitor_env(capture) -> tuple[int, int]:
     """Publish the chosen monitor to the worker and return its origin.
 
@@ -251,7 +263,12 @@ def configure(st) -> None:
     # faster but softer, and an update must not change how the picture looks
     # without being asked. Toggling it later restarts the worker, which is why
     # it lives in the environment rather than in the frame protocol.
-    st.nr_small = bool(st.cfg.get("nr_small", False))
+    # Boost is ON unless a config says otherwise (user, 13.09). It was off
+    # by default because it had been measured on still frames only; it has
+    # been in a release since 1.7.0 now, and on a 5070 Ti at 4K it is
+    # 45.7 -> 72.6 frames for a picture that is indistinguishable at 1:1 -
+    # the residual composite puts the detail back off the native frame.
+    st.nr_small = bool(st.cfg.get("nr_small", True))
     os.environ["NS_NR_SMALL"] = "1" if st.nr_small else "0"
     # The Spout2 bridge is the same story: the worker reads NS_SPOUT once
     # at startup (SpoutBridgeInit), so the config flag becomes the
@@ -259,6 +276,8 @@ def configure(st) -> None:
     # the bridge costs a full-frame GPU copy on every Present, and it is
     # only useful to someone recording through OBS.
     _apply_spout_env(st.cfg)
+    # And HDR compatibility, read once per worker process as well.
+    _apply_hdr_env(st.cfg)
     # The same for the card: NS_GPU is read once per worker process.
     _apply_gpu_env(st.cfg)
     st.lang = str(st.cfg["lang"])
