@@ -133,7 +133,7 @@ def _set_autostart(enabled: bool) -> bool:
 
 # The version shown in the menu header. Kept in sync with native/launcher.rc
 # (FileVersion/ProductVersion) and build_release_zip.py at release time.
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.8.2"
 
 
 # The channel label: the header shows the version, the channel lives in the
@@ -142,15 +142,23 @@ CHANNEL_LABEL = "@perseval_BLR"
 
 
 # --- DLSS 5 NR profiles (field order as in the converter) -----------------
+#
+# local_tone is half a point lower in every profile than it was through
+# 1.8.1 (user, 13.09). The local tone mapping is the part that lifts
+# shadows and flattens contrast, and at the old values it was doing more of
+# that than the picture wanted - most visibly on dark scenes, where the
+# brightening this program does anyway meets it head on. The four sliders
+# still reach everything they reached: this moves where the profiles sit,
+# not what the range allows.
 PROFILES = {
     "Faithful": dict(profile=0, preset=0, style=0, auto_mask=0, ui_correction=0,
-                     intensity=0.70, local_tone=0.75, local_structure=0.75, skin_structure=-1.0),
+                     intensity=0.70, local_tone=0.25, local_structure=0.75, skin_structure=-1.0),
     "Natural": dict(profile=1, preset=0, style=1, auto_mask=0, ui_correction=0,
-                    intensity=1.00, local_tone=1.00, local_structure=1.00, skin_structure=-1.0),
+                    intensity=1.00, local_tone=0.50, local_structure=1.00, skin_structure=-1.0),
     "Strong / Cinematic": dict(profile=2, preset=2, style=2, auto_mask=1, ui_correction=0,
-                               intensity=1.65, local_tone=1.40, local_structure=1.50, skin_structure=1.0),
+                               intensity=1.65, local_tone=0.90, local_structure=1.50, skin_structure=1.0),
     "Extreme / Overdrive": dict(profile=2, preset=2, style=2, auto_mask=1, ui_correction=0,
-                                intensity=2.50, local_tone=2.00, local_structure=2.00, skin_structure=1.5),
+                                intensity=2.50, local_tone=1.50, local_structure=2.00, skin_structure=1.5),
 }
 
 
@@ -181,7 +189,7 @@ def _valid_preset_value(key: str, value) -> bool:
     """
     try:
         value = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return False
     lo = SKIN_MIN if key == "skin_structure" else PARAM_MIN
     return lo <= value <= PARAM_MAX
@@ -239,11 +247,15 @@ def load_config(path: Path) -> dict:
     """Load and validate config.json."""
     with open(path, "r", encoding="utf-8") as fh:
         cfg = json.load(fh)
+    if not isinstance(cfg, dict):
+        raise ValueError("config.json: root must be an object")
     required = {"monitor", "width", "height", "fullscreen", "warmup", "profile",
                 "intensity", "local_tone", "local_structure", "skin_structure"}
     missing = required - set(cfg)
     if missing:
         raise ValueError(f"config.json: missing fields: {sorted(missing)}")
+    if not isinstance(cfg["profile"], str):
+        raise ValueError("config.json: field profile must be a string")
     if cfg["profile"] not in PROFILES:
         # A user preset name, or a stale reference to a deleted preset.
         # A stale reference must not take the program down - fall back to
@@ -253,9 +265,14 @@ def load_config(path: Path) -> dict:
                   f"falling back to 'Natural'", file=sys.stderr)
             cfg["profile"] = "Natural"
     for key in ("width", "height", "warmup"):
-        if not isinstance(cfg[key], int) or cfg[key] <= 0:
+        if isinstance(cfg[key], bool) or not isinstance(cfg[key], int) or cfg[key] <= 0:
             raise ValueError(f"config.json: field {key} must be a positive integer")
-    # work_scale: 0.25..1.0 - the NGX processing resolution relative to the output
+    for key in ("intensity", "local_tone", "local_structure", "skin_structure"):
+        if (cfg[key] is not None
+                and (isinstance(cfg[key], bool)
+                     or not _valid_preset_value(key, cfg[key]))):
+            raise ValueError(f"config.json: field {key} must be a finite number in range")
+    # work_scale: 0.1..1.0 - the NGX processing resolution relative to the output
     scale = float(cfg.get("work_scale", 1.0))
     cfg["work_scale"] = min(WORK_SCALE_MAX, max(WORK_SCALE_MIN, scale))
     # lang: the language of the HUD/alerts/menu (en/ru, DEFAULT_LANG by default)
@@ -376,10 +393,17 @@ def _menu_layout_payload(cfg: dict, params: dict, monitor: int, lang: str,
         # The Spout2 bridge choice must survive a restart: the worker
         # reads NS_SPOUT at startup, and main sets it from this flag.
         "spout": bool(cfg.get("spout", False)),
+        # HDR compatibility, the same hand-off: the worker reads NS_HDR at
+        # startup and main sets it from this flag. Experimental, off.
+        "hdr": bool(cfg.get("hdr", False)),
         # Which card runs the network and the capture. An index, as
         # DXGI enumerates adapters - the same number the worker takes
         # in NS_GPU and prints in its "[host] adapter N" lines.
         "gpu": int(cfg.get("gpu", 0)),
+        # Adapters whose worker could not bring the neural pass up. Kept so
+        # the picker can mark them after a restart too; cleared per adapter
+        # as soon as one of them works (issue #33).
+        "gpu_no_nr": [int(i) for i in (cfg.get("gpu_no_nr") or [])],
         # Skip static frames: no new frame from the capture - the network
         # idles instead of re-running on the same picture. A per-frame flag,
         # so it survives a restart through the config alone.
@@ -510,6 +534,14 @@ def warn_hdr(st) -> None:
             return
 
 
+def _no_nr(st) -> set:
+    """Adapter indices whose worker could not bring the neural pass up."""
+    try:
+        return {int(i) for i in (st.cfg.get("gpu_no_nr") or [])}
+    except (TypeError, ValueError):
+        return set()
+
+
 def _gpu_label(index) -> str:
     """"<dxgi index>: <name>" for the picker - the card that will really run.
 
@@ -598,6 +630,7 @@ def menu_payload(st) -> dict:
         "rec_indicator": bool(st.cfg.get("rec_indicator", True)),
         "screenshot_dir": st.cfg.get("screenshot_dir") or "",
         "spout": bool(st.cfg.get("spout", False)),
+        "hdr": bool(st.cfg.get("hdr", False)),
         "skip_static": bool(st.cfg.get("skip_static", True)),
         "dlss_sr_scale": float(st.cfg.get("dlss_sr_scale", .65)),
         "dlss_sr": bool(st.cfg.get("dlss_sr", False)),
@@ -610,7 +643,16 @@ def menu_payload(st) -> dict:
         # healthy FPS while nothing is being processed, and the skip
         # reads as "it does not work" (user, 12.09).
         "idle": _worker_idle(st),
-        "gpus": [f"{i}: {name}" for i, name in list_adapters()],
+        # The list, with a note on any adapter whose worker could not bring
+        # the neural pass up. DXGI reports some cards twice (one user has a
+        # single 5080 listed as adapters 0 and 2) and the two entries are
+        # indistinguishable by name - so the menu offered a choice between
+        # two identical-looking lines, one of which kills the pipeline
+        # (issue #33). The note is what we actually know: it was tried and
+        # it did not work. The entry stays selectable.
+        "gpus": [f"{i}: {name}" + (f" - {UI_STRINGS[st.lang].get('gpu_no_nr', 'no neural pass')}"
+                                   if i in _no_nr(st) else "")
+                 for i, name in list_adapters()],
         # The saved index may name no NVIDIA card at all. On a hybrid laptop
         # adapter 0 is the integrated GPU and "gpu": 0 is what the program
         # ships with, so the picker came up EMPTY on exactly the machines

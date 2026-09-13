@@ -1,76 +1,66 @@
 # NeuralScreen
 
-> **HDR fork (experimental):** automatic FP16 desktop/window capture and scRGB output.
-> Neural processing uses an SDR proxy; recordings/screenshots remain SDR.
-> [Setup, validation and limitations](docs/HDR.md).
-
 **NVIDIA's DLSS 5 neural renderer, applied to your whole Windows desktop in
 real time.** Everything on screen — games, video, photos — goes through the
 same neural network that DLSS 5 games use, and comes back sharper.
 
-> **Read this first:** the short guide below gets you running. The full
-> technical story — how it works, what was measured, why it is built this
-> way — lives in **[TECHNICAL.md](TECHNICAL.md)**. English:
-> **[README.md](README.md)**. Русская версия: **[README.ru.md](README.ru.md)**
-> / **[TECHNICAL.ru.md](TECHNICAL.ru.md)**.
+> The guide below gets you running. How it works and what was measured:
+> **[TECHNICAL.md](TECHNICAL.md)**. Русская версия:
+> **[README.ru.md](README.ru.md)** / **[TECHNICAL.ru.md](TECHNICAL.ru.md)**.
+
+## How it looks
 
 <table>
 <tr>
-<td><img src="https://raw.githubusercontent.com/perseval-BLR/DLSS5-NeuralScreen/main/docs/screenshot-main-light.png" alt="Menu, light theme" width="420"></td>
-<td><img src="https://raw.githubusercontent.com/perseval-BLR/DLSS5-NeuralScreen/main/docs/screenshot-main-dark.png" alt="Menu, dark theme" width="420"></td>
+<td><img src="https://raw.githubusercontent.com/perseval-BLR/DLSS5-NeuralScreen/main/docs/screenshot-main-light.png" alt="Menu, light theme" width="400"></td>
+<td><img src="https://raw.githubusercontent.com/perseval-BLR/DLSS5-NeuralScreen/main/docs/screenshot-main-dark.png" alt="Menu, dark theme" width="400"></td>
+</tr>
+<tr>
+<td><img src="https://raw.githubusercontent.com/perseval-BLR/DLSS5-NeuralScreen/main/docs/screenshot-settings.png" alt="Settings" width="400"></td>
+<td><img src="https://raw.githubusercontent.com/perseval-BLR/DLSS5-NeuralScreen/main/docs/screenshot-windows.png" alt="Window list" width="400"></td>
 </tr>
 </table>
 
-*Everything lives in one menu inside the overlay. The **Before / after wipe**
-slider splits the screen down the middle so you can see what the effect is
-actually doing.*
+*One menu inside the overlay, in a light and a dark theme; the settings page;
+the window list. The **Before / after wipe** slider splits the screen down the
+middle so you can see what the effect is actually doing.*
 
 ## What you need
 
-- **Windows 11**, or Windows 10 - reported working, see the limitations
-- **An NVIDIA RTX card.** What works, honestly:
+- **Windows 11**, or Windows 10 — reported working.
+- **An NVIDIA RTX card:**
 
   | Cards | Status |
   |---|---|
-  | **RTX 50** (Blackwell) | ✅ works - the officially supported generation |
-  | **RTX 40** (Ada) | ✅ works - through the built-in architecture hook |
-  | **RTX 30** (Ampere) | ✅ works - restored in v1.5.1 (the universal runtime + spoof 0x1B0, same stack as v1.3.0) |
-  | **RTX 20** (Turing) | ❌ cannot run the neural pass at all - below the minimum architecture (DLSS5-Feeder issue #73). See *Trying RTX 20* below. |
-  | **Laptops with hybrid graphics (Optimus)** | ✅ works - on the iGPU display the capture falls back to GDI (slower, confirmed on an Acer Nitro with RTX 4050) |
+  | **RTX 50** / **RTX 40** / **RTX 30** | ✅ works |
+  | **RTX 20** (Turing) | ❌ below the minimum architecture — the program starts, the picture is not processed |
+  | **Hybrid laptops (Optimus)** | ✅ works; on the iGPU display the capture falls back to a slower path |
 
+- **The latest NVIDIA driver, and Windows up to date.** Not a formality: the
+  neural runtime talks to the driver directly, and an old driver is the
+  commonest reason it refuses to start or the picture never appears.
 - **Nothing installed.** The release archive brings its own Python.
-
-### Trying RTX 20
-
-Turing is below the minimum architecture - no runtime build makes the
-neural pass run on it (0xBAD00001, FeatureNotSupported). The program
-starts and the menu works; the picture is not processed.
 
 ## Install
 
 1. Download the archive from [Releases](https://github.com/perseval-BLR/DLSS5-NeuralScreen/releases)
-   and unpack it anywhere. **Everything is inside** — including NVIDIA's
-   `nvngx_dlssnr.dll` (158 MB, too big for GitHub to keep in the repository,
-   so it ships in the archive instead).
+   and unpack it anywhere. Everything is inside, including NVIDIA's runtime.
 2. Run **`NeuralScreen.exe`**.
 
-Windows will probably warn you about an unknown publisher the first time — the
-program is not signed with a paid certificate. Click *More info* → *Run
-anyway*. If you would rather not, `NeuralScreen.vbs` next to it does the same
-thing.
+Windows will probably warn you about an unknown publisher — the program is not
+signed with a paid certificate. Click *More info* → *Run anyway*, or use
+`NeuralScreen.vbs` next to it.
 
-There is no installer and nothing is written outside the folder. To remove it,
-delete the folder.
+There is no installer: to remove the program, delete the folder. Autostart is
+the one thing written outside it — turn it off before you move or delete it.
 
-> **Do not use it in competitive online games.** A process named `nvngx.dll`
-> plus a fullscreen overlay is exactly what anti-cheat systems look for.
+> **Do not use it in competitive online games.** A fullscreen overlay over a
+> game is what anti-cheat systems look for.
 
 ## Using it
 
-The program sits in the tray (with a taskbar button) and draws over your
-desktop. Press **Num2** for the menu. The hotkeys live on the numpad, so
-**Num Lock has to be on** - with it off those keys send Insert/End/arrows
-instead and nothing happens.
+The program sits in the tray and draws over your desktop. Press **Num2** for
+the menu. The hotkeys are on the numpad, so **Num Lock has to be on**.
 
 | Key | What it does |
 |---|---|
@@ -79,123 +69,95 @@ instead and nothing happens.
 | **Num3** | screenshot |
 | **Num0** | start / stop recording, with sound |
 | **Num4** / **Num6** | processing resolution down / up |
-| **Num5** | capture the window under the cursor (see below) |
+| **Num5** | capture the window under the cursor |
 | **Ctrl+Alt+Q** | quit |
 
 Every key can be reassigned in the menu, under the sliders icon. While the
-menu is open it takes the mouse and keyboard, so it works on top of a game.
-Closed, clicks go straight through it as if it were not there.
-
-Startup and mode switches do not flash: the overlay appears with the first
-real frame, a brief blur-with-spinner covers the pipeline rebuild.
+menu is open it takes the mouse and keyboard, so it works on top of a game;
+closed, clicks go straight through it.
 
 ### Whole screen or one window
 
-NeuralScreen renders the whole screen by default. To process one window
-instead (a game, a browser), pick **Select window...** in the menu - the
-list shows every open window, hovering highlights it on the screen, and
-the overlay follows the window. Back to the whole screen: **Fullscreen**
-in the menu.
-
-**Num5** is a shortcut for the common case: the window you want is already
-open and covers the screen - point at it and press **Num5** to capture it
-directly. For anything else, use the window list in the menu.
-
-Minimising the window pauses processing.
+The whole screen is the default. **Source**, at the top of the menu, switches
+between **Fullscreen** and **Window mode**; choosing the second opens the list
+of windows, and hovering a row highlights that window on the screen. **Num5**
+is the shortcut when the window is already in front of you: point at it and
+press. The overlay follows the window as it moves, and resizing it — a video
+going fullscreen, a different player size — reconfigures the worker in place,
+with no black moment. Minimising the window pauses processing.
 
 ## The menu
 
-<table>
-<tr>
-<td><img src="https://raw.githubusercontent.com/perseval-BLR/DLSS5-NeuralScreen/main/docs/screenshot-windows.png" alt="Window list" width="380"></td>
-<td><img src="https://raw.githubusercontent.com/perseval-BLR/DLSS5-NeuralScreen/main/docs/screenshot-settings.png" alt="Settings page" width="380"></td>
-</tr>
-</table>
-
-The dot next to your graphics card is green when neural rendering is actually
+The dot next to your graphics card is green when neural rendering is really
 running on it, red when it is not.
 
-The settings worth touching:
+- **Source** — the whole screen or one window, and which window.
+- **Profile** — how strong the effect is, from *Faithful* to *Extreme*;
+  *Natural* by default. The four sliders underneath are the same thing in
+  detail. **Save preset** stores the current values under a name and puts it
+  in the Profile list; **Delete preset** removes it. Dark scenes are
+  brightened automatically so shadows keep their detail.
+- **Before / after wipe** — leaves the left part of the screen unprocessed so
+  you can see what the effect is doing. Back to 0 when done.
+- **Boost** — on by default. The network runs at a reduced resolution and a
+  slider under the switch chooses which: measured on a 5070 Ti at 4K,
+  **45.7 → 72.6 frames** at the default step and **83.4** at the lowest.
+  The picture stays sharp — the network's result is composed onto your
+  original frame, so text and edges keep full resolution. Turn it off to
+  compare.
 
-- **Profile** — how strong the effect is, from *Faithful* to *Extreme*. The
-  default is *Natural* - a faithful, balanced look. The four sliders
-  underneath are the same thing in detail. **Save preset** snapshots the
-  current slider values under a name (Preset 1, Preset 2, ...) - it appears
-  in the Profile list and applies like a built-in profile; **Delete preset**
-  removes the active user preset. Dark scenes are handled automatically: an
-  adaptive exposure brightens them for the network, so shadows keep their
-  detail instead of turning into artifacts.
-- **Before / after wipe** — leaves the left part of the screen untouched so
-  you can see what the effect is doing. Set it back to 0 when done.
-- **Resolution the network runs at** — one slider. At the top it is your whole
-  screen, which is the default and the best picture. Every step down hands the
-  network a smaller frame: with the slider off the default (full screen) the
-  network is already at its best, and every step down means **roughly 50% more
-  frames** at 2560×1440 on a 4K screen. The picture stays sharp: the network's
-  result is composed onto the pristine 1:1 native frame (a matched residual
-  composite), so text, edges and UI keep full resolution while the cheap
-  low-res network does the relighting. Look at your own screen and pick a step.
-The interface speaks **12 languages** - English, Russian, French, German,
-Spanish, Italian, Portuguese, Polish, Ukrainian, Chinese, Japanese and Korean.
-Pick one under the sliders icon (Language). The menu, the HUD and the alerts
-all follow.
-
-Everything else — which monitor, whether the menu opens on launch, starting
-with Windows, key assignments — is behind the sliders icon.
+Everything else is behind the sliders icon: which monitor is processed and
+which card does it, HDR compatibility, the screenshot folder, Spout2 output,
+the recording indicator, leaving an unchanged screen alone, opening the menu
+on launch, autostart, the key assignments, the theme — and the language, of
+which there are **12**: English, Russian, French, German, Spanish, Italian,
+Portuguese, Polish, Ukrainian, Chinese, Japanese and Korean.
 
 ## Recording and screenshots
 
 **Num0** records what you see, with system sound, into an MP4 in
-`recordings`. **Num3** saves a screenshot. The menu shows up in both if
-open - on purpose. While a recording runs, a red dot with a timer sits
-in the corner of the screen (off in the settings if you do not want it).
-The recording audio passes through a soft limiter, so a loud system mix
-cannot clip the track into distortion.
+`recordings`. **Num3** saves a screenshot. The menu appears in both if it is
+open, on purpose. A red dot with a timer sits in the corner while recording
+(it can be turned off in the settings).
 
-Screenshots open a **Save As** dialog; pick a folder once with
-**Screenshot folder...** in the settings and the dialog will start there
-every time.
+Screenshots open a **Save As** dialog; set **Screenshot folder...** in the
+settings once and it will start there every time.
 
-**Record the processed picture externally:**
-- **OBS (recommended):** turn on **Spout2 output (OBS)** in the settings
-  (RECORDING section). The worker publishes the output as a Spout2 shared
-  texture - add a **Spout2 Capture** source in OBS (free plugin) and record
-  in AV1 / HEVC / H.264 through NVENC, in any mode. Off by default.
-- **NVIDIA App / OBS display capture:** use one-window mode - pick the
-  window in the menu (or point at it and press **Num5**), record, then
-  switch back to **Fullscreen** when done. The NVIDIA App has no Spout
-  input, so this is its only path. In this mode the overlay is
-  visible to screen capture; in full-screen mode it hides (the program
-  captures the screen itself, and a visible overlay would feed on itself).
+**Recording externally:**
+
+- **OBS (recommended):** turn on **Spout2 output (OBS)** in the settings, then
+  add a **Spout2 Capture** source in OBS. Works in any mode. Off by default.
+- **NVIDIA App:** it has no Spout input, so use one-window mode — pick the
+  window, record, then switch back to **Fullscreen**. In that mode the overlay
+  is visible to screen capture; in full-screen mode it hides itself.
 
 ## If something is not working
 
 **Nothing appears after launch.** Check `NeuralScreen.log` next to the
-program; the most common cause is a missing `native\nvngx_dlssnr.dll`.
+program — it names the cause. The commonest is a missing
+`native\nvngx_dlssnr.dll`.
 
 **The overlay is invisible in a game.** True fullscreen cannot have anything
-drawn over it — a Windows rule. Switch the game to *borderless* or
-*windowed fullscreen*.
+drawn over it — a Windows rule. Switch the game to *borderless*.
 
 **The menu pointer is missing or frozen.** A fullscreen game hides the system
-cursor; the overlay only shows the system cursor. Borderless fixes it.
+cursor, and the overlay only shows that one. Borderless fixes it.
 
-**The picture is soft.** Put *Resolution the network runs at* back to the top
-of its slider.
+**The picture is soft.** Turn *Boost* off, or move its slider up a step.
 
-**A key does nothing.** Something else claimed it; reassign it in the menu
-under the sliders icon.
+**Everything is too bright and the sliders do nothing.** HDR is on for that
+display. Turn it off (Win+Alt+B), or try **HDR compatibility** in the settings,
+under CAPTURE — it is experimental; see [HDR setup](https://github.com/perseval-BLR/DLSS5-NeuralScreen/blob/main/docs/HDR.md).
 
-**The menu is slow in a heavy game.** At 4K the pipeline can take up to a
-second per frame; a press may feel lost.
+**A key does nothing.** Something else claimed it; reassign it in the menu.
 
 ## Known limitations
 
-- **True fullscreen games** cannot have the overlay drawn over them — a Windows rule. Borderless or windowed only.
-- **HDR displays:** experimental support in this fork; see [HDR setup and limitations](docs/HDR.md).
-- **Windows 10, two NVIDIA cards and a second monitor are experimental** — built or fixed from user logs, none of it tested on the development machine (Windows 11, one card, one monitor); the overlay is drawn on the primary monitor. Reports welcome.
-- **Pipeline latency** is 40–60 ms (17-20ms with Boost Mode) — fine interactively, not competitively; **processing resolution is capped at 2560×1440** (the network refuses 4K), output is always your full native resolution.
-- **The bundled `nvngx_dlssnr.dll` is the leaked 310.8.0 runtime carrying sm_75/86/89/120 kernels (RTX 20-50)** — see License below.
+- **True fullscreen games** cannot have an overlay drawn over them — borderless or windowed only.
+- **HDR displays:** experimental, and off until you turn on **HDR compatibility** (settings, CAPTURE). Recording and Spout exports stay SDR. See [HDR setup and limitations](https://github.com/perseval-BLR/DLSS5-NeuralScreen/blob/main/docs/HDR.md).
+- **Windows 10 and two NVIDIA cards are experimental** — built or fixed from user logs rather than tested here. Reports welcome.
+- **A rotated display:** 180° is turned back over on capture; 90° and 270° are not handled yet and come out with the sides swapped.
+- **Pipeline latency** is 40–60 ms (17-20ms with Boost Mode) — fine interactively, not competitively; **processing resolution is capped at 2560×1440**, output is always your full native resolution.
 
 ## License
 

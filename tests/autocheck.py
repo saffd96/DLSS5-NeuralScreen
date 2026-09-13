@@ -38,10 +38,21 @@ def fresh_worker():
     data = dll.read_bytes()
     if b"NS_ARCH_SPOOF" not in data:
         return False, "no NS_ARCH_SPOOF in the binary (an old build?)"
-    # freshness: the mtime must not be older than the cpp
-    cpp = ROOT / "native" / "dlss5-feed-host64.cpp"
-    if dll.stat().st_mtime < cpp.stat().st_mtime:
-        return False, "the dll is older than the cpp - rerun build-host.bat"
+    # freshness: the mtime must not be older than any source it is built
+    # from. The .cpp is not alone any more - the HDR path lives in headers
+    # and an .inl included by it, and editing one of those without a
+    # rebuild leaves a binary that disagrees with the tree in silence.
+    sources = [ROOT / "native" / "dlss5-feed-host64.cpp",
+               ROOT / "native" / "hdr_display.h",
+               ROOT / "native" / "hdr_shaders.h",
+               ROOT / "native" / "hdr_present.inl",
+               ROOT / "native" / "ns_forwarder.cpp",
+               ROOT / "native" / "spout_bridge.cpp",
+               ROOT / "native" / "spout_bridge.h"]
+    stale = [s.name for s in sources
+             if s.exists() and dll.stat().st_mtime < s.stat().st_mtime]
+    if stale:
+        return False, f"the dll is older than {', '.join(stale)} - rerun build-host.bat"
     return True, f"{dll.stat().st_size} bytes, the hook is there, fresh"
 
 
@@ -77,9 +88,9 @@ def personal_config_keys():
 
 
 def zip_integrity():
-    zpath = ROOT / "neuralscreen-v1.7.0-full.zip"
+    zpath = ROOT / "neuralscreen-v1.8.2-full.zip"
     if not zpath.is_file():
-        return False, "no neuralscreen-v1.7.0-full.zip"
+        return False, "no neuralscreen-v1.8.2-full.zip"
     required = [
         "main.py", "gpuinfo.py", "overlay_ui.py", "i18n.py", "recorder.py",
         "display.py", "guides.py", "hotkeys.py", "tray.py", "capture.py",
@@ -169,8 +180,8 @@ def zip_integrity():
         zsha = hashlib.sha256(zip_dll).hexdigest()
         if f"sha256 {zsha}" not in vt:
             return False, "VERSION.txt runtime sha != the DLL inside the archive"
-        if "NeuralScreen 1.7.0" not in vt:
-            return False, "VERSION.txt version does not match v1.7.0"
+        if "NeuralScreen 1.8.2" not in vt:
+            return False, "VERSION.txt version does not match v1.8.2"
     return True, f"{zpath.stat().st_size} bytes, all files, the hook, a default config, a truthful manifest"
 
 
@@ -222,19 +233,22 @@ def readme_consistency():
     import re
 
     docs = {
+        # The keys name where the files really live: each doc's links are
+        # resolved from its own directory below. These two moved from docs/
+        # to the root - the old keys kept resolving them against docs/.
         "README.md": (ROOT / "README.md").read_text(encoding="utf-8"),
         "README.ru.md": (ROOT / "README.ru.md").read_text(encoding="utf-8"),
-        "docs/TECHNICAL.md": (ROOT / "TECHNICAL.md").read_text(encoding="utf-8"),
-        "docs/TECHNICAL.ru.md": (ROOT / "TECHNICAL.ru.md").read_text(encoding="utf-8"),
+        "TECHNICAL.md": (ROOT / "TECHNICAL.md").read_text(encoding="utf-8"),
+        "TECHNICAL.ru.md": (ROOT / "TECHNICAL.ru.md").read_text(encoding="utf-8"),
     }
     for name in ("README.md", "README.ru.md"):
         n = len(docs[name].splitlines())
         if n > 200:
             return False, f"{name} is {n} lines - it drifted back into a manual"
     # The Russian needle is the content of a translated doc and stays Russian.
-    if "On by default" not in docs["docs/TECHNICAL.md"]:
+    if "On by default" not in docs["TECHNICAL.md"]:
         return False, "TECHNICAL.md lost the spoof default"
-    if "Включено по умолчанию" not in docs["docs/TECHNICAL.ru.md"]:
+    if "Включено по умолчанию" not in docs["TECHNICAL.ru.md"]:
         return False, "TECHNICAL.ru.md lost the spoof default"
 
     # Every relative link and image must resolve, in both directions.
