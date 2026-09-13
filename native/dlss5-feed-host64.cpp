@@ -44,6 +44,11 @@
 #include <io.h>
 #include <string>
 #include <vector>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
+#include <chrono>
 #include "hdr_display.h"
 #include "hdr_shaders.h"
 
@@ -1741,8 +1746,13 @@ static HdrDisplayInfo g_capture_display;
 static float g_hdr_frame_white = 1.0f;
 static UINT g_hdr_split = UINT_MAX;
 static bool PresentHdr(VideoState &v, bool bypass);
+static bool FgRequested();
+static bool FgPresent(VideoState &v, ID3D12Resource *color, D3D12_RESOURCE_STATES state);
+static void StopFgPresentation();
+static void CloseFgResources();
 static void CloseSrResources();
-static bool EnsurePresentFormat(bool hdr);
+static bool g_fg_reset = true;
+static bool EnsurePresentFormat(bool hdr, bool pq = false);
 static void CloseHdrResources();
 
 static VideoHeader g_video_options = {};
@@ -1798,8 +1808,8 @@ static HWND                       g_present_hwnd;
 // every OpenPresent - a monitor switch restarts the worker anyway.
 static int                        g_present_x = 0;
 static int                        g_present_y = 0;
-static bool g_present_shown = false;
-static bool g_present_revealed = false;   // the first Present already happened
+static std::atomic<bool>          g_present_shown{false};      // shared with the FG presenter
+static std::atomic<bool>          g_present_revealed{false};   // the first Present already happened
 static RECT                       g_present_follow = {};   // where the target window was last seen
 // Defined here rather than with the capture code below: the present window
 // has to know whether one window is being captured, and which one, and this
@@ -1821,7 +1831,7 @@ static bool                       g_present_capturable;  // debug flag from WNDO
 // The flags the present window was opened with, and whether the swap chain
 // has to be built again before the next frame. See PresentStatus.
 static uint32_t                   g_present_flags = 0;
-static bool                       g_present_stale = false;
+static std::atomic<bool>          g_present_stale{false};
 
 // Whether the picture window hides itself from screen capture.
 //
@@ -1926,7 +1936,7 @@ static DWORD WINAPI PresentWindowThread(LPVOID)
 
 static void ClosePresent()
 {
-
+    CloseFgResources();
     if (g_present_swap != nullptr) { g_present_swap->Release(); g_present_swap = nullptr; }
     // Only the thread that created the window can destroy it. This used to
     // post WM_QUIT to the thread FIRST, which ended the message loop before
@@ -2218,6 +2228,8 @@ static bool PresentFrame(VideoState &v, UINT64 *submitted = nullptr)
     // re-decide how the window is presented; on that hardware it decided
     // differently. Off means byte-identical to 1.7.x.
     if (HdrEnabled() && !EnsurePresentFormat(false)) return false;
+    if (FgRequested() && FgPresent(v, v.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) return true;
+    StopFgPresentation();
     ID3D12Resource *bb = nullptr;
     if (FAILED(g_present_swap->GetBuffer(g_present_swap->GetCurrentBackBufferIndex(),
                                          __uuidof(ID3D12Resource),
@@ -2267,6 +2279,7 @@ static bool PresentFrame(VideoState &v, UINT64 *submitted = nullptr)
 // window that PresentModeActive has already checked against the output size.
 static bool PresentBypass(VideoState &v)
 {
+    StopFgPresentation();
     if (!RebuildPresentIfStale()) return false;
     if (g_hdr_capture) return PresentHdr(v, true);
     // Same as PresentFrame: nothing to restore unless HDR has been on (#58).
@@ -3174,6 +3187,7 @@ static void CloseGray()
 
 static void CloseDda()
 {
+    CloseFgResources();
     if (PhaseEnabled()) { ++g_capture_generation; g_previous_source_qpc = 0; g_frame_stamp = {}; }
     g_dda_active = false;
     g_dda_ready = false;
@@ -4823,6 +4837,7 @@ static bool DownloadVideoFrame(VideoState &v, std::vector<BYTE> &packed,
     return true;
 }
 
+#include "frame_generation.inl"
 
 static bool ReShadeHasFeature18()
 {
@@ -4979,6 +4994,7 @@ static int ReadVideoMessage(VideoState &v, VideoFrameHeader &fh, std::vector<BYT
 static void ReleaseVideoTextures(VideoState &v)
 {
     CloseSrResources();
+    CloseFgResources();
 
     if (PhaseEnabled()) { ++g_capture_generation; g_previous_source_qpc = 0; g_frame_stamp = {}; }
     // The shader descriptors referenced these resources - after they are
@@ -5560,7 +5576,7 @@ static int RunVideo()
         {
             const unsigned scale=std::clamp(fh.reset,25u,100u);
             if (g_sr.scale!=scale) {
-                CloseSrResources();g_sr.scale=scale;g_sr.failed=false;
+                CloseFgResources();CloseSrResources();g_sr.scale=scale;g_sr.failed=false;
                 g_force_next_frame=true;
                 Log("[sr] input scale: %u%% (before NR; Boost ratio unchanged)",scale);
             }
@@ -5582,6 +5598,7 @@ static int RunVideo()
             continue;
         }
         ConfigureSrFrame(fh.reserved);
+        ConfigureFgFrame(fh.reserved);
         const double t_frame = PhaseNow();
         const bool phase_on = PhaseEnabled();
         if (phase_on && !(fh.reserved & FRAME_FLAG_PREPARED)) g_frame_stamp = {};
@@ -5675,7 +5692,7 @@ static int RunVideo()
             // the present's fence still cannot complete before it. It is
             // also the mode where frames are cheapest and most numerous, so
             // it is the one with the most round trips to save.
-            defer_tail = !g_hdr_capture && warmup_done && h.feature != nullptr &&
+            defer_tail = !g_hdr_capture && !FgRequested() && warmup_done && h.feature != nullptr &&
                 PresentModeActive(v) &&
                 (fh.reserved & (FRAME_FLAG_BYPASS | FRAME_FLAG_SPLIT | FRAME_FLAG_WANT_PIXELS)) == 0;
             // This frame is being processed: remember what it will show, so the
@@ -5721,10 +5738,12 @@ static int RunVideo()
                 Log("[pure] direct feature 18 confirmed after %u discarded warmup frames", warmup);
             }
         }
+        const UINT previous_hdr_split = g_hdr_split;
         g_hdr_split = (fh.reserved & FRAME_FLAG_SPLIT) ?
             SplitXFromFlags(fh.reserved, v.upscale ? v.full_w : v.w) : UINT_MAX;
         const bool bypass = (fh.reserved & FRAME_FLAG_BYPASS) != 0 || h.feature == nullptr;
         if (bypass) g_sr.history = false;
+        g_fg_reset = frame == 0 || fh.reset != 0 || bypass || previous_hdr_split != g_hdr_split;
         if (!bypass)
         {
             const double t_eval = PhaseNow();
@@ -5838,7 +5857,7 @@ static int RunVideo()
 // ---------------------------------------------------------------------------
 static void CleanupVideoNgx()
 {
-
+    CloseFgResources();
     CloseSrResources();
     if (g_sr.params) { NVSDK_NGX_D3D12_DestroyParameters(g_sr.params); g_sr.params = nullptr; }
 
