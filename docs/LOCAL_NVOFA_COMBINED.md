@@ -39,3 +39,9 @@ Integration validation: native build, module/config/i18n checks, GPU/NVOFA/FG
 controls, UI detection and offline updater tests. Real GPU tests exercised SR
 reduction, 100% DLAA, bypass and resize; HDR FG with dynamic multiplier and UI
 protection completed cleanly. Full suite has not been run for this merge.
+
+The subsequently published v1.10.0 main (e69bc0d) is now merged too. The separate
+NVOFA follow-up includes the single-update regression and cost-calibration harness.
+See NVOFA_COST_VALIDATION.md: 71 captured pairs did not justify a global cost mask,
+so normal rendering still uses unfiltered NVOFA. The combined app smoke delivered
+2361 frames with NVOFA and HDR FG active and no guide-processing errors.
