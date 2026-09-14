@@ -8,6 +8,12 @@ same neural network that DLSS 5 games use, and comes back sharper.
 > **[TECHNICAL.md](TECHNICAL.md)**. Русская версия:
 > **[README.ru.md](README.ru.md)** / **[TECHNICAL.ru.md](TECHNICAL.ru.md)**.
 
+> **Notice.** Not affiliated with NVIDIA; NVIDIA, DLSS and the NVIDIA logo
+> are NVIDIA Corporation's trademarks. The bundled NVIDIA runtimes
+> (`nvngx_dlssnr.dll`, `nvngx_dlssg.dll`) are NVIDIA's property, included
+> unmodified as received, research/educational use only, no warranty, use
+> at your own risk. Rights holders: say the word and the next build ships without them.
+
 ## How it looks
 
 <table>
@@ -113,6 +119,13 @@ running on it, red when it is not.
   The picture stays sharp — the network's result is composed onto your
   original frame, so text and edges keep full resolution. Turn it off to
   compare.
+- **DLSS 4.5 FG** — Frame Generation, opt-in, with a ×2 / ×3 / ×4 multiplier
+  beside the switch. DLSS-G's own desktop build: the depth is flat and the
+  motion is estimated, there is no engine cooperation, so UI and text can
+  distort — that is the known cost of the approach. The header pairs the two
+  honest rates when they differ: "47 / 111 fps" is the network's output, then
+  what the presenter shows. Validated on RTX 50-series; adapters beyond it
+  are unconfirmed.
 
 Everything else is behind the sliders icon: which monitor is processed and
 which card does it, HDR compatibility, the screenshot folder, Spout2 output,
@@ -120,6 +133,13 @@ the recording indicator, leaving an unchanged screen alone, opening the menu
 on launch, autostart, the key assignments, the theme — and the language, of
 which there are **12**: English, Russian, French, German, Spanish, Italian,
 Portuguese, Polish, Ukrainian, Chinese, Japanese and Korean.
+
+## Swapping a runtime
+
+Everything ships in the archive and nothing is downloaded. To run your own
+build of a runtime (a newer DLSS-G, say), drop the DLL into
+**`native/libraries/`** - it wins over the bundled copy (a README sits
+there); `nr_dll` config / `NS_NR_DLL` env remain the NR override.
 
 ## Recording and screenshots
 
@@ -166,9 +186,15 @@ under CAPTURE — it is experimental; see [HDR setup](https://github.com/perseva
 - **Windows 10 and two NVIDIA cards are experimental** — built or fixed from user logs rather than tested here. Reports welcome.
 - **A rotated display:** 180° is turned back over on capture; 90° and 270° are not handled yet and come out with the sides swapped.
 - **Pipeline latency** is 40–60 ms (17-20ms with Boost Mode) — fine interactively, not competitively; **processing resolution is capped at 2560×1440**, output is always your full native resolution.
+- **Window mode, active-state bug (in progress):** when another window takes
+  focus, the NR window can stop responding to dragging. An audit found seven
+  sources; three are fixed (z-order churn, the WGC resize reopen loop, the FG
+  fence token) and the rest is under active work.
 
 ## License
 
-The code here is MIT. NVIDIA's `nvngx_dlssnr.dll` is the leaked 310.8.0
-runtime (sm_75/86/89/120 kernels, RTX 20-50), included as-is, no
-guarantees, research-only. Interface faces: IBM Plex (OFL-1.1, `fonts/OFL.txt`).
+The code here is MIT. NVIDIA's runtimes ship unmodified and remain NVIDIA's
+property: `nvngx_dlssnr.dll` is the leaked 310.8.0 build (sm_75/86/89/120
+kernels, RTX 20-50), `nvngx_dlssg.dll` is the public 310.9.1.0
+redistributable - both included as received, no guarantees, research-only.
+Interface faces: IBM Plex (OFL-1.1, `fonts/OFL.txt`).
