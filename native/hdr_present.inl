@@ -25,6 +25,9 @@ static bool EnsurePresentFormat(bool hdr, bool pq)
         CloseFgResources();
         // PresentFrame/PresentBypass release each back buffer and wait for GPU
         // work before returning; no old buffer reference survives here.
+        // This failure is fatal on either path, and deliberately so: both
+        // presents CopyResource into the back buffer, and a copy between
+        // mismatched formats is not a wrong picture, it is a removed device.
         if (FAILED(g_present_swap->ResizeBuffers(0, 0, 0, format, desc.Flags)))
         { Log("[hdr] swap chain format change failed"); return false; }
         Log("[hdr] presentation=%s", pq ? "HDR10 PQ (DLSS-G)" : hdr ? "FP16 scRGB" : "8-bit SDR");
@@ -61,7 +64,8 @@ static bool EnsureHdrPipeline(UINT w, UINT height, bool pq)
         const auto d = g_hdr_output->GetDesc();
         if (d.Width == w && d.Height == height && d.Format == format) return true;
     }
-    // Clean up partial initialization before another attempt.
+    // Either a size change or a half-built attempt from last time: both
+    // start from nothing.
     CloseHdrResources();
     winrt::com_ptr<ID3DBlob> code, errors, signature;
     HRESULT hr = D3DCompile(kHdrCompositeHlsl, sizeof(kHdrCompositeHlsl)-1,
@@ -165,14 +169,14 @@ static bool PresentHdr(VideoState &v, bool bypass)
     h.list->ResourceBarrier(1, &export_post);
     const auto fence = EndCommands();
     if (!WaitFenceValue(h.fence, fence, 2000)) return false;
+    // The same status reading as the SDR path: a mode change is a SUCCESS
+    // code, and a chain the desktop has moved out from under shows nothing
+    // while every present on it reports success (#58).
     if (framegen)
     {
         if (FgPresent(v, g_hdr_output, D3D12_RESOURCE_STATE_COMMON)) return true;
         return PresentHdr(v, bypass); // failed FG has disabled itself; ordinary output
     }
-    // The same status reading as the SDR path: a mode change is a SUCCESS
-    // code, and a chain the desktop has moved out from under shows nothing
-    // while every present on it reports success (#58).
     const bool ok = PresentStatus(g_present_swap->Present(0, 0), "hdr present");
     if (ok) { RevealOnFirstPresent(); SpoutBridgeSend(); }
     return ok;

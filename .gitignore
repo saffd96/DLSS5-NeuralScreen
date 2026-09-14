@@ -18,7 +18,6 @@ NeuralScreen.exe
 # NVIDIA redistributable: 165 MB, over the GitHub file limit (100 MB).
 # How to get it - see README.md, the Requirements section.
 native/nvngx_dlssnr.dll
-native/nvngx_dlssg.dll
 
 # Optional local Python runtime next to the program
 runtime/
@@ -54,9 +53,11 @@ _mockup_*.py
 test_bake_menu.py
 requirements.txt
 
-native/nvngx_dlss.dll
 native/*.part
 native/*.ready
 native/*.update.json
 native/*.update.tmp
 native/*.bak
+native/nvngx_dlss.dll
+
+native/nvngx_dlssg.dll

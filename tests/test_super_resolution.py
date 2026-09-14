@@ -1,4 +1,4 @@
-﻿"""Opt-in SR output, toggle, bypass and resize regression with real NVIDIA DLLs."""
+"""Opt-in SR output, toggle, bypass and resize regression with real NVIDIA DLLs."""
 import os
 from pathlib import Path
 import struct
@@ -8,6 +8,7 @@ import threading
 import numpy as np
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT))
+sys.path.insert(0,str(Path(__file__).resolve().parent))
 import protocol as wire
 from test_prepared_capture import exact
 

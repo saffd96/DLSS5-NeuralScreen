@@ -1,4 +1,4 @@
-// dlss5-feed-host64 - the 64-bit half of DLSS5-Feeder for 32-bit games.
+﻿// dlss5-feed-host64 - the 64-bit half of DLSS5-Feeder for 32-bit games.
 //
 // A 32-bit game cannot load NGX or the DLSS 5 add-on (both x64-only). This little
 // process can: it puts ReShade x64 (dxgi.dll) and renodx-dlss5.addon64 next to
@@ -528,6 +528,20 @@ static bool InitDirectNr(const wchar_t *data_path)
     {
         dll_name = dll_path;
         Log("[pure] NS_NR_DLL=%ls", dll_name);
+    }
+    else
+    {
+        // The BYO library folder wins over the bundled copy: native\libraries\
+        // is where users drop their own runtime build (see libraries/README).
+        wchar_t worker_dir[MAX_PATH] = {}, candidate[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, worker_dir, MAX_PATH);
+        if (auto slash = wcsrchr(worker_dir, L'\\')) *(slash + 1) = 0;
+        wcscat_s(worker_dir, L"libraries\\nvngx_dlssnr.dll");
+        if (GetFileAttributesW(worker_dir) != INVALID_FILE_ATTRIBUTES)
+        {
+            dll_name = worker_dir;
+            Log("[pure] NR runtime from native\\libraries\\ (BYO)");
+        }
     }
     // NS_NO_FORWARDER=1 keeps the old shape, where the calls leave this
     // executable - which the feature library serves only while the executable
@@ -1531,6 +1545,12 @@ struct VideoResizeCmd
 // is one control: the resolution the network sees, with "full screen" at the
 // top of the slider.
 static constexpr uint32_t RESIZE_FLAG_NR_SMALL = 0x1u;
+// Direct reconstruction: show what the network produced, stretched, instead
+// of composing its delta onto the native frame. Only means anything while
+// nr_small is on - at work == full the network already IS the output. This
+// is the A/B the residual composite has never been measured against on real
+// content, so it travels live: flipping it must not cost a feature.
+static constexpr uint32_t RESIZE_FLAG_NR_DIRECT = 0x2u;
 struct VideoResizeAck
 {
     uint32_t magic, ok, ngx_result, reserved;
@@ -1748,6 +1768,11 @@ static UINT g_hdr_split = UINT_MAX;
 static bool PresentHdr(VideoState &v, bool bypass);
 static bool FgRequested();
 static bool FgPresent(VideoState &v, ID3D12Resource *color, D3D12_RESOURCE_STATES state);
+// The fence value FgPresent submitted and waited on. PresentFrame reads it
+// for the defer-tail contract: the FG branch returns early, before the
+// ordinary EndCommands/submit path fills the caller's token. Defined in
+// frame_generation.inl.
+static UINT64 g_fg_present_fence = 0;
 static void StopFgPresentation();
 static void CloseFgResources();
 static void CloseSrResources();
@@ -1831,7 +1856,7 @@ static bool                       g_present_capturable;  // debug flag from WNDO
 // The flags the present window was opened with, and whether the swap chain
 // has to be built again before the next frame. See PresentStatus.
 static uint32_t                   g_present_flags = 0;
-static std::atomic<bool>          g_present_stale{false};
+static bool                       g_present_stale = false;
 
 // Whether the picture window hides itself from screen capture.
 //
@@ -2120,8 +2145,38 @@ static void FollowCapturedWindow()
         r.right != g_present_follow.right || r.bottom != g_present_follow.bottom)
     {
         g_present_follow = r;
-        SetWindowPos(g_present_hwnd, HWND_TOPMOST, r.left, r.top, 0, 0,
-                     SWP_NOSIZE | SWP_NOACTIVATE);
+        // Follow the size, but never stretch stale content. Two failure
+        // modes measured on the real path (user, 14.09):
+        //   * SWP_NOSIZE (the old behaviour): after a shrink the window's
+        //     bottom/right part hung over the desktop with stale pixels -
+        //     the trail of copies.
+        //   * following the size with the OLD buffer (the first attempt):
+        //     the compositor stretched the old-size capture into the new
+        //     rect and kept re-stretching it at every intermediate drag
+        //     size - the picture shimmered for the whole stability wait.
+        // The resolution: follow the size only when the buffer already
+        // matches the window (g_present_w/h == the rect), otherwise keep
+        // the buffer-sized window but clamp its rect to the target's, so
+        // no part of it hangs outside the window being followed. The live
+        // resize lands the exact size either way.
+        const UINT bw = g_present_w, bh = g_present_h;
+        const bool buffer_matches =
+            bw == (UINT)(r.right - r.left) && bh == (UINT)(r.bottom - r.top);
+        int left = r.left, top = r.top;
+        UINT w = r.right - r.left, hgt = r.bottom - r.top;
+        if (!buffer_matches)
+        {
+            // Stale content: keep the buffer's own size, clamp the origin
+            // so the window never extends past the target's rect.
+            w = bw;
+            hgt = bh;
+            if (left + (int)w > r.right) left = r.right - (int)w;
+            if (top + (int)hgt > r.bottom) top = r.bottom - (int)hgt;
+            if (left < r.left) left = r.left;
+            if (top < r.top) top = r.top;
+        }
+        SetWindowPos(g_present_hwnd, HWND_TOPMOST, left, top, w, hgt,
+                     SWP_NOACTIVATE);
     }
 }
 
@@ -2228,7 +2283,13 @@ static bool PresentFrame(VideoState &v, UINT64 *submitted = nullptr)
     // re-decide how the window is presented; on that hardware it decided
     // differently. Off means byte-identical to 1.7.x.
     if (HdrEnabled() && !EnsurePresentFormat(false)) return false;
-    if (FgRequested() && FgPresent(v, v.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) return true;
+    if (FgRequested() && FgPresent(v, v.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+    {
+        // FG submitted and waited on its own fence; hand that token to the
+        // defer-tail contract (present_done must exist and exceed eval_done).
+        if (submitted) *submitted = g_fg_present_fence;
+        return true;
+    }
     StopFgPresentation();
     ID3D12Resource *bb = nullptr;
     if (FAILED(g_present_swap->GetBuffer(g_present_swap->GetCurrentBackBufferIndex(),
@@ -2279,8 +2340,8 @@ static bool PresentFrame(VideoState &v, UINT64 *submitted = nullptr)
 // window that PresentModeActive has already checked against the output size.
 static bool PresentBypass(VideoState &v)
 {
-    StopFgPresentation();
     if (!RebuildPresentIfStale()) return false;
+    StopFgPresentation();
     if (g_hdr_capture) return PresentHdr(v, true);
     // Same as PresentFrame: nothing to restore unless HDR has been on (#58).
     if (HdrEnabled() && !EnsurePresentFormat(false)) return false;
@@ -2465,6 +2526,13 @@ static float ResidualStrengthRequested()
     return 1.0f;
 }
 
+// Which of the two composites is in force, as the client last asked. The
+// environment decides the very first frame (the client has not spoken yet);
+// every RNSZ after that carries RESIZE_FLAG_NR_DIRECT and overwrites this.
+// A global rather than a field of VideoState because the params-only resize
+// path deliberately does not touch the view - see the RNSZ handler.
+static bool g_nr_direct = !ResidualRequested();
+
 // want_small < 0 means "whatever NS_NR_SMALL says" - used for the very first
 // creation, before the client has had a chance to ask for anything.
 // Keep in sync with resolution_limits.py. Never manufacture a square 64x64
@@ -2492,9 +2560,10 @@ static bool CreateVideoResources(VideoState &v, UINT w, UINT hgt, UINT full_w = 
     v.nr_w = v.nr_small ? w : 0;
     v.nr_h = v.nr_small ? hgt : 0;
     // Residual compose rides on nr_small: at work == full there is nothing
-    // to compose (native would equal nr_in). Env-overridable for now; the
-    // menu wiring lands with the release.
-    v.residual = v.nr_small && ResidualRequested();
+    // to compose (native would equal nr_in). The client asks for the other
+    // composite with RESIZE_FLAG_NR_DIRECT; NS_NR_RESIDUAL=0 still decides
+    // the first frame, before any RNSZ has arrived.
+    v.residual = v.nr_small && !g_nr_direct;
     v.residual_strength = v.residual ? ResidualStrengthRequested() : 1.0f;
     const UINT cw = v.upscale ? full_w : w;   // color texture: full-res in upscale mode
     const UINT ch = v.upscale ? full_h : hgt;
@@ -3187,8 +3256,8 @@ static void CloseGray()
 
 static void CloseDda()
 {
-    CloseFgResources();
     if (PhaseEnabled()) { ++g_capture_generation; g_previous_source_qpc = 0; g_frame_stamp = {}; }
+    CloseFgResources();
     g_dda_active = false;
     g_dda_ready = false;
     g_hdr_capture = false;
@@ -3869,7 +3938,14 @@ static double PhaseNow();
 static void PhaseAdd(int idx, double t0);
 static bool PhaseEnabled();
 
-enum class StageResult { Ok, SizeChanged, Failed };
+// FormatChanged is NOT SizeChanged, and telling them apart is the whole of
+// issue #62. A desktop set to 10 bits per colour can alternate between
+// B8G8R8A8 and FP16 frame after frame - one reporter's log has 781 changes
+// one way and 667 the other in thirteen minutes, two of them 78 ms apart.
+// The staging bridge really does have to be rebuilt for a new format, but
+// the DUPLICATION does not: reopening it cost a full CloseDda/OpenDda per
+// change, 1453 of them in that log, which is what the flicker is.
+enum class StageResult { Ok, SizeChanged, FormatChanged, Failed };
 
 // Everything between "a captured D3D11 texture" and "the bytes are in the
 // shared texture and D3D12 may read them". Desktop Duplication and Windows
@@ -3976,8 +4052,27 @@ static StageResult StageCapturedFrame(ID3D11Texture2D *frame, UINT *out_w, UINT 
     {
         D3D11_TEXTURE2D_DESC sd = {};
         g_dda_shared->GetDesc(&sd);
-        if (sd.Width != fd.Width || sd.Height != fd.Height || sd.Format != fd.Format)
+        if (sd.Width != fd.Width || sd.Height != fd.Height)
             return StageResult::SizeChanged;
+        if (sd.Format != fd.Format)
+        {
+            // Same surface, different format: only the bridge is wrong. Tear
+            // down exactly what fail_capture tears down - the source (dup,
+            // ctx, d11) stays up - and the next frame rebuilds the channel
+            // for the new format. The HDR resources go with it because they
+            // are chosen from the capture format; CloseDda used to take them
+            // on this path and they must not survive it.
+            Log("[cap] capture format %u -> %u - rebuilding the bridge",
+                (unsigned)sd.Format, (unsigned)fd.Format);
+            CloseHdrResources();
+            if (g_dda_d12) { g_dda_d12->Release(); g_dda_d12 = nullptr; }
+            if (g_dda_nt)  { CloseHandle(g_dda_nt); g_dda_nt = nullptr; }
+            if (g_dda_signal) { g_dda_signal->Release(); g_dda_signal = nullptr; }
+            if (g_dda_signal11) { g_dda_signal11->Release(); g_dda_signal11 = nullptr; }
+            if (g_dda_dst) { g_dda_dst->Release(); g_dda_dst = nullptr; }
+            if (g_dda_shared) { g_dda_shared->Release(); g_dda_shared = nullptr; }
+            return StageResult::FormatChanged;
+        }
         D3D11_BOX box = { 0, 0, 0, sd.Width, sd.Height, 1 };
         g_dda_ctx->CopySubresourceRegion(g_dda_shared, 0, 0, 0, 0, frame, 0, &box);
     }
@@ -4103,7 +4198,8 @@ static bool SwizzleCaptureIntoColor(VideoState &v)
     const UINT64 fence = EndCommands();
     if (!ProfileWait(PS_SWIZZLE, fence, 10000)) { Log("[cap] swizzle fence timeout"); return false; }
     // Hand the client the luminance frame (320x180) for the optical flow
-    g_capture_gray_ok = AreaToGray();
+    if (!AreaToGray()) { /* best effort: guides go without a fresh frame */ }
+    g_capture_gray_ok = g_gray_mapped;
     if (g_submission_failed) return false;
     UpdateAdaptiveExposure();
     g_dda_ready = true;
@@ -4164,14 +4260,12 @@ static bool DdaGrab(VideoState &v)
     // is done; releasing earlier let the compositor overwrite the surface
     // mid-copy (torn frames on motion).
     g_dda_dup->ReleaseFrame();
+    // A format change already rebuilt the bridge inside StageCapturedFrame
+    // and said so; it costs this one frame and nothing else (#62).
+    if (st == StageResult::FormatChanged) return false;
     if (st == StageResult::SizeChanged)
     {
-        // Not always the resolution: the staged texture is also rebuilt
-        // when the FORMAT changes, which is what a colour-depth switch
-        // does. The old wording read "resolution changed -> 3840x2160"
-        // while the desktop was still 3840x2160, which is a line that
-        // sends the reader somewhere else (#58).
-        Log("[dda] capture changed -> %ux%u, format %u - recreating",
+        Log("[dda] capture resized -> %ux%u, format %u - recreating",
             new_w, new_h, (unsigned)new_format);
         OpenDda(new_w, new_h);
         return false;
@@ -4361,8 +4455,23 @@ static bool WgcGrab(VideoState &v)
         frame.Close();
         if (st == StageResult::SizeChanged)
         {
-            Log("[wgc] the window changed -> %ux%u, format %u - recreating",
+            // Deadband: animated resizes sweep through many intermediate
+            // sizes, and every recreate flips the display affinity twice and
+            // (with FG) restarts the presenter - the drag-resize blink. Only
+            // a size that HOLDS for a quarter second is worth a rebuild.
+            static UINT last_w = 0, last_h = 0;
+            static ULONGLONG first_seen = 0;
+            const ULONGLONG now = GetTickCount64();
+            if (new_w != last_w || new_h != last_h)
+            {
+                last_w = new_w; last_h = new_h; first_seen = now;
+                return false;  // hold the previous picture while it settles
+            }
+            if (now - first_seen < 250)
+                return false;  // still moving - wait for it to settle
+            Log("[wgc] the window settled at %ux%u, format %u - recreating",
                 new_w, new_h, (unsigned)new_format);
+            last_w = last_h = 0; first_seen = 0;
             OpenWgc(g_wgc_hwnd);
             return false;
         }
@@ -4563,8 +4672,6 @@ static void ReadProfileGpuTime(int slot)
     g_ts_readback->Unmap(0, &none);
 }
 
-#include "super_resolution.inl"
-
 static void CollectProfileGpuTimes()
 {
     if (g_ts_state != 1) return;
@@ -4596,6 +4703,8 @@ static bool ProfileWait(ProfileStage stage, UINT64 fence, DWORD ms)
     if (ok) CollectProfileGpuTimes();
     return ok;
 }
+
+#include "super_resolution.inl"
 
 static bool EvaluateVideo(VideoState &v, int reset, UINT64 *submitted = nullptr)
 {
@@ -5006,10 +5115,10 @@ static int ReadVideoMessage(VideoState &v, VideoFrameHeader &fh, std::vector<BYT
 
 static void ReleaseVideoTextures(VideoState &v)
 {
-    CloseSrResources();
-    CloseFgResources();
     CloseNvofa();
     if (PhaseEnabled()) { ++g_capture_generation; g_previous_source_qpc = 0; g_frame_stamp = {}; }
+    CloseSrResources();
+    CloseFgResources();
     // The shader descriptors referenced these resources - after they are
     // released the descriptors must be reissued (see BindScaleDescriptors).
     if (v.mv.tex == g_scale_dst_bound) g_scale_dst_bound = nullptr;
@@ -5202,60 +5311,6 @@ static void PhaseReport(bool bypass)
     for (int b = 0; b < 6; ++b) g_ph_bins[b] = 0;
 }
 
-static bool GrabCaptureWithRetry(VideoState &v, bool want_pixels)
-{
-    bool got = g_wgc_active ? WgcGrab(v) : DdaGrab(v);
-            if (g_submission_failed) return false;
-            if (!got && !g_dda_ready && want_pixels)
-            {
-                // Pixels were asked for and there is not one captured frame
-                // to give. That is a screenshot or a recording slot: the
-                // screenshot retries on the next frame and heals itself, the
-                // recording simply ends up with a hole where that slot was.
-                //
-                // The window this happens in is short and self-closing -
-                // g_dda_ready is cleared by every RNSZ and by every capture
-                // restart, and the next real frame sets it again - so one
-                // more attempt is usually the whole difference. The DDA
-                // acquire waits up to 100 ms by itself; WGC returns at once
-                // and wants a moment for its pool to fill. Exactly one
-                // retry: a recording would rather have a rare 100 ms hiccup
-                // than a hole, and would not rather have a long stall
-                // (audit cpp-worker).
-                Sleep(8);
-                got = g_wgc_active ? WgcGrab(v) : DdaGrab(v);
-                if (g_submission_failed) return false;
-                if (!got && !g_no_colour_retried)
-                {
-                    // Still nothing, and on a screen that is not changing
-                    // there never will be: duplication answers WAIT_TIMEOUT
-                    // and a WGC pool stays empty until the window redraws.
-                    // A FRESH capture session hands over the current content
-                    // as its first frame, which is exactly what is being
-                    // asked for. Once per dry spell - reopening the capture
-                    // on every slot of a recording would be thrashing.
-                    g_no_colour_retried = true;
-                    const bool reopened = g_wgc_active
-                        ? OpenWgc(g_wgc_hwnd) : OpenDda(g_dda_w, g_dda_h);
-                    // A fresh session does not answer the same millisecond:
-                    // the WGC pool fills on its own schedule, a frame
-                    // interval or so. Up to ~120 ms of small steps, which is
-                    // the difference between a hole and a hiccup, and still
-                    // shorter than the acquire timeout we already accept.
-                    for (int i = 0; reopened && !got && i < 12; ++i)
-                    {
-                        Sleep(10);
-                        got = g_wgc_active ? WgcGrab(v) : DdaGrab(v);
-                        if (g_submission_failed) return false;
-                    }
-                    Log("[video] pixels asked for before the first capture "
-                        "frame: reopened the capture, %s",
-                        got ? "and it answered" : "still nothing");
-                }
-            }
-    return got;
-}
-
 static int RunVideo()
 {
     _setmode(_fileno(stdin), _O_BINARY);
@@ -5414,13 +5469,23 @@ static int RunVideo()
             if (same_size && h.feature != nullptr)
             {
                 memcpy(&g_video_options, &rc, sizeof(g_video_options));
+                // Which composite is a parameter, not a size: the textures
+                // and the feature are the same either way, so the switch
+                // belongs on this path and must be applied to the view by
+                // hand - nothing else here touches it.
+                g_nr_direct = (rc.flags & RESIZE_FLAG_NR_DIRECT) != 0;
+                v.residual = v.nr_small && !g_nr_direct;
+                v.residual_strength = v.residual ? ResidualStrengthRequested() : 1.0f;
                 g_force_next_frame = true;   // show it on the next frame
                 VideoResizeAck ok = { RESIZE_ACK_MAGIC, 1u,
                                       static_cast<uint32_t>(NVSDK_NGX_Result_Success),
                                       0u, fh.pts };
                 if (!WriteExact(g_wire, &ok, sizeof(ok))) return 10;
-                Log("[video] RNSZ: parameters only at %ux%u - the feature stays",
-                    v.w, v.hgt);
+                Log("[video] RNSZ: parameters only at %ux%u - the feature stays"
+                    " (%s)", v.w, v.hgt,
+                    !v.nr_small ? "no composite - the network is the output"
+                                : (v.residual ? "matched residual"
+                                              : "direct reconstruction"));
                 continue;
             }
             Log("[video] RNSZ: work %ux%u -> %ux%u (full %ux%u), warmup=%u",
@@ -5434,7 +5499,10 @@ static int RunVideo()
             // 3. New options (profile/params travel with the command).
             // VideoResizeCmd has the same packed layout as VideoHeader.
             memcpy(&g_video_options, &rc, sizeof(g_video_options));
-            // 4. Recreate textures + feature at the new sizes.
+            // 4. Recreate textures + feature at the new sizes. The composite
+            // is read here too: CreateVideoResources decides v.residual off
+            // this global, and a resize may well carry a changed switch.
+            g_nr_direct = (rc.flags & RESIZE_FLAG_NR_DIRECT) != 0;
             const int want_small = (rc.flags & RESIZE_FLAG_NR_SMALL) != 0 ? 1 : 0;
             if (!CreateVideoResources(v, rc.width, rc.height, rup ? rc.full_w : 0,
                                       rup ? rc.full_h : 0, want_small))
@@ -5457,7 +5525,16 @@ static int RunVideo()
             VideoResizeAck ack = { RESIZE_ACK_MAGIC, 1u, static_cast<uint32_t>(rr), 0u, fh.pts };
             if (!WriteExact(g_wire, &ack, sizeof(ack))) return 10;
             g_force_next_frame = true;   // the new setting must be shown on the next frame
-            Log("[video] RNSZ applied: feature ready at %ux%u", rc.width, rc.height);
+            // Not always ready: CreateFeature may have failed four lines up
+            // and said SAFE PASSTHROUGH, and this line then contradicted it
+            // in the same breath. It also names the composite now - the
+            // parameters-only path has said which one is live since A7, and
+            // the rebuild path stayed silent about it.
+            Log("[video] RNSZ applied at %ux%u: %s, %s", rc.width, rc.height,
+                h.feature != nullptr ? "feature ready" : "SAFE PASSTHROUGH",
+                !v.nr_small ? "no composite"
+                            : (v.residual ? "matched residual"
+                                          : "direct reconstruction"));
             continue;
         }
         if (msg == 3)
@@ -5602,9 +5679,7 @@ static int RunVideo()
         if (msg == 10)
         {
             if (!CaptureActive()) { Log("[cap] CAP1 requires active capture"); return 10; }
-            if (PhaseEnabled()) g_frame_stamp = {};
-            prepared_got = GrabCaptureWithRetry(v, true);
-            if (g_submission_failed) return 6;
+            prepared_got = g_wgc_active ? WgcGrab(v) : DdaGrab(v);
             if (g_dda_ready && g_gray_mapped && !g_capture_gray_ok)
             { Log("[cap] gray update failed; refusing mismatched motion"); return 10; }
             prepared_index = fh.index;
@@ -5620,7 +5695,7 @@ static int RunVideo()
         g_ui_valid = false;
         const double t_frame = PhaseNow();
         const bool phase_on = PhaseEnabled();
-        if (phase_on && !(fh.reserved & FRAME_FLAG_PREPARED)) g_frame_stamp = {};
+        if (phase_on) g_frame_stamp = {};
         ProfileRequest profile_request{ v, fh };
         if (phase_on) ++g_ph_requests;
         bool source_fresh = true;
@@ -5635,13 +5710,59 @@ static int RunVideo()
             const bool use_prepared = (fh.reserved & FRAME_FLAG_PREPARED) != 0;
             if (use_prepared && (!prepared || prepared_index != fh.index))
             { Log("[cap] prepared frame ID mismatch; refusing stale motion"); return 10; }
-            bool got = use_prepared ? prepared_got : GrabCaptureWithRetry(v,
-                (fh.reserved & FRAME_FLAG_WANT_PIXELS) != 0);
+            bool got = use_prepared ? prepared_got : (g_wgc_active ? WgcGrab(v) : DdaGrab(v));
             prepared = false;
             if (g_submission_failed) return 6;
+            if (!got && !g_dda_ready && !use_prepared &&
+                (fh.reserved & FRAME_FLAG_WANT_PIXELS) != 0)
+            {
+                // Pixels were asked for and there is not one captured frame
+                // to give. That is a screenshot or a recording slot: the
+                // screenshot retries on the next frame and heals itself, the
+                // recording simply ends up with a hole where that slot was.
+                //
+                // The window this happens in is short and self-closing -
+                // g_dda_ready is cleared by every RNSZ and by every capture
+                // restart, and the next real frame sets it again - so one
+                // more attempt is usually the whole difference. The DDA
+                // acquire waits up to 100 ms by itself; WGC returns at once
+                // and wants a moment for its pool to fill. Exactly one
+                // retry: a recording would rather have a rare 100 ms hiccup
+                // than a hole, and would not rather have a long stall
+                // (audit cpp-worker).
+                Sleep(8);
+                got = g_wgc_active ? WgcGrab(v) : DdaGrab(v);
+                if (g_submission_failed) return 6;
+                if (!got && !g_no_colour_retried)
+                {
+                    // Still nothing, and on a screen that is not changing
+                    // there never will be: duplication answers WAIT_TIMEOUT
+                    // and a WGC pool stays empty until the window redraws.
+                    // A FRESH capture session hands over the current content
+                    // as its first frame, which is exactly what is being
+                    // asked for. Once per dry spell - reopening the capture
+                    // on every slot of a recording would be thrashing.
+                    g_no_colour_retried = true;
+                    const bool reopened = g_wgc_active
+                        ? OpenWgc(g_wgc_hwnd) : OpenDda(g_dda_w, g_dda_h);
+                    // A fresh session does not answer the same millisecond:
+                    // the WGC pool fills on its own schedule, a frame
+                    // interval or so. Up to ~120 ms of small steps, which is
+                    // the difference between a hole and a hiccup, and still
+                    // shorter than the acquire timeout we already accept.
+                    for (int i = 0; reopened && !got && i < 12; ++i)
+                    {
+                        Sleep(10);
+                        got = g_wgc_active ? WgcGrab(v) : DdaGrab(v);
+                        if (g_submission_failed) return 6;
+                    }
+                    Log("[video] pixels asked for before the first capture "
+                        "frame: reopened the capture, %s",
+                        got ? "and it answered" : "still nothing");
+                }
+            }
             source_fresh = got && g_capture_visual_changed;
-            if (phase_on && source_fresh) ++g_ph_fresh_sources;
-            PhaseAdd(PH_DDA, t_dda);
+            if (phase_on && source_fresh) ++g_ph_fresh_sources;            PhaseAdd(PH_DDA, t_dda);
             if (!got && !g_dda_ready)
             {
                 // Not a single real desktop frame yet: keep the protocol
@@ -5679,12 +5800,21 @@ static int RunVideo()
                                   !out_changed;
                 if (skip)
                 {
-                    if (!g_skip_static_logged)
+                    ++g_skip_static_count;
+                    // Announce a STRETCH, not a frame. In one-window mode the
+                    // capture is event-driven and a window that is almost
+                    // still alternates skip/process frame after frame: a
+                    // user's log had the pair of lines repeating every 10-17
+                    // ms, "1 frames skipped" each time. That noise is also
+                    // what the menu reads to say "idle", so the word flipped
+                    // sixty times a second in front of whoever had it open.
+                    // Eight frames is a seventh of a second - far below any
+                    // real idle stretch, far above this churn.
+                    if (!g_skip_static_logged && g_skip_static_count >= 8)
                     {
                         g_skip_static_logged = true;
                         Log("[skip] no new frame - the network is idle until the screen changes");
                     }
-                    ++g_skip_static_count;
                     // The picture itself does not change, but in one-window mode
                     // the frame it sits in can still move - keep the overlay on it.
                     FollowCapturedWindow();
@@ -5699,8 +5829,12 @@ static int RunVideo()
             }
             else if (g_skip_static_count != 0)
             {
-                Log("[skip] the screen changed - %u frames skipped, the network resumes",
-                    g_skip_static_count);
+                // Only if the stretch was announced: an unannounced one was
+                // too short to be worth two lines, and a "resumes" with no
+                // "idle" before it reads as an event that never happened.
+                if (g_skip_static_logged)
+                    Log("[skip] the screen changed - %u frames skipped, "
+                        "the network resumes", g_skip_static_count);
                 g_skip_static_count = 0;
                 g_skip_static_logged = false;
             }
@@ -5711,7 +5845,7 @@ static int RunVideo()
             // the present's fence still cannot complete before it. It is
             // also the mode where frames are cheapest and most numerous, so
             // it is the one with the most round trips to save.
-            defer_tail = !g_hdr_capture && !FgRequested() && warmup_done && h.feature != nullptr &&
+            defer_tail = !g_hdr_capture && warmup_done && h.feature != nullptr &&
                 PresentModeActive(v) &&
                 (fh.reserved & (FRAME_FLAG_BYPASS | FRAME_FLAG_SPLIT | FRAME_FLAG_WANT_PIXELS)) == 0;
             // This frame is being processed: remember what it will show, so the
@@ -5725,8 +5859,13 @@ static int RunVideo()
             const bool try_nvofa = NvofaRequested() && !g_nvofa.failed && g_gray_mapped;
             const bool nvofa_used = try_nvofa && RunNvofa(v, fh.reset != 0, defer_tail ? &upload_done : nullptr);
             if (try_nvofa && !nvofa_used) fh.reset = 1; // do not reuse history after backend failure
-            const bool gpu_used = !NvofaRequested() && GpuMotionExperiment() && g_gray_mapped && g_gray_uav &&
-                RunGpuMotionExperiment(v, fh.reset != 0, defer_tail ? &upload_done : nullptr);
+            static bool gpu_failed = false;
+            const bool try_gpu = !NvofaRequested() && GpuMotionExperiment() && !gpu_failed && g_gray_mapped;
+            const bool gpu_used = try_gpu && RunGpuMotionExperiment(v, fh.reset != 0, defer_tail ? &upload_done : nullptr);
+            if (try_gpu && !gpu_used) {
+                gpu_failed = true; fh.reset = 1;
+                Log("[gpu-flow] unavailable: execution failed; using CPU DIS");
+            }
             const bool up_ok = nvofa_used || gpu_used || UploadMotionOnly(v, mv_ptr,
                                   (fh.reserved & FRAME_FLAG_MOTION_SMALL) != 0 && g_motion_w != 0,
                                   defer_tail ? &upload_done : nullptr);
@@ -5881,11 +6020,10 @@ static int RunVideo()
 // ---------------------------------------------------------------------------
 static void CleanupVideoNgx()
 {
+    CloseNvofa();
     CloseFgResources();
     CloseSrResources();
     if (g_sr.params) { NVSDK_NGX_D3D12_DestroyParameters(g_sr.params); g_sr.params = nullptr; }
-
-    CloseNvofa();
     if (h.feature != nullptr)
     {
         SafeReleaseFeature(h.feature);

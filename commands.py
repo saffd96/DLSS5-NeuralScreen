@@ -182,8 +182,12 @@ def apply_menu_action(st, action: tuple) -> None:
         st.cfg["rec_indicator"] = not bool(st.cfg.get("rec_indicator", True))
         settings_io.save_menu_layout(st)
         print(f"[main] recording indicator: {'on' if st.cfg['rec_indicator'] else 'off'}")
-    elif kind == "toggle" and action[1] == "gpu_motion":
-        pipeline.apply_gpu_motion(st, not bool(st.cfg.get("gpu_motion", False)))
+    elif kind == "toggle" and action[1] == "library_updates_enabled":
+        enabled = not bool(st.cfg.get("library_updates_enabled", False))
+        st.cfg["library_updates_enabled"] = enabled
+        settings_io.save_menu_layout(st)
+        if enabled:
+            library_checker.start()
     elif kind == "toggle" and action[1] == "ui_detection":
         st.cfg["ui_detection"] = not bool(st.cfg.get("ui_detection", False))
         settings_io.save_menu_layout(st)
@@ -216,6 +220,22 @@ def apply_menu_action(st, action: tuple) -> None:
         # HDR compatibility: NS_HDR is read once per worker process too,
         # and it decides the capture format, so this is a restart as well.
         pipeline.apply_hdr(st, not bool(st.cfg.get("hdr", False)))
+    elif kind == "style":
+        # Style travels with the parameters, so it applies the same way they
+        # do since C1: a resize command with unchanged sizes, no feature
+        # rebuild. Measured in test_param_effect - the frame changes and the
+        # log says "parameters only".
+        try:
+            value = int(action[1])
+        except (TypeError, ValueError):
+            value = 1
+        if 0 <= value <= 2:
+            new_params = dict(st.params)
+            new_params["style"] = value
+            pipeline.request_apply(st, st.work_scale, st.cfg["profile"],
+                                   new_params)
+    elif kind == "toggle" and action[1] == "gpu_motion":
+        pipeline.apply_motion_backend(st, "cpu" if st.cfg.get("gpu_motion") else "gpu")
     elif kind == "motion_backend":
         pipeline.apply_motion_backend(st, action[1])
     elif kind == "param":
@@ -319,7 +339,12 @@ def apply_menu_action(st, action: tuple) -> None:
     elif kind == "button":
         name = action[1]
         if name == "close":
-            if st.display.menu.page == "updates":
+            # Whatever route got here, the keyboard comes back. suspend() has
+            # exactly one counterpart and closing the menu is the last moment
+            # it can be reached; resume() on a controller that was never
+            # suspended posts a message nobody acts on.
+            st.hotkeys.resume()
+            if getattr(st.display.menu, "page", None) == "updates":
                 st.display.menu.page = "main"
             st.display.menu.visible = False
             st.display.set_menu_opaque(False)
@@ -329,6 +354,9 @@ def apply_menu_action(st, action: tuple) -> None:
             print(f"[main] exit: button in the overlay menu "
                   f"(frames processed {st.frame_index})")
             st.running = False
+        elif name.startswith("frame_multiplier:"):
+            st.cfg["frame_multiplier"] = min(4, max(2, int(name.split(":", 1)[1])))
+            settings_io.save_menu_layout(st)
         elif name == "record":
             st.tray_commands.put("record")
         elif name == "check_libraries":

@@ -70,6 +70,8 @@ static bool EnsureSr(VideoState &v)
         wchar_t directory[MAX_PATH] = {}, path[MAX_PATH] = {};
         GetModuleFileNameW(nullptr, directory, MAX_PATH);
         if (auto slash = wcsrchr(directory,L'\\')) *(slash+1)=0;
+        wcscpy_s(path,directory);wcscat_s(path,L"libraries\\nvngx_dlss.dll");
+        if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) g_sr.module = LoadLibraryW(path);
         wcscpy_s(path,directory);wcscat_s(path,L"nvngx_dlss.dll");
         if (!g_sr.module) g_sr.module = LoadLibraryW(path);
         if (!g_sr.module) { Log("[sr] DLL load failed: %lu",GetLastError()); g_sr.failed=true; return false; }

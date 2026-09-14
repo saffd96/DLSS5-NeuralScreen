@@ -110,8 +110,9 @@ def main() -> int:
         if menu.page != "settings" or out != [("capture", None)]:
             failures.append(f"gear: expected settings page, got {out}")
 
-    # 2. The settings page: the lang drop-down, the theme segment, hotkey
-    #    rows, back icon, back button.
+    # 2. The settings page: four tabs, and each control on the one it
+    #    belongs to. The page used to lay every control out at once.
+    menu.settings_tab = "app"      # the language and the theme
     menu.layout(3840, 2160)
     paint(menu)
     lang_choice = find(menu, "choice", "lang")
@@ -135,6 +136,9 @@ def main() -> int:
         # before clicking anything below the list.
         menu.layout(3840, 2160)
         paint(menu)
+    menu.settings_tab = "app"      # the theme segment lives here now
+    menu.layout(3840, 2160)
+    paint(menu)
     for key, want in (("theme", [("theme", "dark")]),):
         seg = find(menu, "segmented", key)
         if seg is None:
@@ -148,6 +152,9 @@ def main() -> int:
             pygame.MOUSEBUTTONDOWN, {"pos": cells[1].center, "button": 1}))
         if out != want:
             failures.append(f"segment {key}: expected {want}, got {out}")
+    # The key rows have their own tab now.
+    menu.settings_tab = "keys"
+    menu.layout(3840, 2160)
     for hk_cmd in ("toggle", "settings", "screenshot_menu", "record",
                    "window_mode", "scale_up", "scale_down", "quit"):
         hk = find(menu, "hotkey", hk_cmd)
@@ -159,7 +166,12 @@ def main() -> int:
             failures.append(f"hotkey row {hk_cmd}: expected capture, got {out}")
     # The switches on the settings page: each reports its own key. Two
     # of the three restart the worker when they fire (spout, hdr).
-    for tg_key in ("spout", "rec_indicator", "hdr"):
+    # The toggles are spread over the tabs now: capture holds hdr and the
+    # static skip, recording holds spout and the indicator.
+    for tg_key, tg_tab in (("spout", "rec"), ("rec_indicator", "rec"),
+                           ("hdr", "capture")):
+        menu.settings_tab = tg_tab
+        menu.layout(3840, 2160)
         tg = find(menu, "toggle", tg_key)
         if tg is None:
             failures.append(f"no {tg_key} toggle on the settings page")
@@ -177,6 +189,9 @@ def main() -> int:
     # The hint under a toggle is a caption, not a hit target: a click on
     # the explanation must emit nothing (the Spout2 toggle restarts the
     # worker, so a stray click there would freeze the screen for seconds).
+    menu.settings_tab = "rec"
+    menu.layout(3840, 2160)
+    paint(menu)
     spout_tg = find(menu, "toggle", "spout")
     if spout_tg is None:
         failures.append("no spout toggle for the hint hit-test")
@@ -238,6 +253,94 @@ def main() -> int:
         out = click(menu, btn)
         if out != want:
             failures.append(f"button {key}: expected {want}, got {out}")
+
+    # 3a2. Style is its own control now - the measurement says it is the
+    #      strongest lever there is, and it used to be reachable only by
+    #      picking a whole profile. Three cells, the middle one is Natural.
+    # The profile list above was expanded and collapsed; its rows move
+    # everything below, and a segment's cells are geometry the DRAWER
+    # fills. Lay out and paint again or the clicks land on the old rects.
+    menu.layout(3840, 2160)
+    paint(menu)
+    seg = find(menu, "segmented", "style")
+    if seg is None:
+        failures.append("no style segment on the main page")
+    else:
+        cells = seg.extra.get("cells") or []
+        if len(cells) != 3:
+            failures.append(f"the style segment has {len(cells)} cells, not 3")
+        else:
+            out = menu.handle_event(pygame.event.Event(
+                pygame.MOUSEBUTTONDOWN, {"pos": cells[0].center, "button": 1}))
+            if out != [("style", "0")]:
+                failures.append(f"style Default: expected [('style', '0')], "
+                                f"got {out}")
+            out = menu.handle_event(pygame.event.Event(
+                pygame.MOUSEBUTTONDOWN, {"pos": cells[2].center, "button": 1}))
+            if out != [("style", "2")]:
+                failures.append(f"style Cinematic: expected [('style', '2')], "
+                                f"got {out}")
+
+    # 3a3. "modified - revert" appears only when the live values have left
+    #      the profile they came from, and reverting is picking the same
+    #      profile again - which is what replaces every parameter with the
+    #      profile's own.
+    menu.page = "main"
+    menu.set_state({"profile": "Natural",
+                    "param_defaults": {"intensity": 1.0, "local_tone": 0.5,
+                                       "local_structure": 1.0,
+                                       "skin_structure": -1.0, "style": 1},
+                    "params": {"intensity": 1.0, "local_tone": 0.5,
+                               "local_structure": 1.0, "skin_structure": -1.0},
+                    "style": 1})
+    menu.layout(3840, 2160)
+    if find(menu, "button", "revert_profile") is not None:
+        failures.append("revert is offered while the profile is untouched")
+    menu.set_state({"params": {"intensity": 1.0, "local_tone": 1.2,
+                               "local_structure": 1.0, "skin_structure": -1.0}})
+    menu.layout(3840, 2160)
+    paint(menu)
+    rev = find(menu, "button", "revert_profile")
+    if rev is None:
+        failures.append("a moved slider must offer revert")
+    else:
+        out = click(menu, rev)
+        if out != [("profile", "Natural")]:
+            failures.append(f"revert: expected [('profile', 'Natural')], "
+                            f"got {out}")
+    # The model is part of the profile too.
+    menu.set_state({"params": {"intensity": 1.0, "local_tone": 0.5,
+                               "local_structure": 1.0, "skin_structure": -1.0},
+                    "style": 2})
+    menu.layout(3840, 2160)
+    if find(menu, "button", "revert_profile") is None:
+        failures.append("a changed model must offer revert too")
+    menu.set_state({"style": 1})
+    # Back to a painted layout: the source segment below reads the cells the
+    # drawer fills, and the state changes above invalidated them.
+    menu.layout(3840, 2160)
+    paint(menu)
+
+    # 3a4. The row that names the captured window opens the picker. It was
+    #      the one line on the page that looked like a control and was not.
+    menu.page = "main"
+    menu.state["window_mode"] = True
+    menu.set_state({"window_current": "1A2B3C: Firefox"})
+    menu.layout(3840, 2160)
+    row = next((i for i in menu.items
+                if i.kind == "info" and i.key == "source_now"), None)
+    if row is None:
+        failures.append("no captured-window row in window mode")
+    else:
+        out = menu.handle_event(pygame.event.Event(
+            pygame.MOUSEBUTTONDOWN, {"pos": row.rect.center, "button": 1}))
+        if menu.page != "windows" or out != [("capture", None)]:
+            failures.append(f"the captured-window row must open the picker, "
+                            f"got page={menu.page!r} out={out}")
+    menu.page = "main"
+    menu.state["window_mode"] = False
+    menu.layout(3840, 2160)
+    paint(menu)
 
     # 3b. The source segment carries what the Actions buttons used to: the
     #     left cell returns to the whole screen (nothing to do when it is

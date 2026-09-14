@@ -24,8 +24,8 @@ from i18n import STRINGS as UI_STRINGS
 # numbers size the shared motion buffer in the SHMI handshake.
 from protocol import WORK_MAX_H, WORK_MAX_W  # noqa: F401
 from winapi import list_capturable_windows
-from resolution_limits import safe_processing_size
 from library_updates import checker as library_checker
+from resolution_limits import safe_processing_size
 
 
 def show_update_notice(st):
@@ -133,7 +133,7 @@ def _set_autostart(enabled: bool) -> bool:
 
 # The version shown in the menu header. Kept in sync with native/launcher.rc
 # (FileVersion/ProductVersion) and build_release_zip.py at release time.
-APP_VERSION = "1.8.2"
+APP_VERSION = "1.9.0"
 
 
 # The channel label: the header shows the version, the channel lives in the
@@ -150,22 +150,85 @@ CHANNEL_LABEL = "@perseval_BLR"
 # brightening this program does anyway meets it head on. The four sliders
 # still reach everything they reached: this moves where the profiles sit,
 # not what the range allows.
+#
+# The profiles no longer carry `profile`, `preset` or `ui_correction`.
+# Measured on the 310.8.0 runtime: every value of all three produces a
+# byte-identical frame (colour-sweep-20260913, and tests/test_param_effect.py
+# reports them every run). They are still sent - the wire layout is shared
+# with the resize command and with a hundred tests - but they are sent as a
+# fixed zero by the two packers, and nobody has to wonder about them again.
+#
+# Intensity is clamped at 1.00 inside NVIDIA's DLL, so the 1.65 and 2.50 the
+# strong profiles used to ask for were the same picture as 1.00 all along.
+# Extreme's local_structure comes down from 2.00 to the new 1.50 ceiling,
+# which is the one real change here: measured, that is a detail metric of
+# -14.4% against -13.5%, about a percent of the picture.
+#
+# The auto mask is on in every profile. Measured here on three real frames,
+# a frozen input so anything moving between consecutive outputs is the
+# network trembling rather than the picture changing:
+#
+#   source  mask   wiggle  shadows  peak   edges  detail  ms/frame
+#   text       0    0.209    0.167    10   1.110   0.965      5.26
+#   text       1    0.158    0.131    10   1.096   0.932      5.15
+#   film       0    0.363    0.207     9   0.971   0.666      5.26
+#   film       1    0.314    0.176     7   0.959   0.669      5.30
+#   game       0    0.335    0.304     8   1.225   1.176      5.28
+#   game       1    0.308    0.286     6   1.213   1.157      5.26
+#
+# It damps the trembling by 8-24% and the shadows by 6-22%, takes the peaks
+# down (9->7, 8->6), and costs nothing in time - the per-frame figures are
+# the same within noise. It is not free: on text it costs 3.4% of the fine
+# detail. Text is also where it damps the most, and shimmering text is what
+# people report, so that is the trade taken.
+#
+# The other reason is arithmetic: skin_structure is inert without it. With
+# the mask off in two of the four profiles, the fourth slider in the menu
+# did nothing at all in those two.
 PROFILES = {
-    "Faithful": dict(profile=0, preset=0, style=0, auto_mask=0, ui_correction=0,
+    "Faithful": dict(style=0, auto_mask=1,
                      intensity=0.70, local_tone=0.25, local_structure=0.75, skin_structure=-1.0),
-    "Natural": dict(profile=1, preset=0, style=1, auto_mask=0, ui_correction=0,
+    "Natural": dict(style=1, auto_mask=1,
                     intensity=1.00, local_tone=0.50, local_structure=1.00, skin_structure=-1.0),
-    "Strong / Cinematic": dict(profile=2, preset=2, style=2, auto_mask=1, ui_correction=0,
-                               intensity=1.65, local_tone=0.90, local_structure=1.50, skin_structure=1.0),
-    "Extreme / Overdrive": dict(profile=2, preset=2, style=2, auto_mask=1, ui_correction=0,
-                                intensity=2.50, local_tone=1.50, local_structure=2.00, skin_structure=1.5),
+    "Strong / Cinematic": dict(style=2, auto_mask=1,
+                               intensity=1.00, local_tone=0.90, local_structure=1.50, skin_structure=1.0),
+    "Extreme / Overdrive": dict(style=2, auto_mask=1,
+                                intensity=1.00, local_tone=1.50, local_structure=1.50, skin_structure=1.5),
 }
 
 
 WORK_SCALE_MIN = 0.1
 
 
-PARAM_MIN, PARAM_MAX = 0.0, 2.5
+# How far each slider really reaches. One shared 0..2.5 was wrong in both
+# directions: it promised travel that did nothing (issue #40, "low effect
+# strength" - the user was turning a knob that had stopped answering), and
+# it allowed values where the picture gets worse rather than stronger.
+#
+#   intensity        clamped at 1.0 inside NVIDIA's DLL. 1.0, 1.25, 1.5, 2
+#                    and 2.5 all hash to the same frame.
+#   tone, structure  the detail metric keeps climbing past 1.5, but what is
+#                    climbing is shimmer: the metric counts trembling noise
+#                    as fine detail. 1.5 is where the picture stops
+#                    improving and only starts moving.
+#   skin_structure   inert unless auto_mask is on, and -1 is "off".
+PARAM_RANGE = {
+    "intensity": (0.0, 1.0),
+    "local_tone": (0.0, 1.5),
+    "local_structure": (0.0, 1.5),
+    "skin_structure": (-1.0, 2.0),
+}
+
+
+def param_range(key: str) -> tuple:
+    """The (low, high) a parameter is allowed. Unknown keys get the widest."""
+    return PARAM_RANGE.get(key, (0.0, 1.5))
+
+
+def clamp_param(key: str, value: float) -> float:
+    """Pull a value into range - for configs written before the range was."""
+    lo, hi = param_range(key)
+    return min(max(float(value), lo), hi)
 
 
 # The four sliders a user preset stores. The same keys as PROFILES carries,
@@ -174,45 +237,29 @@ PARAM_MIN, PARAM_MAX = 0.0, 2.5
 PRESET_KEYS = ("intensity", "local_tone", "local_structure", "skin_structure")
 
 
-SKIN_MIN = -1.0
-
-
 DEFAULT_LANG = "en"
 
 
-def _valid_preset_value(key: str, value) -> bool:
-    """A preset value is a finite number inside the slider range.
-
-    The config is user-editable: a hand-typed "intensity": "abc" or 99.0
-    must not crash the program - the preset is dropped instead (the
-    built-in profiles always survive).
-    """
-    try:
-        value = float(value)
-    except (TypeError, ValueError, OverflowError):
-        return False
-    lo = SKIN_MIN if key == "skin_structure" else PARAM_MIN
-    return lo <= value <= PARAM_MAX
-
-
-# The NGX plumbing fields a preset carries along with the four sliders.
-# They are integers with a small, known range (the same values PROFILES
-# uses); anything outside is a broken entry.
+# The NGX plumbing a preset carries along with the four sliders: the range
+# it must be in, and what to use when it is not there at all. Presets saved
+# by builds up to 1.8.2 also carry profile/preset/ui_correction; those are
+# read and thrown away, because they do nothing (see PARAM_RANGE). A preset
+# saved by this build does not have them, and must still load.
 _PRESET_INT_KEYS = {
-    "profile": (0, 2), "preset": (0, 2), "style": (0, 2),
-    "auto_mask": (0, 1), "ui_correction": (0, 1),
+    "style": (0, 2, 1),
+    "auto_mask": (0, 1, 0),
 }
 
 
 def load_presets(cfg: dict) -> dict:
     """The user presets from the config, validated.
 
-    A preset is a full params snapshot: the four sliders plus the NGX
-    plumbing (profile/preset/style/auto_mask/ui_correction), so applying
-    it reproduces the exact look it was saved with. Anything that is not
-    exactly that shape is dropped - a broken entry must not take the
-    program down, and a broken entry must not be offered in the menu
-    either.
+    A preset is a full params snapshot: the four sliders plus the style and
+    the auto mask, so applying it reproduces the look it was saved with.
+    A broken entry is dropped - it must neither take the program down nor
+    be offered in the menu. A merely OLD entry is not broken: values wider
+    than the ranges allow today are pulled in, and the three dead fields a
+    pre-1.8.3 preset carries are ignored.
     """
     raw = cfg.get("presets")
     if not isinstance(raw, dict):
@@ -226,14 +273,28 @@ def load_presets(cfg: dict) -> dict:
         clean = {}
         ok = True
         for key in PRESET_KEYS:
-            if key not in values or not _valid_preset_value(key, values[key]):
+            if key not in values:
                 ok = False
                 break
-            clean[key] = float(values[key])
+            try:
+                v = float(values[key])
+            except (TypeError, ValueError, OverflowError):
+                ok = False
+                break
+            if (isinstance(values[key], bool) or v != v
+                    or v in (float("inf"), float("-inf"))):
+                ok = False
+                break
+            # Out of range is an older build, not a broken preset: the
+            # ranges shrank when they were measured, and a preset saved at
+            # intensity 2.5 was already giving the picture 1.0 gives. It is
+            # pulled in, not thrown away - losing someone's saved look over
+            # a number that never did anything would be indefensible.
+            clean[key] = clamp_param(key, v)
         if not ok:
             continue
-        for key, (lo, hi) in _PRESET_INT_KEYS.items():
-            v = values.get(key)
+        for key, (lo, hi, fallback) in _PRESET_INT_KEYS.items():
+            v = values.get(key, fallback)
             if not isinstance(v, int) or isinstance(v, bool) or not (lo <= v <= hi):
                 ok = False
                 break
@@ -267,11 +328,30 @@ def load_config(path: Path) -> dict:
     for key in ("width", "height", "warmup"):
         if isinstance(cfg[key], bool) or not isinstance(cfg[key], int) or cfg[key] <= 0:
             raise ValueError(f"config.json: field {key} must be a positive integer")
+    # Out of range is not an error any more, it is an old config. The
+    # ranges shrank when they were measured (intensity 2.5 -> 1.0 and so
+    # on), and a user who had 2.5 saved was already getting the picture 1.0
+    # gives - refusing to start over a number that never did anything would
+    # be the worst of both. Nonsense is still an error: "abc" is a broken
+    # file, 2.5 is a file written by an older build.
     for key in ("intensity", "local_tone", "local_structure", "skin_structure"):
-        if (cfg[key] is not None
-                and (isinstance(cfg[key], bool)
-                     or not _valid_preset_value(key, cfg[key]))):
-            raise ValueError(f"config.json: field {key} must be a finite number in range")
+        if cfg[key] is None:
+            continue
+        if isinstance(cfg[key], bool):
+            raise ValueError(f"config.json: field {key} must be a finite number")
+        try:
+            value = float(cfg[key])
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(f"config.json: field {key} must be a finite number")
+        if value != value or value in (float("inf"), float("-inf")):
+            raise ValueError(f"config.json: field {key} must be a finite number")
+        pulled = clamp_param(key, value)
+        if pulled != value:
+            print(f"[main] config.json: {key} {value:g} is outside the "
+                  f"measured range {param_range(key)}; using {pulled:g} - "
+                  f"the same picture the old value gave",
+                  file=sys.stderr)
+        cfg[key] = pulled
     # work_scale: 0.1..1.0 - the NGX processing resolution relative to the output
     scale = float(cfg.get("work_scale", 1.0))
     cfg["work_scale"] = min(WORK_SCALE_MAX, max(WORK_SCALE_MIN, scale))
@@ -280,22 +360,21 @@ def load_config(path: Path) -> dict:
     if lang not in UI_STRINGS:
         lang = DEFAULT_LANG
     cfg["lang"] = lang
+    from motion_backend import normalize_backend
+    cfg["motion_backend"] = normalize_backend(cfg.get("motion_backend", "gpu" if cfg.get("gpu_motion") else "cpu"))
+    cfg["gpu_motion"] = cfg["motion_backend"] == "gpu"
     try:
         sr_scale = float(cfg.get("dlss_sr_scale", .65))
     except (TypeError, ValueError):
         sr_scale = .65
     cfg["dlss_sr_scale"] = min(1.0, max(.25, sr_scale))
     cfg["dlss_sr"] = bool(cfg.get("dlss_sr", False))
-    cfg["gpu_motion"] = cfg.get("gpu_motion") is True
     cfg["ui_detection"] = bool(cfg.get("ui_detection", False))
     cfg["frame_generation"] = bool(cfg.get("frame_generation", False))
     try:
         cfg["frame_multiplier"] = min(4, max(2, int(cfg.get("frame_multiplier", 2))))
     except (ValueError, TypeError, OverflowError):
         cfg["frame_multiplier"] = 2
-    from motion_backend import normalize_backend
-    cfg["motion_backend"] = normalize_backend(cfg.get("motion_backend", "gpu" if cfg.get("gpu_motion") else "cpu"))
-    cfg["gpu_motion"] = cfg["motion_backend"] == "gpu"
     return cfg
 
 
@@ -310,10 +389,20 @@ def resolve_params(cfg: dict) -> dict:
         params = dict(PROFILES[cfg["profile"]])
     else:
         params = dict(load_presets(cfg).get(cfg["profile"], PROFILES["Natural"]))
+    # The saved style overrides the profile's, the same way the four
+    # sliders do - the user picked it after picking the profile.
+    style = cfg.get("style")
+    if isinstance(style, int) and not isinstance(style, bool) and 0 <= style <= 2:
+        params["style"] = style
     for key in ("intensity", "local_tone", "local_structure", "skin_structure"):
+        # Saved presets are written by whatever build the user had, so they
+        # are pulled into range here as well - validate_config only sees the
+        # live slider values, not the presets behind them.
+        if key in params:
+            params[key] = clamp_param(key, params[key])
         value = cfg.get(key)
         if value is not None:
-            params[key] = float(value)
+            params[key] = clamp_param(key, value)
     return params
 
 
@@ -390,6 +479,9 @@ def _menu_layout_payload(cfg: dict, params: dict, monitor: int, lang: str,
         "local_tone": params["local_tone"],
         "local_structure": params["local_structure"],
         "skin_structure": params["skin_structure"],
+        # Style is a user choice now, not a property of the profile, so it
+        # has to survive a restart like the four sliders do.
+        "style": int(params.get("style", 1)),
         "monitor": monitor_name if monitor_name is not None else int(monitor),
         "rec_indicator": bool(cfg.get("rec_indicator", True)),
         "screenshot_dir": cfg.get("screenshot_dir") or "",
@@ -400,6 +492,8 @@ def _menu_layout_payload(cfg: dict, params: dict, monitor: int, lang: str,
         # startup and main sets it from this flag. Experimental, off.
         "hdr": bool(cfg.get("hdr", False)),
         "motion_backend": cfg.get("motion_backend", "cpu"),
+        "gpu_motion": cfg.get("motion_backend") == "gpu",
+        "library_updates_enabled": cfg.get("library_updates_enabled", False) is True,
         # Which card runs the network and the capture. An index, as
         # DXGI enumerates adapters - the same number the worker takes
         # in NS_GPU and prints in its "[host] adapter N" lines.
@@ -411,10 +505,9 @@ def _menu_layout_payload(cfg: dict, params: dict, monitor: int, lang: str,
         # Skip static frames: no new frame from the capture - the network
         # idles instead of re-running on the same picture. A per-frame flag,
         # so it survives a restart through the config alone.
-        "skip_static": bool(cfg.get("skip_static", True)),
+        "skip_static": bool(cfg.get("skip_static", False)),
         "dlss_sr_scale": float(cfg.get("dlss_sr_scale", .65)),
         "dlss_sr": bool(cfg.get("dlss_sr", False)),
-        "gpu_motion": cfg.get("gpu_motion") is True,
         "ui_detection": bool(cfg.get("ui_detection", False)),
         "frame_generation": bool(cfg.get("frame_generation", False)),
         "frame_multiplier": min(4, max(2, int(cfg.get("frame_multiplier", 2)))),
@@ -495,9 +588,16 @@ def refresh_gpu_ok(st) -> None:
         # speak again.
         if not st.gpu_alerted:
             st.gpu_alerted = True
+            # Eight seconds, not the usual two and a half. This is not a
+            # notification that something was applied - it is the reason the
+            # picture will look untouched for the rest of the session, and
+            # the people who reported it as a black screen had not seen it
+            # at all. The standing version of the same fact is in the menu's
+            # status line, for whoever looks later.
             st.display.alert(UI_STRINGS[st.lang].get(
                 "gpu_nr_fail",
-                "This GPU cannot run the neural pass - the picture stays unprocessed"))
+                "This GPU cannot run the neural pass - the picture stays "
+                "unprocessed"), 8.0)
 
 
 def refresh_sr(st) -> None:
@@ -570,6 +670,27 @@ def _gpu_label(index) -> str:
     return f"{i}: {name}"
 
 
+
+def _fg_displayed_fps(st) -> float | None:
+    """The frame rate the presenter actually shows (real + generated).
+
+    The worker reports it every two seconds - "[fg] displayed 87.1 FPS".
+    The pipeline counter stays the honest network rate; this is what the
+    screen really shows with Frame Generation on. None while FG is off.
+    """
+    for line in reversed(st.worker_logs[-200:]):
+        if "[fg] displayed" in line:
+            try:
+                return float(line.split("displayed ", 1)[1].split(" FPS", 1)[0])
+            except (ValueError, IndexError):
+                return None
+        # A marker line for FG-off resets the reading - the toggle logs one.
+        if "[fg] UI: off" in line:
+            return None
+    return None
+
+
+
 def _worker_idle(st) -> bool:
     """Is the network idling on an unchanged screen right now?
 
@@ -597,7 +718,27 @@ def _worker_idle(st) -> bool:
 def menu_payload(st) -> dict:
     """The current state for the menu - a single source of truth."""
     refresh_gpu_ok(st)
-    wins = list_capturable_windows()
+    # The list is FROZEN while the page that shows it is open, and sorted by
+    # title rather than by z-order.
+    #
+    # EnumWindows answers in z-order, this payload is rebuilt on every frame
+    # the menu is up, and z-order changes whenever anything takes the focus -
+    # including the window the pointer is travelling towards. So the rows
+    # re-ordered under the cursor between the hover and the click, and the
+    # click landed on whatever had moved into that position: picked
+    # WireGuard, got Claude (user, 13.09).
+    #
+    # Frozen means frozen: a window that appears or closes while the list is
+    # up does not shuffle the rows either. Closing the page and opening it
+    # again takes a fresh reading - which is the only way to take one, and
+    # enough: the picker is a few clicks, not a live monitor.
+    _menu = getattr(getattr(st, "display", None), "menu", None)
+    if getattr(_menu, "page", "") == "windows" and getattr(st, "window_list", None):
+        wins = st.window_list
+    else:
+        wins = sorted(list_capturable_windows(),
+                      key=lambda hw: (str(hw[1]).casefold(), hw[0]))
+        st.window_list = wins
     # The devicename is the stable identity: the menu hands it back
     # on a switch, so a reorder cannot redirect the capture.
     monitor_entries = [f"{i}: {w}x{h} ({dev})"
@@ -621,12 +762,19 @@ def menu_payload(st) -> dict:
         # What the CURRENT profile puts each parameter at. The menu draws it
         # as a tick under the slider, so "how far have I moved this from
         # Natural" is visible instead of remembered.
+        # The range each slider draws. It lives here, next to the
+        # measurement that set it, rather than being a second copy of the
+        # numbers inside the menu.
+        "param_ranges": {k: list(v) for k, v in PARAM_RANGE.items()},
+        # Which of the three looks is live - its own control since the
+        # measurement showed it is the strongest lever we have.
+        "style": int(st.params.get("style", 1)),
         "param_defaults": {
             k: float(v) for k, v in
             (PROFILES.get(st.cfg["profile"])
              or st.presets.get(st.cfg["profile"]) or {}).items()
             if k in ("intensity", "local_tone", "local_structure",
-                     "skin_structure")},
+                     "skin_structure", "style")},
         "lang": st.lang,
         "recording": st.recorder is not None,
         "work_size": f"{st.work_w}x{st.work_h}",
@@ -636,10 +784,11 @@ def menu_payload(st) -> dict:
         "spout": bool(st.cfg.get("spout", False)),
         "hdr": bool(st.cfg.get("hdr", False)),
         "motion_backend": st.cfg.get("motion_backend", "cpu"),
-        "skip_static": bool(st.cfg.get("skip_static", True)),
+        "gpu_motion": st.cfg.get("motion_backend") == "gpu",
+        "skip_static": bool(st.cfg.get("skip_static", False)),
+        "library_updates_enabled": st.cfg.get("library_updates_enabled", False) is True,
         "dlss_sr_scale": float(st.cfg.get("dlss_sr_scale", .65)),
         "dlss_sr": bool(st.cfg.get("dlss_sr", False)),
-        "gpu_motion": st.cfg.get("gpu_motion") is True,
         "ui_detection": bool(st.cfg.get("ui_detection", False)),
         "frame_generation": bool(st.cfg.get("frame_generation", False)),
         "frame_multiplier": min(4, max(2, int(st.cfg.get("frame_multiplier", 2)))),
@@ -648,6 +797,9 @@ def menu_payload(st) -> dict:
         # healthy FPS while nothing is being processed, and the skip
         # reads as "it does not work" (user, 12.09).
         "idle": _worker_idle(st),
+        # What the presenter actually shows while FG interpolates; the
+        # HUD pairs it with the network rate as "42 / 84 fps".
+        "display_fps": _fg_displayed_fps(st),
         # The list, with a note on any adapter whose worker could not bring
         # the neural pass up. DXGI reports some cards twice (one user has a
         # single 5080 listed as adapters 0 and 2) and the two entries are
@@ -669,6 +821,12 @@ def menu_payload(st) -> dict:
         "autostart": _autostart_enabled(),
         "split": st.split_pos,
         "gpu_text": st.gpu_text,
+        # The four facts the log header carries, for the About block. A
+        # reporter can read them off the menu instead of being asked which
+        # version and which driver - which is the first exchange on almost
+        # every issue.
+        "about": dict(getattr(st, "environment", None) or {},
+                      gpu=st.gpu_text or ""),
         "gpu_ok": st.gpu_ok,
         "window_mode": st.window_hwnd is not None,
         "monitor_devicename": st.capture.devicename,

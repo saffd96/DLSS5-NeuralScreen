@@ -2,7 +2,7 @@
 
 
 def normalize_backend(value):
-    return value if value in ("nvofa", "gpu") else "cpu"
+    return value if value in ("gpu", "nvofa") else "cpu"
 
 
 class MotionBackendStatus:
@@ -17,10 +17,10 @@ class MotionBackendStatus:
             self.active = self.failed = False
         # Keep the last verdict when the bounded log buffer rotates.
         for line in reversed(logs):
-            if "[nvofa] unavailable:" in line:
+            if "[nvofa] unavailable:" in line or "[gpu-flow] unavailable:" in line:
                 self.active, self.failed = False, True
                 break
-            if "[nvofa] active:" in line:
+            if "[nvofa] active:" in line or "[gpu-flow] experimental GPU Lucas-Kanade active" in line:
                 self.active, self.failed = True, False
                 break
         return self.active

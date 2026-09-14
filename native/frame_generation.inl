@@ -68,6 +68,9 @@ static struct FgState {
     bool history = false;
     ~FgState() { stop = true; wake.notify_all(); if (thread.joinable()) thread.join(); }
 } g_fg;
+// g_fg_present_fence lives in dlss5-feed-host64.cpp near the FgPresent
+// forward declaration: PresentFrame consumes it for the defer-tail token,
+// and the include of this file sits below that call site.
 
 static int g_fg_ui_enabled = -1;
 static unsigned g_fg_count = 1;
@@ -133,7 +136,7 @@ static void FgPresenter()
             FAILED(fence->SetEventOnCompletion(value, event)) ||
             WaitForSingleObject(event, 2000) != WAIT_OBJECT_0 ||
             fence->GetCompletedValue() < value) return false;
-        if (!PresentStatus(g_present_swap->Present(0, 0), "fg present")) return false;
+        if (FAILED(g_present_swap->Present(0, 0))) return false;
         RevealOnFirstPresent();
         ++shown;
         return true;
@@ -199,12 +202,25 @@ static bool EnsureFg(VideoState &v, DXGI_FORMAT format)
     CloseFgResources();
     if (!g_fg.module)
     {
+        // The BYO library folder next to the worker, then the worker's own
+        // directory: users drop nvngx_dlssg.dll into native\libraries\ to
+        // pick the build they want, and native\ stays the bundled fallback.
         wchar_t path[MAX_PATH] = {};
         GetModuleFileNameW(nullptr, path, MAX_PATH);
         if (auto slash = wcsrchr(path, L'\\')) *(slash + 1) = 0;
         wchar_t directory[MAX_PATH]; wcscpy_s(directory, path);
-        wcscat_s(path, L"nvngx_dlssg.dll");
-        g_fg.module = LoadLibraryW(path);
+        wchar_t libraries[MAX_PATH]; wcscpy_s(libraries, directory);
+        wcscat_s(libraries, L"libraries\\");
+        wchar_t lib_path[MAX_PATH]; wcscpy_s(lib_path, libraries);
+        wcscat_s(lib_path, L"nvngx_dlssg.dll");
+        if (GetFileAttributesW(lib_path) != INVALID_FILE_ATTRIBUTES)
+            g_fg.module = LoadLibraryW(lib_path);
+        if (!g_fg.module)
+        {
+            wcscpy_s(path, directory);
+            wcscat_s(path, L"nvngx_dlssg.dll");
+            g_fg.module = LoadLibraryW(path);
+        }
         if (!g_fg.module) { Log("[fg] nvngx_dlssg.dll load failed: %lu", GetLastError()); return false; }
         auto init = reinterpret_cast<PFN_NR_InitExt>(GetProcAddress(g_fg.module, "NVSDK_NGX_D3D12_Init_Ext"));
         g_fg.create = reinterpret_cast<PFN_NR_Create>(GetProcAddress(g_fg.module, "NVSDK_NGX_D3D12_CreateFeature"));
@@ -381,7 +397,17 @@ static bool FgPresent(VideoState &v, ID3D12Resource *color, D3D12_RESOURCE_STATE
         std::lock_guard<std::mutex> lock(g_fg.mutex);
         for (auto &s : g_fg.slots) if (s.state == 0) { slot = &s; break; }
         if (!slot) for (auto &s : g_fg.slots) if (s.state == 2) { slot = &s; break; }
-        if (!slot) { WaitFenceValue(h.fence, EndCommands(), 30000); return true; }
+        if (!slot)
+        {
+            // Starvation: every slot is mid-flight. The submitted work still
+            // ends here - record its token, or PresentFrame hands the defer
+            // contract a STALE g_fg_present_fence from an earlier frame and
+            // the token-order guard kills the worker (the blink-out class).
+            const UINT64 fence = EndCommands();
+            WaitFenceValue(h.fence, fence, 30000);
+            g_fg_present_fence = fence;
+            return true;
+        }
         slot->state = 1;
     }
     // The reserved slot is invisible to the presenter until the fence completes.
@@ -408,8 +434,10 @@ static bool FgPresent(VideoState &v, ID3D12Resource *color, D3D12_RESOURCE_STATE
     SpoutBridgeCopy(h.list, v.output, g_fg.w, g_fg.height);
     auto spout_post = Transition(v.output, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     h.list->ResourceBarrier(1, &spout_post);
-    if (!WaitFenceValue(h.fence, EndCommands(), 30000))
+    const UINT64 fg_fence = EndCommands();
+    if (!WaitFenceValue(h.fence, fg_fence, 30000))
     { g_fg.failed = true; CloseFgResources(); return false; }
+    g_fg_present_fence = fg_fence;
     BYTE *disabled = nullptr;
     D3D12_RANGE read = {0, g_fg_count * 4}, written = {0, 0};
     if (SUCCEEDED(g_fg.disable_readback->Map(0, &read, reinterpret_cast<void **>(&disabled))))

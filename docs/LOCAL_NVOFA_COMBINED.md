@@ -23,3 +23,19 @@ Combined smoke command:
 
 Standalone NVOFA benchmark numbers in NVOFA.md do not measure the cost of
 enabling every feature at the same time.
+
+## Experimental integration (2026-09-14)
+
+Merged upstream experimental at fc6af02 while retaining local SR, UI protection,
+GPU LK and opt-in library updates. Main is still v1.9.0 at b18980f at this time.
+Latest FG pacing, window flicker fixes, displayed FPS and multiplier controls
+are retained. Guides run once after prepared capture; the duplicate processing
+in the upstream experimental loop was removed. Hardware backend failure resets
+history and resumes CPU DIS. Updates remain off by default; the opt-in persists.
+SR and FG load from native/libraries first, then native; updates follow that path.
+SR/DLAA remain available locally but disabled in the personal configuration.
+
+Integration validation: native build, module/config/i18n checks, GPU/NVOFA/FG
+controls, UI detection and offline updater tests. Real GPU tests exercised SR
+reduction, 100% DLAA, bypass and resize; HDR FG with dynamic multiplier and UI
+protection completed cleanly. Full suite has not been run for this merge.

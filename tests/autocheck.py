@@ -88,20 +88,19 @@ def personal_config_keys():
 
 
 def zip_integrity():
-    zpath = ROOT / "neuralscreen-v1.8.2-full.zip"
+    zpath = ROOT / "neuralscreen-v1.9.0-full.zip"
     if not zpath.is_file():
-        return False, "no neuralscreen-v1.8.2-full.zip"
+        return False, "no neuralscreen-v1.9.0-full.zip"
     required = [
         "main.py", "gpuinfo.py", "overlay_ui.py", "i18n.py", "recorder.py",
         "display.py", "guides.py", "hotkeys.py", "tray.py", "capture.py",
         "audio.py", "protocol.py", "winapi.py", "dialogs.py", "channels.py",
         "settings_io.py", "paths.py", "pipeline.py", "commands.py",
-        "startup.py", "library_updates.py", "resolution_limits.py", "ui_detection.py",
+        "startup.py", "fonts.py", "taskbar.py",
         "NeuralScreen.exe",
         "TECHNICAL.md", "TECHNICAL.ru.md",
         "README.md", "README.ru.md", "NeuralScreen.vbs", "NeuralScreen.bat",
         "native/nvngx.dll", "native/nvngx_dlssnr.dll",
-        "native/nvngx_dlss.dll", "native/nvngx_dlssg.dll",
         # Neural Rendering does not start without it: the NGX calls
         # have to leave a module whose path carries "nvngx.dll".
         "native/nvngx.dll_ns-forwarder.dll",
@@ -134,11 +133,15 @@ def zip_integrity():
         # same goes for the worker - the archive carries a freshly built
         # nvngx.dll whose content nobody can verify by eye, so a
         # non-committed rebuild slips through (audit #4, C1/C2).
-        for name in ("main.py", "hotkeys.py", "display.py", "recorder.py",
-                     "overlay_ui.py", "i18n.py", "protocol.py", "winapi.py",
-                     "pipeline.py", "settings_io.py", "channels.py",
-                     "commands.py", "paths.py", "startup.py",
-                     "README.md", "README.ru.md"):
+        # Derived from `required` rather than written out again: the two
+        # lists have to agree, and the second one drifted - guides.py,
+        # gpuinfo.py, tray.py, capture.py, audio.py and dialogs.py were
+        # required to be PRESENT but never compared, so an uncommitted
+        # change to any of them shipped silently. guides.py is where the
+        # motion-vector validation lives.
+        compared = [f for f in required if f.endswith(".py")]
+        compared += ["README.md", "README.ru.md"]
+        for name in compared:
             try:
                 head = subprocess.check_output(["git", "show", f"HEAD:{name}"],
                                                cwd=ROOT)
@@ -180,8 +183,8 @@ def zip_integrity():
         zsha = hashlib.sha256(zip_dll).hexdigest()
         if f"sha256 {zsha}" not in vt:
             return False, "VERSION.txt runtime sha != the DLL inside the archive"
-        if "NeuralScreen 1.8.2" not in vt:
-            return False, "VERSION.txt version does not match v1.8.2"
+        if "NeuralScreen 1.9.0" not in vt:
+            return False, "VERSION.txt version does not match v1.9.0"
     return True, f"{zpath.stat().st_size} bytes, all files, the hook, a default config, a truthful manifest"
 
 

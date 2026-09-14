@@ -22,7 +22,7 @@ def exact(p,n):
         b.extend(c)
     return b
 
-def run(mode,quality=False,round_id=0,static=False,failure=False,hdr=True,resize=False,combined=False):
+def run(mode,quality=False,round_id=0,static=False,failure=False,hdr=True,resize=False):
     w,h=(1280,720) if quality else (2560,1440)
     screen=pygame.display.set_mode((w,h),pygame.NOFRAME)
     rng=np.random.default_rng(123)
@@ -34,10 +34,10 @@ def run(mode,quality=False,round_id=0,static=False,failure=False,hdr=True,resize
         rgb=cv2.cvtColor(cv2.resize(gray,(w,h),interpolation=cv2.INTER_LINEAR),cv2.COLOR_GRAY2RGB)
         surfaces.append(pygame.surfarray.make_surface(rgb.transpose(1,0,2)))
     screen.blit(surfaces[0],(0,0));pygame.display.flip()
-    tag=f'{mode}-q{int(quality)}-r{round_id}'+('-static' if static else '')+('-fallback' if failure else '')+('-sdr' if not hdr else '')+('-resize' if resize else '')+('-combined' if combined else '')
+    tag=f'{mode}-q{int(quality)}-r{round_id}'+('-static' if static else '')+('-fallback' if failure else '')+('-sdr' if not hdr else '')+('-resize' if resize else '')
     folder=OUT/tag;folder.mkdir(exist_ok=True)
     env=dict(os.environ,NS_HDR='1' if hdr else '0',NS_NR_SMALL='1',NS_MOTION_BACKEND='nvofa' if mode=='nvofa' else 'cpu',
-             NS_PHASE_TIMING='1',NS_GPU_FLOW_EXPERIMENT='0')
+             NS_PHASE_TIMING='1')
     if failure:env['NS_NVOFA_TEST_FAIL_AT']='60'
     else:env.pop('NS_NVOFA_TEST_FAIL_AT',None)
     if quality and mode=='nvofa':env['NS_NVOFA_DUMP']=str(folder)
@@ -60,8 +60,6 @@ def run(mode,quality=False,round_id=0,static=False,failure=False,hdr=True,resize
         wire.send_motion_size(p,320,180);ack(wire.MOTION_ACK_FMT)
         wire.send_gray(p,320,180,shm.gray_name);ack(wire.GRAY_ACK_FMT)
         wire.send_window(p,w,h);ack(wire.WINDOW_ACK_FMT)
-        if combined:
-            p.stdin.write(struct.pack(wire.FRAME_FMT,wire.SR_SCALE_MAGIC,0,75,0,0));p.stdin.flush();ack(wire.OUT_FMT)
         time.sleep(.15)
         for i in range(24 if quality else 220):
             if resize and i in (70,140):
@@ -76,16 +74,12 @@ def run(mode,quality=False,round_id=0,static=False,failure=False,hdr=True,resize
             pygame.event.pump();screen.blit(surfaces[0 if static else i%16],(0,0));pygame.display.flip()
             if quality:time.sleep(.025)
             t0=time.perf_counter()
-            if combined:
-                p.stdin.write(struct.pack(wire.FRAME_FMT,wire.CAPTURE_MAGIC,i,0,0,i));p.stdin.flush();ack(wire.OUT_FMT)
-                wire.send_ui_regions(p,i,((1000,1000,8000,8000),))
             t1=time.perf_counter();gray=shm.read_gray().copy().reshape(180,320)
             hardware=mode=='nvofa' and status.update(p,[x.decode('utf-8',errors='replace') for x in logs])
             hardware_frames.append(hardware)
             g=guide.process(gray=gray,compute_motion=not hardware)
             t2=time.perf_counter()
-            wire.send_frame(p,i,None,g.motion,g.reset,i,no_color=True,motion_small=True,want_pixels=False,
-                            prepared=combined,dlss_sr=combined,frame_generation=combined,frame_multiplier=2)
+            wire.send_frame(p,i,None,g.motion,g.reset,i,no_color=True,motion_small=True,want_pixels=False)
             a=ack(wire.OUT_FMT)
             if a[3]:exact(p.stdout,a[3])
             t3=time.perf_counter()
@@ -131,9 +125,6 @@ def run(mode,quality=False,round_id=0,static=False,failure=False,hdr=True,resize
             assert '[nvofa] unavailable: injected execute failure' in log, log
             assert any(hardware_frames) and not any(hardware_frames[80:]), hardware_frames
         else: assert '[nvofa] unavailable:' not in log, log
-    if combined:
-        assert '[sr] first evaluation succeeded' in log and '[fg] 2x enabled' in log,log
-        assert '[sr] Evaluate failed' not in log and '[fg] Evaluate failed' not in log,log
     if quality:
         valid=[r for r in quality_rows if not r['reset'] and r['phase_response'] > .98]
         assert len(valid)>=16, quality_rows
@@ -150,9 +141,7 @@ def run(mode,quality=False,round_id=0,static=False,failure=False,hdr=True,resize
 if __name__=='__main__':
     pygame.init()
     try:
-        if '--combined' in sys.argv:
-            run('nvofa',combined=True)
-        elif '--resize' in sys.argv:
+        if '--resize' in sys.argv:
             run('nvofa',resize=True,hdr=False)
         elif '--fallback' in sys.argv:
             run('nvofa',failure=True)

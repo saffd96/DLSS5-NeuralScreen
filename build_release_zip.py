@@ -17,7 +17,7 @@ from pathlib import Path
 BASE = Path(__file__).resolve().parent
 os.chdir(BASE)
 
-VERSION = "1.8.2"
+VERSION = "1.9.0"
 # The bundle is architecture-agnostic by design: the dcc0dc24 runtime and
 # the 0x1B0 spoof work on RTX 30/40/50 (v1.3.0 behaviour). The manifest
 # still records what is inside so a mismatch is catchable.
@@ -26,10 +26,10 @@ TARGET_ARCHS = "RTX 30/40/50 (sm_86/89/120 kernels, spoof 0x1B0; RTX 20 cannot r
 files = subprocess.check_output(["git", "ls-files"], text=True).splitlines()
 extra = [
     "library_updates.py",
-    "resolution_limits.py",
     "ui_detection.py",
-    "native/nvngx_dlss.dll",
     "native/nvngx_dlssg.dll",
+    "resolution_limits.py",
+    "native/nvngx_dlss.dll",
     "NeuralScreen.exe",
     "NeuralScreen.vbs",
     "NeuralScreen-diag.vbs",
@@ -40,10 +40,6 @@ extra = [
     "native/nvngx.dll_ns-forwarder.dll",
     "native/nvngx_dlssnr.dll",
 ]
-required = tuple(extra)
-missing = [name for name in required if not (BASE / name).is_file()]
-if missing:
-    raise SystemExit("Missing required release files: " + ", ".join(missing))
 # tcl/tk stays out of the archive: the tkinter settings window is gone and the
 # whole interface lives in the overlay menu. Nothing in the project imports
 # tkinter (PIL/_tkinter_finder pulls it lazily and only for ImageTk).
@@ -279,19 +275,41 @@ for want in (75, 86, 89, 120):
 # The user can verify which build they have without asking anyone.
 commit = subprocess.check_output(
     ["git", "rev-parse", "HEAD"], text=True).strip()
+# One tag, one set of bytes. The archive is rebuilt after every commit so the
+# static checks can compare it against HEAD - which means a zip built today
+# still carries yesterday's version number, passes every gate, and would be
+# accepted by a release that was tagged a dozen commits ago. Nothing caught
+# that: autocheck compares the zip with HEAD, verify_github compares it with
+# what is published, and neither has ever looked at the tag. So the manifest
+# says which it is, and the build says it out loud.
+try:
+    tagged = subprocess.check_output(
+        ["git", "rev-parse", "v" + VERSION + "^{commit}"], text=True,
+        stderr=subprocess.DEVNULL).strip()
+except Exception:
+    tagged = ""
+if not tagged:
+    tag_line = "tag: v" + VERSION + " does not exist yet - release candidate\n"
+elif tagged == commit:
+    tag_line = "tag: v" + VERSION + "\n"
+else:
+    ahead = subprocess.check_output(
+        ["git", "rev-list", "--count", "v" + VERSION + "..HEAD"],
+        text=True).strip()
+    tag_line = ("tag: NOT v" + VERSION + " - " + ahead
+                + " commits past it (tagged " + tagged[:9] + ")\n")
+    print("  NOTE: this archive is " + ahead + " commits past v" + VERSION
+          + ". It is a development build - do NOT upload it to that tag. "
+            "Bump the version, build, then tag.")
 version_txt = (
     f"NeuralScreen {VERSION}\n"
     f"commit: {commit}\n"
+    + tag_line +
     f"runtime: nvngx_dlssnr.dll sha256 {dll_sha}\n"
     f"kernel archs: {', '.join(sorted(SM_NAMES.get(a, f'sm_{a}') for a in archs))}\n"
     f"targets: {TARGET_ARCHS}\n"
     f"built: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
 )
-for name in ("nvngx_dlss.dll", "nvngx_dlssg.dll"):
-    with (BASE / "native" / name).open("rb") as stream:
-        version_txt += f"library: {name} sha256 {hashlib.file_digest(stream, 'sha256').hexdigest()}\n"
-if subprocess.check_output(["git", "status", "--porcelain"], text=True).strip():
-    version_txt += "worktree: modified (archive includes local changes)\n"
 
 with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
     z.writestr("VERSION.txt", version_txt)

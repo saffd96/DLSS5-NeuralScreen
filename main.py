@@ -37,7 +37,6 @@ import sys
 import threading
 import time
 import uuid
-import warnings
 from pathlib import Path
 
 
@@ -70,12 +69,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import cv2
 import numpy as np
-os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
-with warnings.catch_warnings():
-    # pygame 2.6 uses this deprecated API internally; keep other warnings visible.
-    warnings.filterwarnings("ignore", message=r"pkg_resources is deprecated as an API.*",
-                            category=UserWarning, module=r"pygame\.pkgdata")
-    import pygame  # HUD overlay on the recorded frame (image.frombuffer)
+import pygame  # HUD overlay on the recorded frame (image.frombuffer)
 
 from capture import (ScreenCapture, devicename_for_output_idx, list_monitors,
                      resolve_output_idx)
@@ -111,7 +105,7 @@ from startup import (LOG_PATH, _apply_gpu_env,  # noqa: F401
                      _apply_nr_dll, _apply_spout_env, _init_logging,
                      _log_environment)
 from settings_io import (DEFAULT_LANG, PRESET_KEYS,  # noqa: F401
-                         SKIN_MIN, load_config, load_presets,
+                         load_config, load_presets,
                          resolve_params)
 from settings_io import _work_size, hotkey_labels  # noqa: F401
 # The settings layer owns these now; re-exported because the rest
@@ -157,6 +151,32 @@ from protocol import (  # noqa: F401
 FPS_LOG_INTERVAL = 2.0  # seconds, FPS log to the console
 PERF_LOG_INTERVAL = 5.0  # seconds, log of the mean pipeline stage timings
 PERF_KEYS = ("grab", "resize_full", "guides", "send", "recv", "show")
+
+
+def _resize_interp(src: np.ndarray, dst_w: int, dst_h: int) -> int:
+    """Which cv2 filter the fallback resize uses.
+
+    Only the fallback path resizes at all: with the capture in the worker
+    (DDA1/WGCW) the GPU hands over a frame that is already the right size.
+    This runs when dxcam is doing the grabbing and its frame disagrees with
+    the configured size - a hybrid laptop on the iGPU display, or a display
+    mode change caught in flight.
+
+    It used to be INTER_LANCZOS4 in either direction, which measured 11.76 ms
+    for 2560x1440 -> 4K against 1.53 ms for INTER_AREA and 1.64 ms for
+    INTER_LINEAR: ten milliseconds of the frame budget on the one path that
+    exists BECAUSE the fast path was unavailable - i.e. on the slowest
+    hardware in the fleet.
+
+    AREA when shrinking, LINEAR when growing: AREA is a box filter and
+    degenerates towards nearest neighbour on an upscale, while LINEAR aliases
+    on a large downscale, and guides.py says what aliasing does to the flow
+    field. A Lanczos kernel's extra sharpness was never going to survive NGX
+    resampling the frame again anyway.
+    """
+    if dst_w * dst_h < src.shape[1] * src.shape[0]:
+        return cv2.INTER_AREA
+    return cv2.INTER_LINEAR
 
 
 
@@ -250,6 +270,7 @@ class _Pipeline:
         "follow_resize",
         "follow_size",
         "mon_resize",
+        "environment",
         "frame_index",
         "gpu_ok",
         "gpu_alerted",
@@ -263,6 +284,7 @@ class _Pipeline:
         "hotkeys",
         "lang",
         "last_foreground",
+        "window_list",
         "last_restart",
         "mon_h",
         "mon_w",
@@ -270,6 +292,7 @@ class _Pipeline:
         "motion_attempted",
         "motion_small",
         "next_auto_revive",
+        "nr_direct",
         "nr_small",
         "out_attempted",
         "out_shm",
@@ -336,13 +359,6 @@ def main() -> int:
     if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
         print("[main] another NeuralScreen is already running - this copy exits", file=sys.stderr)
         return 1
-
-    # The 320x180 motion field is too small to benefit from a large thread
-    # pool: 32 threads measured 6.5-7 ms versus 2.8 ms with four, with identical
-    # motion vectors. Configure once before capture/recording threads start;
-    # keep a lower thread count if the environment already selected one.
-    cv2.setNumThreads(min(4, max(1, cv2.getNumThreads())))
-    print(f"[main] OpenCV threads: {cv2.getNumThreads()}")
 
     # The config file's path, kept in the state: the settings module writes
     # back into it and has no business knowing what argparse is.
@@ -426,6 +442,7 @@ def main() -> int:
                         channels.forget_present(st)
                         channels.forget_dda(st)
                         channels.forget_out(st)
+                        channels.forget_verdict(st)
                         channels.sync_motion_size(st)
                         st.frame_index = 0
                         st.pts = 0
@@ -539,8 +556,8 @@ def main() -> int:
                 # nothing", which is a report we have had (issue #27) and a
                 # notice a user asked for (issue #33). Once per session.
                 settings_io.warn_hdr(st)
-                settings_io.refresh_sr(st)
                 settings_io.show_update_notice(st)
+                settings_io.refresh_sr(st)
 
             # --- Input for the overlay menu --------------------------
             # Events are read only while the menu is open: the rest of the
@@ -572,12 +589,12 @@ def main() -> int:
                 if frame.shape[1] != st.width or frame.shape[0] != st.height:
                     t0 = time.perf_counter()
                     try:
-                        cv2.resize(frame, (st.width, st.height), interpolation=cv2.INTER_LANCZOS4, dst=st.buf_full)
+                        cv2.resize(frame, (st.width, st.height), interpolation=_resize_interp(frame, st.width, st.height), dst=st.buf_full)
                     except cv2.error:
                         # The monitor resolution changed: buf_full was
                         # preallocated for the old size - recreate and retry
                         st.buf_full = np.empty((st.height, st.width, 4), dtype=np.uint8)
-                        cv2.resize(frame, (st.width, st.height), interpolation=cv2.INTER_LANCZOS4, dst=st.buf_full)
+                        cv2.resize(frame, (st.width, st.height), interpolation=_resize_interp(frame, st.width, st.height), dst=st.buf_full)
                     _perf("resize_full", t0)
                     frame = st.buf_full
                 else:
@@ -593,22 +610,39 @@ def main() -> int:
                 check_worker(st.worker, st.worker_logs)
                 sync_sr_scale(st.worker, st.reader, float(st.cfg.get("dlss_sr_scale", .65)))
                 if st.gray_active:
-                    t_prepare = time.perf_counter()
                     prepare_capture(st.worker, st.reader, st.frame_index, st.pts)
-                    st.perf.setdefault("prepare_capture", []).append((time.perf_counter()-t_prepare)*1000)
                 try:
                     t0 = time.perf_counter()
-                    detect_ui = bool(st.cfg.get("ui_detection", False) and
-                                     st.cfg.get("frame_generation", False))
-                    if st.gray_active:
+                    detect_ui = bool(st.cfg.get("ui_detection", False) and st.cfg.get("frame_generation", False))
+                    if bypass:
+                        # NR OFF: the worker skips the NGX evaluate, so nothing
+                        # ever reads this motion field. Computing it anyway cost
+                        # 2.9 ms of DIS per frame (measured, 320x180 flow, moving
+                        # content) - and it cost it on the mode that runs
+                        # FASTEST, 121-133 FPS in bypass, where it came to about
+                        # half a core spent filling a buffer the worker throws
+                        # away. The frame still CARRIES a motion field: the
+                        # header's size contract does not change just because the
+                        # effect is off.
+                        #
+                        # previous_gray goes with it. Keeping the last pre-bypass
+                        # frame as history would mean correlating against a
+                        # screen that is minutes old the moment NR comes back on,
+                        # and the first real flow field would be garbage.
+                        # Cleared, the first NR frame reports a scene cut
+                        # instead - which is what a resumed pipeline is.
+                        st.guides.previous_gray = None
+                        guide = st.guides.zero_guide()
+                    elif st.gray_active:
                         was_failed = motion_status.failed and motion_status.worker is st.worker
                         hardware_motion = motion_status.update(st.worker, st.worker_logs)
-                        if motion_status.failed and not was_failed:
-                            st.display.alert(UI_STRINGS[st.lang]["motion_fallback"])
-                        nvofa = st.cfg.get("motion_backend") == "nvofa"
-                        skip_dis = hardware_motion if nvofa else os.environ.get("NS_GPU_FLOW_EXPERIMENT") == "1"
-                        guide = st.guides.process(gray=st.shm.read_gray(), detect_ui=detect_ui,
-                                                  compute_motion=not skip_dis)
+                        if motion_status.failed and not was_failed and st.cfg.get("motion_backend") == "nvofa":
+                            st.display.alert(UI_STRINGS[st.lang].get(
+                                "motion_fallback", "NVOFA unavailable - using CPU DIS"))
+                        guide = st.guides.process(
+                            gray=st.shm.read_gray(), detect_ui=detect_ui,
+                            compute_motion=not (st.cfg.get("motion_backend") in ("nvofa", "gpu")
+                                                and hardware_motion))
                     else:
                         guide = st.guides.process(st.work_frame, detect_ui=detect_ui)
                     _perf("guides", t0)
@@ -640,7 +674,7 @@ def main() -> int:
                            no_color=bool(st.dda_mode),
                            bypass=bypass,
                            split=st.split_pos,
-                           skip_static=bool(st.cfg.get("skip_static", True)),
+                           skip_static=bool(st.cfg.get("skip_static", False)),
                            frame_generation=bool(st.cfg.get("frame_generation", False)),
                            frame_multiplier=int(st.cfg.get("frame_multiplier", 2)),
                            prepared=bool(st.gray_active),
@@ -688,6 +722,7 @@ def main() -> int:
                 channels.forget_present(st)
                 channels.forget_dda(st)
                 channels.forget_out(st)
+                channels.forget_verdict(st)
                 channels.sync_motion_size(st)
                 st.frame_index = 0
                 st.pts = 0
@@ -710,10 +745,10 @@ def main() -> int:
                 if next_frame.shape[1] != st.width or next_frame.shape[0] != st.height:
                     t0 = time.perf_counter()
                     try:
-                        cv2.resize(next_frame, (st.width, st.height), interpolation=cv2.INTER_LANCZOS4, dst=st.buf_full)
+                        cv2.resize(next_frame, (st.width, st.height), interpolation=_resize_interp(next_frame, st.width, st.height), dst=st.buf_full)
                     except cv2.error:
                         st.buf_full = np.empty((st.height, st.width, 4), dtype=np.uint8)
-                        cv2.resize(next_frame, (st.width, st.height), interpolation=cv2.INTER_LANCZOS4, dst=st.buf_full)
+                        cv2.resize(next_frame, (st.width, st.height), interpolation=_resize_interp(next_frame, st.width, st.height), dst=st.buf_full)
                     _perf("resize_full", t0)
                     next_frame = st.buf_full
                 else:
@@ -791,6 +826,7 @@ def main() -> int:
                 channels.forget_present(st)
                 channels.forget_dda(st)
                 channels.forget_out(st)
+                channels.forget_verdict(st)
                 channels.sync_motion_size(st)
                 st.frame_index = 0
                 st.pts = 0
@@ -861,10 +897,24 @@ def main() -> int:
                     # WGCW works (fallback config) - without the call the HUD
                     # and the menu stay invisible forever in that setup.
                     st.display.reveal()
+                    # And the layer has to be colour-keyed here, because
+                    # draw_overlay() clears it with CHROMA_KEY. In this
+                    # configuration enable_present() failed, so set_hud_only
+                    # was last called with False - an OPAQUE window - and the
+                    # clear painted the whole screen magenta with the menu on
+                    # top of it. Nothing else fills this layer in this branch:
+                    # no frame reaches Python at all, which is why the desktop
+                    # underneath has to show through (audit I1).
+                    st.display.set_hud_only(True)
                     st.display.draw_overlay()
                 else:
                     st.display.exit_switch_mode()  # the next frame replaces the overlay
                     st.display.reveal()  # a real frame exchange happened
+                    # The layer's own state is decided inside show(): it knows
+                    # whether the frame covers the layer (opaque) or only a
+                    # window on it (the surround is keyed out). Asking for it
+                    # here as well is how the key used to flip once per
+                    # returned frame - the blink.
                     st.display.show(st.output_rgba)
                     if st.pending_shot is not None:
                         commands.save_screenshot(st, st.pending_shot, st.output_rgba)
@@ -920,6 +970,10 @@ def main() -> int:
             _perf("show", t0)
             st.display.set_hud({
                 "fps": last_fps,
+                # What the presenter shows with Frame Generation on - the
+                # worker reports it every two seconds. The HUD pairs the
+                # network rate with it ("42 / 84 fps"); None while FG is off.
+                "display_fps": settings_io._fg_displayed_fps(st),
                 "status": status,
                 "resolution": f"{st.width}x{st.height}",
                 "profile": st.cfg["profile"],
@@ -960,8 +1014,8 @@ def main() -> int:
 
             if now - last_perf_log >= PERF_LOG_INTERVAL:
                 parts = []
-                for key in (*PERF_KEYS, "prepare_capture"):
-                    samples = st.perf.get(key, [])
+                for key in PERF_KEYS:
+                    samples = st.perf[key]
                     if samples:
                         parts.append(f"{key} {sum(samples) / len(samples):.1f}ms")
                     samples.clear()

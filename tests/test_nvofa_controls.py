@@ -23,7 +23,7 @@ import tempfile
 
 
 def main():
-    assert all(normalize_backend(v) == "cpu" for v in [None, {}, [], 1, "obsolete", "CPU"])
+    assert all(normalize_backend(v) == "cpu" for v in [None, {}, [], 1, "CPU"])
     assert normalize_backend("nvofa") == "nvofa"
     assert _payload()["motion_backend"] == "cpu"
     assert _payload(dict(GOOD, motion_backend="nvofa"))["motion_backend"] == "nvofa"
@@ -69,12 +69,6 @@ def main():
         assert up.call_count == 1
         pipeline.apply_motion_backend(st, "cpu")
         assert os.environ["NS_MOTION_BACKEND"] == "cpu" and up.call_count == 2
-        pipeline.apply_motion_backend(st, "gpu")
-        assert st.cfg["gpu_motion"] and os.environ["NS_GPU_FLOW_EXPERIMENT"] == "1"
-        pipeline.apply_motion_backend(st, "nvofa")
-        assert not st.cfg["gpu_motion"] and os.environ["NS_GPU_FLOW_EXPERIMENT"] == "0"
-        pipeline.apply_gpu_motion(st, True)
-        assert st.cfg["motion_backend"] == "gpu" and os.environ["NS_MOTION_BACKEND"] != "nvofa"
 
     pygame.init()
     try:

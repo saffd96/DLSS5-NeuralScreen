@@ -16,8 +16,14 @@ UPDATABLE = {'DLSS SR': 'nvngx_dlss.dll', 'DLSS FG': 'nvngx_dlssg.dll'}
 INSTALL_ERRORS = set()
 
 
-def stage_update(filename, expected, directory=NATIVE_DIR):
+def library_directory(filename):
+    bundled = NATIVE_DIR / 'libraries'
+    return bundled if (bundled / filename).is_file() else NATIVE_DIR
+
+
+def stage_update(filename, expected, directory=None):
     """Download official bytes, verify repository blob hash and PE version."""
+    directory = library_directory(filename) if directory is None else directory
     if filename not in UPDATABLE.values():
         raise ValueError('Unsupported library')
     url = ('https://api.github.com/repos/NVIDIA/DLSS/contents/'
@@ -75,8 +81,12 @@ def stage_update(filename, expected, directory=NATIVE_DIR):
         temp_manifest.unlink(missing_ok=True)
 
 
-def apply_pending(directory=NATIVE_DIR):
+def apply_pending(directory=None):
     """Called before the first worker starts. Keep an original .bak on success."""
+    if directory is None:
+        apply_pending(NATIVE_DIR)
+        apply_pending(NATIVE_DIR / 'libraries')
+        return
     for filename in UPDATABLE.values():
         manifest = directory / (filename + '.update.json')
         if not manifest.exists():
@@ -281,7 +291,7 @@ class LibraryChecker:
                                     ('DLSS FG', 'nvngx_dlssg.dll'),
                                     ('DLSS NR', 'nvngx_dlssnr.dll')]:
                 path = (os.environ.get('NS_NR_DLL') if label == 'DLSS NR' else None)
-                path = path or NATIVE_DIR / filename
+                path = path or library_directory(filename) / filename
                 installed = latest = None
                 try:
                     installed = local_version(path)
@@ -299,7 +309,7 @@ class LibraryChecker:
                                       'newer' if installed > latest else 'current')
                     except Exception as exc:
                         print(f'[libraries] {label}: official version unavailable: {exc}')
-                if label in UPDATABLE and (NATIVE_DIR / (filename + '.update.json')).exists():
+                if label in UPDATABLE and (library_directory(filename) / (filename + '.update.json')).exists():
                     status = 'install_failed' if filename in INSTALL_ERRORS else 'pending'
                 rows.append((label, version_text(installed), version_text(latest), status))
                 print(f'[libraries] {label}: installed={version_text(installed)}, '

@@ -121,6 +121,20 @@ Two costs, neither of them the bitrate:
   section happens on the reader thread; a copy is unavoidable because the
   section has one slot and the worker overwrites it next frame, while a
   recorded frame outlives that.
+- **~11 ms of ALLOCATING the 33 MB to copy into.** This is the part the
+  `OUTS` channel did not fix and the table above still shows: transport was
+  removed, allocation was not. `read_out()` called `.copy()`, so every
+  recorded frame mapped a fresh 33 MB array and paid ~8000 first-touch page
+  faults on it - measured at 4K with four frames held alive (the encoder's
+  queue depth), **13.2 ms per frame at 2.5 GB/s against 2.4 ms at 13.7 GB/s**
+  into a pre-allocated buffer. The memcpy was never the cost.
+
+  It now copies into a slot of a reused ring (`OUT_RING_SLOTS`). The reason
+  that is safe, and the reason the ring is scanned rather than simply
+  advanced: a returned frame travels by REFERENCE into the encoder queue and
+  lives until the encoder has written it, so a slot is only handed out when
+  its refcount shows nobody else holds it. When every slot is in flight the
+  answer is a fresh array - slower for that frame, and always correct.
 
 Lowering the bitrate does nothing for any of this: the time goes into the
 colour conversion, not into the encoder. Which is why there is no bitrate
@@ -136,14 +150,15 @@ not.
 | `fullscreen` | borderless fullscreen window |
 | `warmup` | NGX warmup frames at start |
 | `work_scale` | 0.1–1.0, the resolution the network runs at, relative to the screen. Only has an effect with `nr_small` on |
-| `nr_small` | process at a reduced resolution and compose the result onto the native frame: faster, sharp (the residual composite). Default `false` |
+| `nr_small` | process at a reduced resolution and compose the result onto the native frame: faster, sharp (the residual composite). Default `true` - **Boost is on** |
 | `profile` | `Faithful`, `Natural`, `Strong / Cinematic`, `Extreme / Overdrive` |
 | `intensity`, `local_tone`, `local_structure`, `skin_structure` | `null` = take from profile |
-| `lang` | `ru` / `en` |
+| `lang` | 12 languages: `en` `ru` `fr` `de` `es` `it` `pt` `pl` `uk` `zh` `ja` `ko` |
 | `worker_present` | worker shows the frame in its own window (`false` — pygame output) |
 | `motion_on_gpu` | worker upscales the motion field (`false` — CPU) |
 | `capture_in_worker` | worker captures the desktop itself (DDA, `false` — dxcam in Python) |
 | `pixels_in_shm` | result pixels come back through a shared section instead of the pipe (`false` — pipe, as before) |
+| `flow_preset` | which DIS configuration estimates the motion field: `fast` (default, as shipped), `ultrafast`, `medium`. See "What the guides cost" |
 | `split` | 0–1, share of the frame left unprocessed for the before/after wipe; 0 — off |
 | `theme` | `light` / `dark` |
 | `open_menu_on_start` | open the menu on launch; `false` — a short alert instead |
@@ -173,6 +188,49 @@ They talk over stdin/stdout with a binary protocol:
 **Capture.** On `DDA1` the worker opens Desktop Duplication on the GPU: each
 frame is copied into a cross-device shared texture and swizzled to RGBA.
 Python stops capturing entirely — `grab` and `guides` drop to 0.1 ms.
+
+That `guides` figure is a STATIC screen, and it is worth saying so: with
+nothing moving, `process()` sees a scene score under 0.001 and returns a
+cached zero field without ever calling DIS (measured 0.03 ms). On moving
+content — a game, a video, a page being scrolled, i.e. the whole point of
+the program — the DIS call runs and the stage costs **3.9 ms**, of which
+2.9 ms is `dis.calc` itself. It is the one per-frame cost left in Python
+once the capture, the motion upscale and the presentation are all on the
+GPU, and it is serial ahead of `send`, so it is frame time rather than
+background work.
+
+Two things follow from that, both done:
+
+* **In bypass (NR OFF) it is not computed at all.** The worker skips the
+  NGX evaluate, so nothing ever reads the field; filling it cost ~2.9 ms on
+  the mode that runs fastest (121-133 FPS), about half a core spent on a
+  buffer that gets thrown away. `previous_gray` is cleared along with it, so
+  the first frame after NR comes back reports a scene cut instead of
+  correlating against a screen that may be minutes old.
+* **The preset is a setting now** (`flow_preset`), because it is worth a
+  measurement rather than an assumption.
+
+### What the guides cost
+
+`dis.calc` on the same 320×180 pair, and the endpoint error against
+synthetic ground truth (a known pixel shift, in flow-grid pixels):
+
+```
+                     ms      EPE mean over 1..16 px    p99 @1px   max @32px
+FAST / finest 1    2.85          0.001 - 0.029           0.10       8.5
+ULTRAFAST / 1      0.34          0.0003 - 0.076          0.49      31.6
+FAST / finest 2    1.45          (not scored against GT)
+```
+
+`ultrafast` is **8.4× faster**, and its mean error stays under 0.08 flow px
+— inside the 0.5 px noise floor `guides.py` already zeroes, so on average it
+cannot even reach the motion field. Its tails are the reason it is not the
+default: p99 0.49 px at a 1 px shift and a 31.6 px maximum at a 32 px shift,
+against 8.5 px for `fast`. Tails are what a temporal network shows as
+smearing, and nothing here can judge that without the GPU pipeline and real
+moving content in front of a person — so it ships as a switch with its
+numbers attached, the way `nr_small` did before it became the default. The
+before/after wipe is how to judge it.
 Fallback (dxcam + full-frame send) stays intact.
 
 **Guides.** The optical flow needs a small gray frame. On `GRAY` the worker
@@ -304,7 +362,7 @@ above (14.0 ms at 4K, 7.7 ms at 2560×1600) and matches what the
 [neural-upstream](https://github.com/matiasLombo/neural-upstream) add-on
 measures for the same network in games.
 
-So **Process at reduced resolution** (menu → speed, `"nr_small"` in
+So **Process at reduced resolution** (menu → processing, `"nr_small"` in
 `config.json`) scales the frame down to the work resolution, runs the network
 there, and scales the result back up. On a 4K desktop, work at the 2560×1440
 cap:

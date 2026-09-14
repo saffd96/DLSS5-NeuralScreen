@@ -25,6 +25,7 @@ def main():
              patch.object(pipeline, "teardown_pipeline"), patch.object(pipeline, "rebuild_pipeline"):
             for before in [False, True, False]:
                 st.cfg["gpu_motion"] = before
+                st.cfg["motion_backend"] = "gpu" if before else "cpu"
                 menu.set_state(st.cfg)
                 paint(menu)
                 item = find(menu, "toggle", "gpu_motion")

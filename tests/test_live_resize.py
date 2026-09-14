@@ -72,6 +72,9 @@ def _state(dda_mode=True):
     return types.SimpleNamespace(
         window_hwnd=0x1234, worker_failed=False, dda_mode=dda_mode,
         present_mode=True, motion_small=True, nr_small=False,
+        # Which Boost composite travels with the resize (A7). False is what
+        # ships; the flag only has to exist, the resize reads it.
+        nr_direct=False,
         work_scale=0.65, width=FRAME[0], height=FRAME[1],
         work_w=2496, work_h=1364, params={"intensity": 1.0},
         follow_pos=(0, 0), follow_size=FRAME, follow_resize=None,
@@ -103,7 +106,9 @@ def _patch(calls, probe=FULLSCREEN, rack_raises=False, probe_raises=False):
 
     pipeline.send_resize = resize_fn
     pipeline.switch_window = lambda st, hwnd: calls.append("restart")
-    pipeline.TemporalGuideGenerator = lambda w, h, emit_small=False: \
+    # **kw: the stub stands in for the generator, it does not pin its
+    # signature - the real one also takes the flow preset now.
+    pipeline.TemporalGuideGenerator = lambda w, h, emit_small=False, **kw: \
         calls.append(f"guides:{w}x{h}") or types.SimpleNamespace(
             motion_width=w, motion_height=h)
     channels.probe_window_capture = probe_fn

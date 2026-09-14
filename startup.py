@@ -81,6 +81,13 @@ def _apply_nr_dll(cfg: dict) -> None:
         os.environ["NS_NR_DLL"] = str(cfg["nr_dll"])
 
 
+def _start_library_checks(cfg: dict) -> None:
+    """Network access requires explicit saved opt-in; absent means offline."""
+    if cfg.get("library_updates_enabled", False) is True:
+        from library_updates import checker
+        checker.start()
+
+
 def _apply_spout_env(cfg: dict) -> None:
     """The Spout2 bridge flag reaches the worker through the environment.
 
@@ -153,6 +160,12 @@ def _apply_gpu_env(cfg: dict) -> None:
         os.environ["NS_GPU"] = str(int(gpu))
 
 
+#: What _log_environment found, kept for the About block. The log header
+#: is what users are asked to paste into an issue, and the same four facts
+#: belong where a user can read them without finding the log first.
+ENVIRONMENT: dict = {}
+
+
 def _log_environment(cfg: dict) -> None:
     """Print the environment header into the log: version, OS, HDR, driver.
 
@@ -166,6 +179,8 @@ def _log_environment(cfg: dict) -> None:
         import platform
         import sys as _sys
         win = _sys.getwindowsversion()
+        ENVIRONMENT["version"] = APP_VERSION
+        ENVIRONMENT["windows"] = f"{win.major}.{win.minor} ({win.build})"
         print(f"[env] NeuralScreen {APP_VERSION} | Windows {win.major}.{win.minor} "
               f"(build {win.build}) | {platform.platform()}")
     except Exception:
@@ -188,6 +203,7 @@ def _log_environment(cfg: dict) -> None:
                     desc, _ = winreg.QueryValueEx(key, "DriverDesc")
                     if "NVIDIA" in str(desc):
                         ver, _ = winreg.QueryValueEx(key, "DriverVersion")
+                        ENVIRONMENT["driver"] = str(ver)
                         print(f"[env] driver: {ver}")
                         break
             except OSError:
@@ -225,7 +241,8 @@ def _log_environment(cfg: dict) -> None:
         print(f"[env] Num Lock: {'on' if numlock else 'off'} | "
               f"lang: {cfg.get('lang', 'en')} | "
               f"profile: {cfg.get('profile', '?')} | "
-              f"work_scale: {cfg.get('work_scale', '?')}")
+              f"work_scale: {cfg.get('work_scale', '?')} | "
+              f"flow: {cfg.get('flow_preset', 'fast')}")
     except Exception:
         pass
 
@@ -244,6 +261,9 @@ def configure(st) -> None:
     st.presets = load_presets(st.cfg)
     _apply_nr_dll(st.cfg)
     _log_environment(st.cfg)
+    # A copy for the About block: the module-level dict is filled by the
+    # probe above, and the menu reads it off the state like everything else.
+    st.environment = dict(ENVIRONMENT)
     st.width, st.height = int(st.cfg["width"]), int(st.cfg["height"])
     monitor_cfg = st.cfg["monitor"]
     if isinstance(monitor_cfg, str):
@@ -272,17 +292,26 @@ def configure(st) -> None:
     # the residual composite puts the detail back off the native frame.
     st.nr_small = bool(st.cfg.get("nr_small", True))
     os.environ["NS_NR_SMALL"] = "1" if st.nr_small else "0"
+    # Which composite Boost uses: the matched residual (the network's delta
+    # laid over the native frame, so text and edges keep full resolution) or
+    # direct reconstruction (the network's own output, stretched). Residual
+    # is what ships; direct exists to be measured against it on real content,
+    # which has never been done. No menu control on purpose - it becomes one
+    # only if the A/B says it earns its place. Unlike Boost itself this one
+    # travels with the resize, so flipping it costs no feature.
+    st.nr_direct = bool(st.cfg.get("nr_direct", False))
+    os.environ["NS_NR_RESIDUAL"] = "0" if st.nr_direct else "1"
     # The Spout2 bridge is the same story: the worker reads NS_SPOUT once
     # at startup (SpoutBridgeInit), so the config flag becomes the
     # environment before the first worker is launched. Off by default -
     # the bridge costs a full-frame GPU copy on every Present, and it is
     # only useful to someone recording through OBS.
     _apply_spout_env(st.cfg)
-    os.environ["NS_GPU_FLOW_EXPERIMENT"] = "1" if st.cfg.get("gpu_motion") is True else "0"
     # And HDR compatibility, read once per worker process as well.
     _apply_hdr_env(st.cfg)
     from motion_backend import normalize_backend
     os.environ["NS_MOTION_BACKEND"] = normalize_backend(st.cfg.get("motion_backend"))
+    os.environ["NS_GPU_FLOW_EXPERIMENT"] = "1" if st.cfg.get("motion_backend") == "gpu" else "0"
     # The same for the card: NS_GPU is read once per worker process.
     _apply_gpu_env(st.cfg)
     st.lang = str(st.cfg["lang"])
@@ -455,7 +484,8 @@ def bring_up(st) -> None:
     # stole focus from the game and dragged the whole of tcl/tk into the
     # runtime.
 
-    st.guides = TemporalGuideGenerator(st.work_w, st.work_h)
+    st.guides = TemporalGuideGenerator(
+        st.work_w, st.work_h, preset=st.cfg.get("flow_preset", "fast"))
 
     # A reused buffer: every frame allocated ~100 MB (a 4K grab plus the
     # resizes plus flow), the GC could not keep up -> OOM around frame 1900.
@@ -494,6 +524,8 @@ def bring_up(st) -> None:
     st.dda_attempted = False     # already tried for the current worker (do not spam)
     st.window_hwnd = None        # WGCW target; None = the whole desktop (DDA1)
     st.last_foreground = 0       # the last focused window that was not ours
+    #: The window list the picker shows, held still while that page is open.
+    st.window_list: list = []
     st.follow_pos = None         # where the overlay currently sits (window mode)
     st.follow_resize = None      # a pending size change, waiting to settle
     # A pending MONITOR size change, same idea. follow_monitor assigns it on
@@ -522,5 +554,4 @@ def bring_up(st) -> None:
     st.next_auto_revive = 0.0      # monotonic deadline; 0 = no revive pending
     st.consecutive_restarts = 0
     st.guide_fails = 0
-    from library_updates import checker as library_checker
-    library_checker.start()
+    _start_library_checks(st.cfg)

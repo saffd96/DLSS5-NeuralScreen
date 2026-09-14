@@ -55,7 +55,7 @@ from winapi import window_frame_rect
 #: Always let through: the pipeline diagnostics. NS_PHASE=1 adds the
 #: per-frame profiler lines ([phase]/[pw]) on top of these.
 _LOG_ALWAYS = ("[host]", "[pure]", "[arch]", "[cap]", "[dda]", "[present]",
-               "[spout]", "[wgc]", "[video]", "[skip]", "[sr]", "[fg]", "[hdr]", "[gpu-flow]", "[nvofa]")
+               "[spout]", "[wgc]", "[video]", "[skip]", "[hdr]", "[nvofa]", "[sr]", "[fg]")
 #: [video] lines that are a heartbeat rather than a diagnostic: the "delivered
 #: frame N" line is printed every 30 frames and would bury the log.
 _LOG_SKIP = ("delivered frame",)
@@ -145,8 +145,13 @@ def start_worker(params: dict, width: int, height: int, warmup: int,
     header = struct.pack(
         HEADER_FMT,
         VIDEO_MAGIC, width, height, int(warmup), 0,  # frame_count=0 -> an endless loop
-        params["profile"], params["preset"], params["style"],
-        params["auto_mask"], params["ui_correction"],
+        # profile, preset and ui_correction: sent, and sent as zero. All
+        # three are dead in the 310.8.0 runtime - every value gives a
+        # byte-identical frame - so they are not carried in the profiles
+        # any more. The wire keeps its shape because the resize command
+        # shares this layout and a hundred tests build it by position.
+        0, 0, params["style"],
+        params["auto_mask"], 0,
         params["intensity"], params["local_tone"],
         params["local_structure"], params["skin_structure"],
         int(full_w), int(full_h),
@@ -358,7 +363,9 @@ def rebuild_pipeline(st, note: str) -> None:
         if st.window_hwnd is not None:
             st.display.set_fullscreen_layer(st.mon_w, st.mon_h)
     # guides and the buffers follow the new resolution.
-    st.guides = TemporalGuideGenerator(st.work_w, st.work_h, emit_small=st.motion_small)
+    st.guides = TemporalGuideGenerator(
+        st.work_w, st.work_h, emit_small=st.motion_small,
+        preset=st.cfg.get("flow_preset", "fast"))
     st.buf_full = np.empty((st.height, st.width, 4), dtype=np.uint8)
     # Pipeline flags - the new worker knows nothing.
     st.present_mode = False
@@ -370,8 +377,7 @@ def rebuild_pipeline(st, note: str) -> None:
     st.motion_attempted = False
     st.out_shm = False
     st.out_attempted = False
-    st.gpu_ok = None  # a new worker means a new verdict on feature 18
-    st.gpu_alerted = False           # and a fresh chance for the alert to speak
+    channels.forget_verdict(st)  # a new worker means a new verdict on feature 18
     st.frame_index = 0
     st.pts = 0
     st.work_frame = None
@@ -600,7 +606,7 @@ def resize_window_live(st, frame_w: int, frame_h: int) -> bool:
     try:
         t0 = time.perf_counter()
         send_resize(st.worker, st.params, new_w, new_h, RESTART_WARMUP,
-                    new_full_w, new_full_h, st.nr_small)
+                    new_full_w, new_full_h, st.nr_small, st.nr_direct)
         st.reader.wait_rack(timeout=RACK_TIMEOUT)
         st.reader.set_output_size(new_full_w or new_w, new_full_h or new_h)
     except Exception as exc:
@@ -612,7 +618,9 @@ def resize_window_live(st, frame_w: int, frame_h: int) -> bool:
     # The guides carry the work size in their buffers, and the worker reads
     # exactly that many bytes of motion - they change together or the stream
     # desynchronises (see do_restart).
-    st.guides = TemporalGuideGenerator(new_w, new_h, emit_small=st.motion_small)
+    st.guides = TemporalGuideGenerator(
+        new_w, new_h, emit_small=st.motion_small,
+        preset=st.cfg.get("flow_preset", "fast"))
     channels.sync_motion_size(st)
     channels.sync_gray(st)
     # Both of these are sized for the old frame. Re-negotiated here rather
@@ -975,7 +983,7 @@ def do_restart(st, new_scale: float, new_profile: str, new_params: dict,
         try:
             t_rnsz = time.perf_counter()
             send_resize(st.worker, st.params, new_w, new_h, RESTART_WARMUP,
-                        new_full_w, new_full_h, st.nr_small)
+                        new_full_w, new_full_h, st.nr_small, st.nr_direct)
             st.reader.wait_rack(timeout=RACK_TIMEOUT)
             st.reader.set_output_size(new_full_w or new_w, new_full_h or new_h)
             applied = True
@@ -1001,6 +1009,7 @@ def do_restart(st, new_scale: float, new_profile: str, new_params: dict,
         # desync and a restart loop.
         channels.forget_dda(st)
         channels.forget_out(st)
+        channels.forget_verdict(st)
 
     # The order matters: work_w/work_h and guides change TOGETHER,
     # otherwise the motion size drifts away from what the worker
@@ -1010,7 +1019,9 @@ def do_restart(st, new_scale: float, new_profile: str, new_params: dict,
     # would come back as a scene cut and the network would start its
     # temporal accumulation again, which is visible as a small settle.
     if (new_w, new_h) != (st.work_w, st.work_h) or st.guides is None:
-        st.guides = TemporalGuideGenerator(new_w, new_h, emit_small=st.motion_small)
+        st.guides = TemporalGuideGenerator(
+            new_w, new_h, emit_small=st.motion_small,
+            preset=st.cfg.get("flow_preset", "fast"))
     st.work_w, st.work_h = new_w, new_h
     channels.sync_motion_size(st)  # the flow resolution may have changed
     channels.sync_gray(st)         # the gray channel lives in the worker, size = guides flow
@@ -1036,14 +1047,3 @@ def request_apply(st, new_scale: float, new_profile: str, new_params: dict,
               f"the last value will be applied")
     else:
         do_restart(st, new_scale, new_profile, new_params, new_small=new_small)
-
-
-def apply_gpu_motion(st, enabled: bool) -> None:
-    st.cfg["gpu_motion"] = bool(enabled)
-    st.cfg["motion_backend"] = "gpu" if enabled else "cpu"
-    os.environ["NS_MOTION_BACKEND"] = "cpu"
-    os.environ["NS_GPU_FLOW_EXPERIMENT"] = "1" if enabled else "0"
-    settings_io.save_menu_layout(st)
-    print(f"[main] motion backend: {'GPU LK (experimental)' if enabled else 'CPU DIS'} - restarting worker")
-    teardown_pipeline(st)
-    rebuild_pipeline(st, UI_STRINGS[st.lang]["gpu_motion"] if enabled else "CPU DIS")

@@ -11,10 +11,34 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import library_updates as updates
 
 
 class Checks(unittest.TestCase):
+    def setUp(self):
+        guard = patch('socket.create_connection', side_effect=AssertionError('Tests must stay offline'))
+        guard.start()
+        self.addCleanup(guard.stop)
+
+    def test_opt_in_survives_save_and_load(self):
+        import settings_io
+        from test_config_atomic import GOOD, _payload
+        for enabled in (False, True):
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / 'config.json'
+                cfg = dict(GOOD, library_updates_enabled=enabled)
+                settings_io._atomic_write_json(path, dict(GOOD, **_payload(cfg)))
+                self.assertIs(settings_io.load_config(path)['library_updates_enabled'], enabled)
+
+    def test_startup_is_offline_by_default(self):
+        import startup
+        with patch.object(updates.checker, 'start') as start:
+            for cfg in ({}, {'library_updates_enabled': False}, {'library_updates_enabled': 'true'}):
+                startup._start_library_checks(cfg)
+            start.assert_not_called()
+            startup._start_library_checks({'library_updates_enabled': True})
+            start.assert_called_once()
     def test_notice_once_and_batch(self):
         checker = updates.LibraryChecker()
         self.assertFalse(checker.take_notice())
@@ -56,7 +80,8 @@ class Checks(unittest.TestCase):
             self.assertIsNotNone(find(menu, 'button', 'close'))
             self.assertIsNone(find(menu, 'action', 'exit'))
             state = SimpleNamespace(display=SimpleNamespace(menu=menu,
-                set_menu_opaque=lambda _: None, set_menu_input=lambda _: None))
+                set_menu_opaque=lambda _: None, set_menu_input=lambda _: None),
+                hotkeys=SimpleNamespace(resume=lambda: None))
             with patch.object(commands.settings_io, 'save_menu_layout'):
                 commands.apply_menu_action(state, ('button', 'close'))
             self.assertFalse(menu.visible)

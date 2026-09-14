@@ -88,7 +88,7 @@ def send_params(worker, params, w=W, h=H):
     worker.stdin.write(struct.pack(
         RESIZE_FMT, RESIZE_MAGIC, w, h, WARMUP, 0, 0, 0,
         int(params["style"]), int(params["auto_mask"]),
-        int(params["ui_correction"]), float(params["intensity"]),
+        int(params.get("ui_correction", 0)), float(params["intensity"]),
         float(params["local_tone"]), float(params["local_structure"]),
         float(params["skin_structure"]), 0, 0))
     worker.stdin.flush()
@@ -107,7 +107,7 @@ def main() -> int:
     extreme = dict(PROFILES["Extreme / Overdrive"])
     header = struct.pack(HEADER_FMT, VIDEO_MAGIC, W, H, WARMUP, 0, 0, 0,
                          int(faithful["style"]), int(faithful["auto_mask"]),
-                         int(faithful["ui_correction"]),
+                         int(faithful.get("ui_correction", 0)),
                          float(faithful["intensity"]),
                          float(faithful["local_tone"]),
                          float(faithful["local_structure"]),
@@ -161,7 +161,12 @@ def main() -> int:
     text = Path(log.name).read_text(encoding="utf-8", errors="replace")
     Path(log.name).unlink(missing_ok=True)
     params_only = text.count("RNSZ: parameters only")
-    rebuilt = text.count("RNSZ applied: feature ready")
+    # "RNSZ applied at WxH: ..." is printed only by the rebuild path - the
+    # parameters-only path says "parameters only" and returns. Matching the
+    # prefix rather than the old fixed phrase: the line now also reports
+    # whether the feature really came up and which composite is live, and a
+    # create that FAILED used to be announced as "feature ready" anyway.
+    rebuilt = text.count("RNSZ applied at ")
     print(f"    log: {params_only} parameter-only, {rebuilt} rebuilt")
     if params_only != 1:
         failures.append(f"expected one parameter-only RNSZ in the log, "

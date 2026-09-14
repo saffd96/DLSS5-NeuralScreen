@@ -119,7 +119,9 @@ KNOB_R = 9
 BTN_H = 42
 BTN_PAD = 18
 BTN_GAP = 10
-ICON_W = 30        # header button: a rounded square, not a circle
+ICON_W = 34        # header button: a rounded square, not a circle
+                   # 30 was too small to notice: the user asked where the
+                   # collapse button was while looking straight at it.
 ACTION_H = 46      # action button: title with the hotkey caption below it
 EXIT_H = 64        # exit: plus an explanation on a third line
 STAT_LINE_H = 24
@@ -130,9 +132,17 @@ FONT_SIZE = 17
 TITLE_SIZE = 21
 SMALL_SIZE = 14
 
+#: The settings page, in the order the tabs are drawn. Four is the ceiling
+#: at this panel width - measured across twelve languages, Polish takes 96%
+#: of the strip - so a fifth subject needs a wider panel or a scrolling
+#: strip, not another tab squeezed in.
+SETTINGS_TABS = ("capture", "rec", "keys", "app")
+
 PARAM_KEYS = ("intensity", "local_tone", "local_structure", "skin_structure")
-PARAM_MIN, PARAM_MAX = 0.0, 2.5
-SKIN_MIN = -1.0
+# The fallback range, used only if the state has no "param_ranges" - the
+# real ones are measured and live in settings_io, which owns them. A menu
+# built by hand in a test still has to draw something.
+PARAM_FALLBACK = (0.0, 1.5)
 
 
 def _rgb(color: str) -> tuple[int, int, int]:
@@ -166,6 +176,7 @@ class OverlayMenu:
         self.lang = "en"
         self.state: dict = {
             "library_updates": (False, ()),
+            "library_updates_enabled": False,
             "nr": True,
             "work_scale": 1.0,
             # Where the work size hits the NGX cap. Sent by main because only it
@@ -176,10 +187,12 @@ class OverlayMenu:
             # main so a config value below the range cannot misplace the knob.
             "work_scale_min": 0.1,
             "nr_small": False,
+            # What the presenter shows with FG on (from the worker's two-second
+            # report); the HUD pairs it with the network fps. None while off.
+            "display_fps": None,
             "dlss_sr_scale": .65,
             "dlss_sr": False,
             "ui_detection": False,
-            "gpu_motion": False,
             "frame_generation": False,
             "frame_multiplier": 2,
             "screen_size": "",
@@ -188,6 +201,11 @@ class OverlayMenu:
             "params": {},
             # The profile's own numbers, drawn as a tick under each
             # parameter slider (see _draw_slider).
+            # (low, high) per parameter, from settings_io.
+            "param_ranges": {},
+            # version / windows / driver / gpu, from the log header.
+            "about": {},
+            "style": 1,
             "param_defaults": {},
             "preset_active": False,
             "recording": False,
@@ -206,6 +224,7 @@ class OverlayMenu:
             # then draws as off while the action behind it fires normally.
             "hdr": False,
             "motion_backend": "cpu",
+            "gpu_motion": False,
             # Skip static frames (processing section): no new capture frame -
             # the network idles instead of re-running.
             "skip_static": True,
@@ -257,6 +276,10 @@ class OverlayMenu:
         except Exception:
             self._cjk_fonts = {}
         self.panel_rect = pygame.Rect(0, 0, 0, 0)
+        #: Which settings tab is open. In-session only: the page is entered
+        #: to do one thing, and being returned to last week's tab is not
+        #: what anyone wants from it.
+        self.settings_tab = SETTINGS_TABS[0]
         self._stats_rect = pygame.Rect(0, 0, 0, 0)
         self._gpu_rect = pygame.Rect(0, 0, 0, 0)
         # The relative rects are computed in layout() for the main page
@@ -480,19 +503,17 @@ class OverlayMenu:
         # the other pages do the work). The rects are still computed for the
         # main page - the drawers check the page before drawing.
         if self.page == "main":
-            # The readings block
-            stat_h = self._u(STAT_LINE_H) * 2 + self._u(STAT_PAD) * 2
-            self._stats_rel = pygame.Rect(pad, cy, inner_w, stat_h)
-            cy += stat_h + self._u(6)
-
-            # The GPU line: a status dot and the card model. A separate line
-            # rather than a cell in the readings block - this is not a
-            # pipeline reading but the answer to "does this work on my card
-            # at all". The capture mode (fullscreen / window) sits on the
-            # second line below it.
-            gpu_h = self._u(SMALL_SIZE) * 2 + self._u(10)
-            self._gpu_rel = pygame.Rect(pad, cy, inner_w, gpu_h)
-            cy += gpu_h + gap
+            # ONE status line, where a six-cell readings grid and a separate
+            # card row used to be. Four of those six said what the page below
+            # already says: MODE is the source segment, PROFILE is the
+            # profile picker, REC is the Record button and the red dot on
+            # screen, and FRAMES was a counter nobody acts on. What is left is
+            # what you actually want at a glance - is it working, how fast,
+            # at what size, on which card.
+            status_h = self._u(SMALL_SIZE) + self._u(18)
+            self._stats_rel = pygame.Rect(pad, cy, inner_w, status_h)
+            self._gpu_rel = pygame.Rect(0, 0, 0, 0)   # folded into the line
+            cy += status_h + gap
 
         # The content is split into titled blocks: eight identical rows in a
         # row gave the eye nothing to hold on to. The titles are not
@@ -500,8 +521,16 @@ class OverlayMenu:
         self._sections: list[tuple[str, pygame.Rect]] = []
         sec_h = self._u(SMALL_SIZE) + self._u(10)
 
-        def section(title: str) -> None:
-            nonlocal cy
+        # Which tab the rows being built belong to. section() sets it and
+        # every builder below honours it, so a hidden tab costs no layout and
+        # no re-indentation of the page that was here before tabs.
+        show = True
+
+        def section(title: str, tab: str | None = None) -> None:
+            nonlocal cy, show
+            show = tab is None or tab == self.settings_tab
+            if not show:
+                return
             cy += self._u(6)
             self._sections.append((title, pygame.Rect(pad, cy, inner_w, sec_h)))
             cy += sec_h
@@ -511,6 +540,8 @@ class OverlayMenu:
                    mark: float | None = None,
                    ends: tuple | None = None) -> None:
             nonlocal cy
+            if not show:
+                return
             items.append(Item("slider", key,
                               pygame.Rect(pad, cy, inner_w, label_h + ctrl_h),
                               lo=lo, hi=hi, value=value,
@@ -526,6 +557,8 @@ class OverlayMenu:
         def choice(key: str, label: str, current: str, options: list,
                    labels: list | None = None, hint: str = "") -> None:
             nonlocal cy
+            if not show:
+                return
             extra = {"label": label, "current": current,
                      "labels": list(labels or options),
                      "label_h": label_h}
@@ -552,9 +585,22 @@ class OverlayMenu:
             expand/collapse machinery; here both options are visible at once.
             """
             nonlocal cy
+            if not show:
+                return
             if label:
+                # The control is as wide as its captions need, not a fixed
+                # 60 units per option. Those captions are real words in
+                # twelve languages - "Натуральный" ran past a 60-unit cell
+                # and into its neighbour, and _draw_segmented centres the
+                # caption and lets it spill, so the overflow reads as a
+                # misspelling rather than as a clipped word.
+                # test_settings_hints measures this the way it measures
+                # hints; the label column keeps at least 150 units.
+                widest = max((self._small_font.size(str(t))[0]
+                              for t in (labels or options)), default=0)
+                need = max(self._u(60), widest + self._u(22))
                 seg_w = min(inner_w - self._u(150),
-                            self._u(60) * len(options) + self._u(60))
+                            need * len(options) + self._u(60))
             else:
                 # No label, no reason to squeeze: the captions are the
                 # control. "Window mode" ran off the panel at the old width.
@@ -567,9 +613,20 @@ class OverlayMenu:
             cy += seg_h + gap
 
         def toggle(key: str, label: str, on: bool, hint: str = "",
-                   key_text: str = "") -> None:
+                   inline_right: list[tuple[str, str, bool]] | None = None) -> None:
             nonlocal cy
-            extra = {"label": label, "key_text": key_text}
+            if not show:
+                return
+            # Small inline buttons at the row's right end, beside the switch:
+            # the multiplier rides the FG row itself (user, 14.09) instead of
+            # a second full-width row below it. Returns their x-span so the
+            # caller can lay them out.
+            inline_x = None
+            if inline_right:
+                btn_w = self._u(44)
+                btn_h = self._u(CTRL_H) - self._u(8)
+                inline_x = pad
+            extra = {"label": label}
             hint_h = 0
             if hint:
                 extra["hint"] = hint
@@ -585,6 +642,19 @@ class OverlayMenu:
                               pygame.Rect(pad, cy, inner_w, ctrl_h + hint_h),
                               value=1.0 if on else 0.0,
                               extra=extra))
+            if inline_x is not None:
+                # The buttons: right-aligned against the switch's left edge,
+                # small pills in one line with the toggle.
+                bx = (pad + inner_w - self._u(30) - self._u(12)  # switch track
+                      - len(inline_right) * (btn_w + self._u(8)))
+                for (opt_key, opt_label) in inline_right:
+                    items.append(Item("button", opt_key,
+                                      pygame.Rect(bx, cy + (ctrl_h - btn_h) // 2,
+                                                  btn_w, btn_h),
+                                      extra={"label": opt_label,
+                                             "filled": False,
+                                             "small": True}))
+                    bx += btn_w + self._u(6)
             cy += ctrl_h + hint_h + gap
 
         # The windows page: the full list of capturable windows, one row per
@@ -631,7 +701,15 @@ class OverlayMenu:
             cy += gap
 
         elif self.page == "settings":
-            section(s["sec_capture"])
+            # Four tabs where six sections used to run one after another. The
+            # page is where everything set once in a lifetime lives, and it
+            # is where every new setting will land - a single column of
+            # sections is what made the old menu grow without bound.
+            segmented("settings_tab", "", self.settings_tab,
+                      list(SETTINGS_TABS),
+                      labels=[s[f"tab_{t}"] for t in SETTINGS_TABS])
+            cy += self._u(4)
+            section(s["sec_capture"], "capture")
             monitors = self.state.get("monitors") or []
             if monitors:
                 # The hint is here because two people asked the same question
@@ -662,7 +740,7 @@ class OverlayMenu:
                    hint=s.get("hdr_mode_hint", ""))
             choice("motion_backend", s.get("motion_backend", "Motion estimation"),
                    self.state.get("motion_backend", "cpu"), ["cpu", "gpu", "nvofa"],
-                   labels=["CPU DIS", "GPU LK", s.get("motion_nvofa", "NVOFA (experimental)")],
+                   labels=["CPU DIS", "GPU LK (experimental)", s.get("motion_nvofa", "NVOFA (experimental)")],
                    hint=s.get("motion_hint", "Restarts the worker; CPU fallback if unavailable"))
             # The screenshot folder: a plain button that opens the folder
             # picker (issue #20). The current value is shown as the caption
@@ -671,42 +749,46 @@ class OverlayMenu:
             label = s.get("shot_dir_btn", "Screenshot folder...")
             if shot_dir:
                 label = f"{label}  ·  {shot_dir}"
-            items.append(Item("button", "shot_dir",
-                              pygame.Rect(pad, cy, inner_w, ctrl_h),
-                              extra={"label": label}))
-            cy += ctrl_h + gap
+            if show:
+                items.append(Item("button", "shot_dir",
+                                  pygame.Rect(pad, cy, inner_w, ctrl_h),
+                                  extra={"label": label}))
+                cy += ctrl_h + gap
 
             # Recording: everything about what leaves the program besides
             # the screen itself. Spout2 (off by default) publishes the
             # processed picture for external recorders; the recording
             # indicator is a display preference of the same subject.
-            section(s["sec_recording"])
+            section(s["sec_recording"], "rec")
             toggle("spout", s.get("spout", "Spout2 output (OBS)"),
                    bool(self.state.get("spout")),
                    hint=s.get("spout_hint", ""))
             toggle("rec_indicator", s.get("rec_indicator", "Recording indicator"),
                    bool(self.state.get("rec_indicator", True)))
 
-            section(s["sec_behaviour"])
-            # Idle screens: no new frame arrives (the desktop did not change,
-            # the window did not redraw) - the network waits instead of
-            # chewing the same picture again. No visual price, a real one on
-            # an idle desktop. Set once and forgotten, which is why it lives
-            # here and not on the main page.
-            toggle("skip_static", s.get("skip_static", "Skip static frames"),
-                   bool(self.state.get("skip_static", True)),
-                   hint=s.get("skip_static_hint", ""))
+            section(s["sec_behaviour"], "app")
+            # The static-frame skip is OFF and its switch is not drawn. The
+            # feature is suspected in the window-mode trouble and is on its
+            # way out (user, 13.09); the flag still works from config.json
+            # until it goes, so it can be measured rather than argued about.
+            # Nothing else here is hidden - do not grow the habit.
+            _skip_hidden = True
+            if not _skip_hidden:
+                toggle("skip_static",
+                       s.get("skip_static", "Skip static frames"),
+                       bool(self.state.get("skip_static", False)),
+                       hint=s.get("skip_static_hint", ""))
             toggle("open_on_start", s["open_on_start"],
                    bool(self.state.get("open_on_start")))
             toggle("autostart", s.get("autostart", "Autostart with Windows"),
                    bool(self.state.get("autostart")))
 
-            section(s["sec_hotkeys"])
+            section(s["sec_hotkeys"], "keys")
             # The remapping fields. The captions on the buttons come from these
             # same values, so a key change is visible across the whole menu at
             # once.
             field_h = self._u(CTRL_H)
-            for cmd, label in HOTKEY_ROWS:
+            for cmd, label in HOTKEY_ROWS if show else ():
                 items.append(Item("hotkey", cmd,
                                   pygame.Rect(pad, cy, inner_w, field_h),
                                   extra={"label": s.get(label, label),
@@ -717,15 +799,22 @@ class OverlayMenu:
             # below: a full row gap on both sides left 96 px of nothing
             # before APPEARANCE.
             cy += self._u(8)
-            self._hint_rel = pygame.Rect(pad, cy, inner_w,
-                                         self._u(SMALL_SIZE) + self._u(6))
-            cy += self._hint_rel.h + gap
+            if show:
+                self._hint_rel = pygame.Rect(pad, cy, inner_w,
+                                             self._u(SMALL_SIZE) + self._u(6))
+                cy += self._hint_rel.h + gap
+            else:
+                # Not on this tab - and the rect has to be emptied, not just
+                # left unset: it is a member, the draw reads it every frame,
+                # and the caption from the keys tab floated under Theme on
+                # the program tab (user, 13.09).
+                self._hint_rel = pygame.Rect(0, 0, 0, 0)
 
             # Appearance: language and theme moved here from the main page
             # (user rule 10.09: the main page is the main page - settings
             # live behind the gear). The segmented controls emit the same
             # ("lang", ...) / ("theme", ...) actions main already handles.
-            section(s["sec_view"])
+            section(s["sec_view"], "app")
             # The language list: a drop-down, not segments - the full set
             # of popular languages (12) cannot fit in a segmented row
             # (user rule 10.09: the list expands, it is not cycled).
@@ -743,7 +832,29 @@ class OverlayMenu:
             # non-interactive kind the drawer supports - with the label as
             # its caption.
             channel = self.state.get("channel") or ""
+            about = self.state.get("about") or {}
+            if channel or about:
+                section(s["sec_about"], "app")
+                # The same four facts the log header opens with. Every issue
+                # starts by asking which version and which driver; this is
+                # the answer, where it can be read without finding the log.
+                for key, label in (("version", s["about_version"]),
+                                   ("gpu", s["gpu"]),
+                                   ("driver", s["about_driver"]),
+                                   ("windows", s["about_windows"])):
+                    value = str(about.get(key) or "")
+                    if not value or not show:
+                        continue
+                    items.append(Item("info", f"about_{key}",
+                                      pygame.Rect(pad, cy, inner_w,
+                                                  self._u(LABEL_H)),
+                                      extra={"label": label, "value": value}))
+                    cy += self._u(LABEL_H) + self._u(4)
+                if show and about:
+                    cy += self._u(6)
             section(s["lib_section"])
+            toggle("library_updates_enabled", s["lib_opt_in"],
+                   bool(self.state.get("library_updates_enabled")), hint=s["lib_opt_in_hint"])
             busy, libraries = self.state.get("library_updates", (False, ()))
             act_h = self._u(ACTION_H)
             items.append(Item("button", "check_libraries",
@@ -766,20 +877,26 @@ class OverlayMenu:
                                              "filled": False}))
                     cy += act_h + gap
             if channel:
-                section(s["sec_about"])
                 act_h = self._u(ACTION_H)
-                items.append(Item("button", "channel",
-                                  pygame.Rect(pad, cy, inner_w, act_h),
-                                  extra={"label": channel, "filled": False}))
-                # The footer below opens with its own rule and spacing; a
-                # full PAD on top of that was the second hole.
-                cy += act_h + self._u(6)
+                if show:
+                    items.append(Item("button", "channel",
+                                      pygame.Rect(pad, cy, inner_w, act_h),
+                                      extra={"label": channel,
+                                             "filled": False}))
+                    # The footer below opens with its own rule and spacing;
+                    # a full PAD on top of that was the second hole.
+                    cy += act_h + self._u(6)
         else:
             section(s["sec_processing"])
             nr_on = bool(self.state.get("nr"))
-            hk_nr = self.hotkeys.get("toggle", "")
-            toggle("nr", s["nr_on"] if nr_on else s["nr_off"], nr_on,
-                   key_text=hk_nr)
+            # No key name here. The main page used to print "Num1" beside the
+            # switch, and every control that had a key printed it - furniture
+            # nobody reads twice, in the one place where the picture is being
+            # judged. The keys live on the settings page, which is where you
+            # go when you want to know or change them (user, 13.09).
+            # The row is named for what the feature is, not for its state -
+            # the switch at the right end already carries on/off (user, 14.09).
+            toggle("nr", "DLSS 5 NR", nr_on)
 
             # Boost: the network runs at a reduced resolution and the detail
             # comes back off the native frame (the matched residual
@@ -793,17 +910,24 @@ class OverlayMenu:
             # the difference is not visible. The residual is what makes that
             # true: without it the same setting is visibly soft.
             fg = bool(self.state.get("frame_generation"))
-            toggle("frame_generation", s["frame_generation"], fg)
-            if fg:
-                multiplier = int(self.state.get("frame_multiplier", 2))
-                slider("frame_multiplier", 2, 4, multiplier, s["frame_multiplier"],
-                       value_text=f"×{multiplier}", ends=("×2", "×4"))
+            multiplier = int(self.state.get("frame_multiplier", 2))
+            # The multiplier rides the FG row: three small buttons between the
+            # label and the switch, the active one filled (user, 14.09).
+            toggle("frame_generation", "DLSS 4.5 FG", fg,
+                   inline_right=[("frame_multiplier:2", "×2"),
+                                 ("frame_multiplier:3", "×3"),
+                                 ("frame_multiplier:4", "×4")])
+            for idx, value in enumerate((2, 3, 4)):
+                btn = items[-3 + idx]
+                btn.extra["filled"] = fg and multiplier == value
+                btn.extra["disabled"] = not fg
 
             toggle("ui_detection", s["ui_detection"], bool(self.state.get("ui_detection")))
-            toggle("gpu_motion", s["gpu_motion"], bool(self.state.get("gpu_motion", False)), hint=s["gpu_motion_hint"])
+
+            toggle("gpu_motion", s["gpu_motion"], bool(self.state.get("gpu_motion")), hint=s["gpu_motion_hint"])
 
             boost = bool(self.state.get("nr_small"))
-            toggle("boost", s["boost"], boost, hint=s["boost_hint"])
+            toggle("boost", s["boost"], boost)
 
             # The resolution the network runs at - only while Boost is on.
             #
@@ -903,13 +1027,46 @@ class OverlayMenu:
             section(s["sec_effect"])
             choice("profile", s["profile"], str(self.state.get("profile", "")),
                    list(self.state.get("profiles") or []))
+            # "modified - revert", and only when it is true. A profile is a
+            # starting point, and until now the menu gave no way to tell
+            # whether you were still on one: the tick under each slider says
+            # where the profile put THAT value, and nothing said "you have
+            # moved four of them". Reverting is picking the same profile
+            # again, which is exactly what the command already does.
+            if self._profile_modified():
+                items.append(Item("button", "revert_profile",
+                                  pygame.Rect(pad, cy, inner_w,
+                                              self._u(SMALL_SIZE) + self._u(6)),
+                                  extra={"label": s["profile_modified"],
+                                         "flat": True}))
+                cy += self._u(SMALL_SIZE) + self._u(6) + self._u(4)
+            # Called "Model" in the interface and `style` in the code: the
+            # three values really do select three different networks, and
+            # "style" next to the visual styles of a picture reads as a look
+            # rather than a choice of engine (user, 13.09). The key, the wire
+            # field and the config entry keep NVIDIA's name - DLSSNR.Style -
+            # because renaming those would break every saved config for a
+            # word.
+            # Style picks WHICH look the network produces; the profile and
+            # the sliders under it say how strongly. Measured, it is the
+            # biggest lever there is - the three values are three different
+            # outputs, not three strengths - and until now it was buried
+            # inside the profile with no way to reach it. Default is the one
+            # that suits a desktop; the other two are tuned for games and
+            # soften photographs and text (README says so at length; a menu
+            # hint would not fit on one line).
+            segmented("style", s["style"],
+                      str(int(self.state.get("style", 1))),
+                      ["0", "1", "2"],
+                      labels=[s["style_0"], s["style_1"], s["style_2"]])
             params = self.state.get("params") or {}
             defaults = self.state.get("param_defaults") or {}
             for key in PARAM_KEYS:
-                lo = SKIN_MIN if key == "skin_structure" else PARAM_MIN
+                ranges = self.state.get("param_ranges") or {}
+                lo, hi = ranges.get(key) or PARAM_FALLBACK
                 val = float(params.get(key, 0.0))
-                slider(key, lo, PARAM_MAX, val, s[key], value_text=f"{val:.2f}",
-                       mark=defaults.get(key))
+                slider(key, float(lo), float(hi), val, s[key],
+                       value_text=f"{val:.2f}", mark=defaults.get(key))
             # Save / Delete preset: the user presets live in the same list
             # as the built-in profiles. Delete is only offered while a user
             # preset is active - the built-in profiles are not deletable.
@@ -1168,7 +1325,11 @@ class OverlayMenu:
             else:
                 self.hover = None
                 for it in self.items:
-                    if it.kind in ("action", "hotkey", "button") and \
+                    # "info" is in the list for one row: the captured
+                    # window, which opens the picker.
+                    if (it.kind in ("action", "hotkey", "button")
+                        or (it.kind == "info"
+                            and it.key == "source_now")) and \
                             it.rect.collidepoint(event.pos):
                         self.hover = f"{it.kind}:{it.key}"
                         break
@@ -1248,6 +1409,18 @@ class OverlayMenu:
                     if cr.collidepoint(event.pos) and idx < len(item.payload or []):
                         out.extend(self._pick(item.key, str(item.payload[idx])))
                         break
+            elif item.kind == "info" and item.key == "source_now":
+                # The row that names the captured window is the obvious place
+                # to click when you want a different one, and it was the one
+                # line on the page that looked like a control and was not.
+                # The list itself stays on its own page: a desktop can have
+                # twenty windows, and a list that long inside this panel
+                # would push the picture controls off the bottom - the same
+                # unbounded column the settings tabs were made to stop.
+                self.page = "windows"
+                self.scroll = 0
+                self.capturing = None
+                out.append(("capture", None))
             elif item.kind == "toggle":
                 out.append(("nr",) if item.key == "nr" else ("toggle", item.key))
             elif item.kind == "button":
@@ -1339,8 +1512,17 @@ class OverlayMenu:
             return [("capture", None)]
         if key == "min":
             # The collapse button: hide the menu, exactly like the old
-            # footer "Collapse" did.
-            return [("button", "close")]
+            # footer "Collapse" did - and let go of the keyboard first.
+            # Collapsing while a hotkey field was waiting for a key left
+            # `capturing` set and never sent ("capture", None), so the global
+            # hotkeys stayed suspended: no Num2 to reopen the menu, no Num1,
+            # nothing. The program looked dead (audit).
+            out: list[tuple] = []
+            if self.capturing is not None:
+                self.capturing = None
+                out.append(("capture", None))
+            out.append(("button", "close"))
+            return out
         if key == "close":
             self.page = "main"
             self.scroll = 0
@@ -1361,6 +1543,28 @@ class OverlayMenu:
             return [("capture", None)]
         return [("button", key)]
 
+    def _profile_modified(self) -> bool:
+        """Do the live values still match the profile they came from?
+
+        `param_defaults` is the chosen profile's own numbers, sent with every
+        payload. Floats are compared with a tolerance a slider cannot land
+        inside: the sliders step in hundredths, and a saved config comes back
+        through float() twice.
+        """
+        defaults = self.state.get("param_defaults") or {}
+        if not defaults:
+            return False
+        params = self.state.get("params") or {}
+        for key in PARAM_KEYS:
+            if key not in defaults:
+                continue
+            if abs(float(params.get(key, 0.0))
+                   - float(defaults[key])) > 0.005:
+                return True
+        if "style" in defaults:
+            return int(self.state.get("style", 1)) != int(defaults["style"])
+        return False
+
     def _button_click(self, key: str) -> list[tuple]:
         """A plain button. The windows button opens the window list page,
         the fullscreen button returns the capture to the whole screen (the
@@ -1372,6 +1576,8 @@ class OverlayMenu:
             return [("capture", None)]
         if key == "fullscreen":
             return [("button", "window_mode")]
+        if key == "revert_profile":
+            return [("profile", str(self.state.get("profile", "")))]
         return [("button", key)]
 
     def _pick(self, key: str, value: str) -> list[tuple]:
@@ -1383,12 +1589,30 @@ class OverlayMenu:
         if key == "theme":
             self.state["theme"] = value
             return [("theme", value)]
+        if key == "settings_tab":
+            # Navigation inside the page: nothing for main to do, and the
+            # menu redraws itself on the next frame.
+            if value in SETTINGS_TABS:
+                self.settings_tab = value
+                self.scroll = 0
+            return []
+        if key == "style":
+            # Optimistic, like the theme: the control shows the new choice
+            # at once and main applies it. Without this the segment would
+            # snap back to the old cell until the next payload arrives.
+            self.state["style"] = int(value)
+            return [("style", value)]
         if key == "monitor":
             return [("monitor", value)]
         if key == "gpu":
             return [("gpu", value)]
         if key == "motion_backend":
             return [("motion_backend", value)]
+        if key == "frame_multiplier":
+            # Optimistic like style: the segment highlights at once, main
+            # applies the new multiplier to the worker.
+            self.state["frame_multiplier"] = int(value)
+            return [("frame_multiplier", int(value))]
         if key == "source":
             # The same two commands the Actions buttons sent: back to the
             # whole screen, or the window list page.
@@ -1480,6 +1704,11 @@ class OverlayMenu:
         for opt in getattr(self, "options", []):
             if opt.rect.collidepoint(pos):
                 return opt
+        # The SMALLEST hit wins: inline widgets live inside a row's rect
+        # (the multiplier buttons share the FG toggle's row), and the row
+        # must not swallow their clicks (user 14.09: clicking "×3" flipped
+        # the whole FG switch instead).
+        best: "Item | None" = None
         for item in self.items:
             if not item.rect.collidepoint(pos):
                 continue
@@ -1494,8 +1723,10 @@ class OverlayMenu:
                 strip = item.extra.get("strip")
                 if strip is not None and pos[1] > strip.bottom:
                     continue
-            return item
-        return None
+            if best is None or item.rect.w * item.rect.h \
+                    < best.rect.w * best.rect.h:
+                best = item
+        return best
 
     def inside(self, pos: tuple[int, int]) -> bool:
         return self.panel_rect.collidepoint(pos)
@@ -1549,7 +1780,6 @@ class OverlayMenu:
         # computed there, so the drawers must not run.
         if self.page == "main":
             self._draw_stats(surface, s)
-            self._draw_gpu(surface, s)
         self._draw_sections(surface)
         self._draw_rules(surface, s)
         # The resize corner: three short strokes, as resize handles usually go
@@ -1646,66 +1876,91 @@ class OverlayMenu:
         pygame.draw.rect(surface, _rgb(color), self._scroll_thumb,
                          border_radius=radius)
 
+    def status_text(self, s: dict) -> tuple[str, bool]:
+        """What the status line says, and whether it is saying "broken".
+
+        A failed verdict outranks everything except the user's own switch.
+        The alert that announces it is up for a few seconds and gone; the
+        state it announces lasts until the worker is rebuilt, and someone who
+        looks at the menu a minute later deserves the same answer. Three
+        black-screen reports came from people who never opened the log.
+        """
+        paused = not bool(self.state.get("nr"))
+        failed = self.state.get("gpu_ok") is False and not paused
+        if paused:
+            return str(s.get("status_off", "not processing")), False
+        if failed:
+            return str(s.get("gpu_no_nr", "no neural pass")), True
+        if bool(self.state.get("idle")):
+            return str(s.get("idle_short", "idle")), False
+        return str(s.get("status_on", "processing")), False
+
     def _draw_stats(self, surface, s: dict) -> None:
-        st = self.stats or {}
+        """The status line: is it working, how fast, how big, on what.
+
+        The dot is the same signal it has always been - green when the
+        network really runs on that card, red when it does not - and it now
+        sits next to a sentence instead of above a grid.
+        """
         rect = self._stats_rect
+        if rect.w <= 0:
+            return
         pygame.draw.rect(surface, _rgb(self.c["surface"]), rect,
                          border_radius=self._u(RADIUS // 2))
-        fps = st.get("fps")
-        mode = (s["mode_window"] if self.state.get("window_mode")
-                else s["mode_fullscreen"])
-        # An idle network is not a stalled one: the loop still runs at full
-        # speed, it just does not process an unchanged screen. Saying so
-        # here is the only visible sign that the skip is doing its job.
-        idling = bool(self.state.get("idle"))
-        rows = (
-            (("FPS", s.get("idle_short", "idle") if idling
-              else f"{fps:.1f}" if isinstance(fps, (int, float)) else "—"),
-             ("RES", str(st.get("resolution", "—"))),
-             ("MODE", mode)),
-            (("FRAMES", str(st.get("frames", "—"))),
-             ("REC", self._rec_text(s)),
-             ("PROFILE", str(self.state.get("profile", "—")).split(" /")[0])),
-        )
+        st = self.stats or {}
         pad = self._u(STAT_PAD)
-        cell = (rect.w - pad * 2) // 3
-        for ri, row in enumerate(rows):
-            y = rect.y + pad + ri * self._u(STAT_LINE_H)
-            for ci, (name, value) in enumerate(row):
-                cx = rect.x + pad + ci * cell
-                k = self._mono_small.render(name, True, _rgb(self.c["muted"]))
-                v = self._mono_small.render(value, True, _rgb(self.c["accent"]))
-                surface.blit(k, (cx, y))
-                surface.blit(v, (cx + k.get_width() + self._u(6), y))
-
-    def _draw_gpu(self, surface, s: dict) -> None:
-        """Status dot and card model: green - NR works, red - it does not."""
-        rect = getattr(self, "_gpu_rect", None)
-        if rect is None:
-            return
         ok = self.state.get("gpu_ok")
-        color = (self.c["muted"] if ok is None
-                 else self.c["ok"] if ok else self.c["danger"])
-        r = max(3, self._u(5))
-        cy = rect.y + rect.h // 2
-        pygame.draw.circle(surface, _rgb(color), (rect.x + r, cy), r)
-        text = self.state.get("gpu_text") or "—"
-        name = self._small_font.render(text, True, _rgb(self.c["text"]))
-        # The status text next to the card is gone: the dot colour already
-        # answers "does it work" (user rule 10.09). The capture mode moved
-        # into the stats block (MODE cell) - no duplicate line under the
-        # card. The name gets the full row width now.
-        avail = rect.right - (rect.x + r * 2 + self._u(8)) - self._u(8)
-        if avail < self._u(24):
-            avail = self._u(24)  # never let the name vanish entirely
-        if name.get_width() > avail:
-            clip = self._small_font.render(text + "…", True, _rgb(self.c["text"]))
-            while clip.get_width() > avail and len(text) > 1:
-                text = text[:-1]
-                clip = self._small_font.render(text + "…", True, _rgb(self.c["text"]))
-            name = clip
-        surface.blit(name, (rect.x + r * 2 + self._u(8),
-                            cy - name.get_height() // 2))
+        paused = not bool(self.state.get("nr"))
+        dot = (self.c["muted"] if paused or ok is None
+               else self.c["ok"] if ok else self.c["danger"])
+        r = max(3, self._u(4))
+        cyr = rect.centery
+        pygame.draw.circle(surface, _rgb(dot), (rect.x + pad + r, cyr), r)
+
+        text, failed = self.status_text(s)
+        label = self._small_font.render(str(text), True, _rgb(self.c["text"]))
+        lx = rect.x + pad + r * 2 + self._u(9)
+        surface.blit(label, (lx, cyr - label.get_height() // 2))
+
+        # The readings hug the right edge, shortest first, and the card name
+        # takes whatever is left in the middle. A card name is the one value
+        # here with no upper bound - "NVIDIA GeForce RTX 5070 Ti Laptop GPU"
+        # is a real one - so it is the only thing that gets elided, and it
+        # disappears rather than collide when the room runs out.
+        # The frame rate stays a frame rate. It used to be replaced by the
+        # word "idle" while the network skipped an unchanged screen, and the
+        # reading jumped between a number and a word as the screen came and
+        # went - a counter that twitches instead of counting (user, 13.09).
+        # The loop keeps running through a skipped stretch, so the number is
+        # true the whole time. State belongs in the sentence on the left;
+        # numbers stay numbers.
+        fps = st.get("fps")
+        shown = st.get("display_fps")
+        readings = []
+        if not paused and not failed:
+            # Frame Generation: the presenter's rate next to the network's.
+            # "42 / 84 fps" - the first is what the network produced, the
+            # second what the screen shows (real + generated frames).
+            if isinstance(shown, (int, float)) and isinstance(fps, (int, float)) \
+                    and shown > fps + 0.5:
+                readings.append(f"{fps:.0f} / {shown:.0f} fps")
+            else:
+                readings.append(f"{fps:.1f} fps"
+                                if isinstance(fps, (int, float)) else "— fps")
+            readings.append(str(st.get("resolution", "—")))
+        x = rect.right - pad
+        for value in reversed(readings):
+            img = self._mono_small.render(value, True, _rgb(self.c["muted"]))
+            x -= img.get_width()
+            surface.blit(img, (x, cyr - img.get_height() // 2))
+            x -= self._u(14)
+
+        name = str(self.state.get("gpu_text") or "")
+        room = x - (lx + label.get_width() + self._u(14))
+        if name and room > self._u(40):
+            img = self._clip(self._small_font, name, _rgb(self.c["muted"]), room)
+            surface.blit(img, (x - img.get_width(),
+                               cyr - img.get_height() // 2))
 
     def _rec_text(self, s: dict) -> str:
         """Recording state: the duration is more useful than a bare "on"."""
@@ -1756,9 +2011,13 @@ class OverlayMenu:
         # the word beside it, and this one is read from the corner of the eye
         # while a game is running.
         track_w = int(size * 1.8)
-        box = pygame.Rect(item.rect.x, item.rect.centery - size // 2,
-                          track_w, size)
-        # A hint grows the row; the box and the label stay on the first
+        # The switch sits at the row's right end, the label on the left -
+        # the reading order every settings panel uses (label, then the
+        # control at the edge), and the knob never shifts position when a
+        # label changes between "on"/"off" wording (user, 14.09).
+        box = pygame.Rect(item.rect.right - track_w,
+                          item.rect.centery - size // 2, track_w, size)
+        # A hint grows the row; the switch and the label stay on the first
         # line - only the hint is pushed under them.
         hint = item.extra.get("hint")
         if hint:
@@ -1779,27 +2038,16 @@ class OverlayMenu:
         text = item.extra.get("label")
         if not text:
             text = s["nr_on"] if on else s["nr_off"]
-        # The key caption is a reading, not language: it takes the
-        # monospaced face and sits after the label, so "Num1" here matches
-        # the key fields on the settings page.
-        key_text = item.extra.get("key_text") or ""
-        key_img = (self._mono.render(key_text, True, _rgb(self.c["muted"]))
-                   if key_text else None)
-        room = item.rect.right - box.right - self._u(12)
-        if key_img is not None:
-            room -= key_img.get_width() + self._u(12)
+        room = item.rect.w - 2 * self._u(12)
+        if hint:
+            room = item.rect.w
         label = self._clip(self._font, text,
                            _rgb(self.c["text"] if on else self.c["muted"]),
                            room)
-        surface.blit(label, (box.right + self._u(12),
-                             box.y + (box.h - label.get_height()) // 2))
-        if key_img is not None:
-            surface.blit(key_img,
-                         (box.right + self._u(12) + label.get_width()
-                          + self._u(12),
-                          box.y + (box.h - key_img.get_height()) // 2))
+        surface.blit(label, (item.rect.x,
+                             item.rect.y + (self._u(CTRL_H) - label.get_height()) // 2))
         if hint:
-            y = box.bottom + self._u(8)
+            y = item.rect.y + self._u(CTRL_H) + self._u(8)
             for line in str(hint).split("\n"):
                 img = self._clip(self._small_font, line, _rgb(self.c["muted"]),
                                  item.rect.w)
@@ -1849,7 +2097,10 @@ class OverlayMenu:
         # which way is more.
         ends = item.extra.get("ends")
         if ends:
-            left, right = ends
+            # Two captions (what the two ends mean) or three (the numeric
+            # scale, with a word in the middle for the tick).
+            left, middle, right = (ends if len(ends) == 3
+                                   else (ends[0], "", ends[1]))
             y = track.bottom + self._u(6)
             if left:
                 surface.blit(self._small_font.render(
@@ -1857,6 +2108,10 @@ class OverlayMenu:
             if right:
                 img = self._small_font.render(right, True, _rgb(self.c["muted"]))
                 surface.blit(img, (track.right - img.get_width(), y))
+            if middle:
+                img = self._small_font.render(middle, True,
+                                              _rgb(self.c["muted"]))
+                surface.blit(img, (track.centerx - img.get_width() // 2, y))
         pygame.draw.circle(surface, _rgb(self.c["bg"]), (cx, track.centery), self._u(KNOB_R) // 2)
         item.extra["track"] = track
 
@@ -1989,12 +2244,19 @@ class OverlayMenu:
 
 
     def _draw_info(self, surface, item: Item, s: dict) -> None:
-        """A read-only line: what on the left, how big on the right."""
+        """A line: what on the left, how big on the right.
+
+        The captured-window row is clickable (it opens the list); it takes
+        the accent under the pointer so that it reads as one.
+        """
         value = str(item.extra.get("value") or "")
         val = self._mono_small.render(value, True, _rgb(self.c["muted"]))
         room = item.rect.w - val.get_width() - self._u(12)
+        hot = (item.key == "source_now"
+               and self.hover == f"info:{item.key}")
         label = self._clip(self._font, str(item.extra.get("label") or ""),
-                           _rgb(self.c["text"]), room)
+                           _rgb(self.c["accent"] if hot else self.c["text"]),
+                           room)
         y = item.rect.centery
         surface.blit(label, (item.rect.x, y - label.get_height() // 2))
         if value:
@@ -2047,7 +2309,12 @@ class OverlayMenu:
         if hot:
             pygame.draw.rect(surface, _rgb(self.c["surface"]), rect,
                              border_radius=radius)
-        col = self.c["accent"] if hot else self.c["muted"]
+        # At rest the glyph takes the panel's own text colour, not `muted`.
+        # Muted is for captions you read once; these are controls, and one of
+        # them is the only way to put the menu away. Drawn in muted on the
+        # title bar's surface they read as decoration - the collapse button
+        # was reported missing while it was on screen.
+        col = self.c["accent"] if hot else self.c["text"]
         pygame.draw.rect(surface,
                          _rgb(self.c["accent"] if hot else self.c["border"]),
                          rect, max(1, self._u(1)), border_radius=radius)
@@ -2168,15 +2435,35 @@ class OverlayMenu:
     def _draw_button(self, surface, item: Item, s: dict) -> None:
         hot = self.hover == f"button:{item.key}"
         disabled = bool(item.extra.get("disabled"))
-        pygame.draw.rect(surface, _rgb(self.c["surface"]), item.rect,
-                         border_radius=self._u(RADIUS // 2))
+        if item.extra.get("flat"):
+            # Text only, right-aligned, in the accent: this is a link in
+            # weight, and a bordered box here would compete with the two
+            # real buttons under the sliders.
+            img = self._clip(self._small_font,
+                             item.extra.get("label", item.key),
+                             _rgb(self.c["accent"]), item.rect.w)
+            surface.blit(img, (item.rect.right - img.get_width(),
+                               item.rect.centery - img.get_height() // 2))
+            return
+        # "filled": the active choice inside an inline group (the FG
+        # multiplier) reads as a selected segment - accent background, the
+        # label on it - and NOT as a hover state, so the selection stays
+        # visible with the cursor elsewhere (user 14.09: the active
+        # multiplier was invisible, the renderer had no filled handling).
+        filled = bool(item.extra.get("filled")) and not disabled
+        small = bool(item.extra.get("small"))
         pygame.draw.rect(surface,
-                         _rgb(self.c["accent"] if hot and not disabled
+                         _rgb(self.c["accent"] if filled else self.c["surface"]),
+                         item.rect, border_radius=self._u(RADIUS // 2))
+        pygame.draw.rect(surface,
+                         _rgb(self.c["accent"] if (hot and not disabled) or filled
                               else self.c["border"]),
                          item.rect, self._u(1), border_radius=self._u(RADIUS // 2))
-        label = self._clip(self._font, item.extra.get("label", item.key),
-                           _rgb(self.c["muted"] if disabled
+        label = self._clip(self._small_font if small else self._font,
+                           item.extra.get("label", item.key),
+                           _rgb(self.c["bg"] if filled
+                                else self.c["muted"] if disabled
                                 else item.extra.get("color", self.c["text"])),
-                           item.rect.w - self._u(16))
+                           item.rect.w - self._u(12 if small else 16))
         surface.blit(label, (item.rect.centerx - label.get_width() // 2,
                              item.rect.centery - label.get_height() // 2))
