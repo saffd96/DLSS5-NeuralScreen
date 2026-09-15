@@ -195,6 +195,9 @@ def apply_menu_action(st, action: tuple) -> None:
     elif kind == "toggle" and action[1] == "dlss_sr":
         st.cfg["dlss_sr"] = not bool(st.cfg.get("dlss_sr", False))
         settings_io.save_menu_layout(st)
+    elif kind == "detail_strength":
+        st.cfg["detail_strength"] = min(1.0, max(0.0, float(action[1])))
+        settings_io.save_menu_layout(st)
     elif kind == "dlss_sr_scale":
         st.cfg["dlss_sr_scale"] = min(1.0, max(.25, float(action[1])))
         settings_io.save_menu_layout(st)

@@ -4926,6 +4926,7 @@ static bool SetVerifiedU(NVSDK_NGX_Parameter *p, const char *name, unsigned int 
 }
 
 #include "super_resolution.inl"
+#include "detail_enhancement.inl"
 
 static bool EvaluateVideo(VideoState &v, int reset, UINT64 *submitted = nullptr)
 {
@@ -5018,6 +5019,7 @@ static bool EvaluateVideo(VideoState &v, int reset, UINT64 *submitted = nullptr)
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         h.list->ResourceBarrier(1, &back);
     }
+    ApplyDetail(v);
     if (ts) ProfileGpuEnd(PS_EVAL, 4);
     const UINT64 fence = EndCommands();
     if (submitted) *submitted = fence;
@@ -5220,6 +5222,7 @@ static int ReadVideoMessage(VideoState &v, VideoFrameHeader &fh, std::vector<BYT
         g_ui_index = fh.index; g_ui_valid = true;
         return 12;
     }
+    if (fh.magic == 0x31524853u) return fh.reset <= 100 && fh.reserved == 0 ? 13 : 0; // SHR1
     if (fh.magic == 0x31435353u) return 11; // SSC1: independent SR input scale
     if (fh.magic == CAPTURE_MAGIC) return 10;
     if (fh.magic == FRAME_MAGIC)
@@ -5343,6 +5346,7 @@ static void ReleaseVideoTextures(VideoState &v)
     CloseNvofa();
     NvofaResetLatch();
     if (PhaseEnabled()) { ++g_capture_generation; g_previous_source_qpc = 0; g_frame_stamp = {}; }
+    CloseDetailResources();
     CloseSrResources();
     CloseFgResources();
     // The shader descriptors referenced these resources - after they are
@@ -5889,6 +5893,14 @@ static int RunVideo()
             if (!WriteExact(g_wire, &ack, sizeof(ack))) return 10;
             continue;
         }
+        if (msg == 13) {
+            g_detail_strength = fh.reset;
+            g_force_next_frame = true;
+            Log("[detail] strength: %u%%",g_detail_strength);
+            VideoResultHeader ack={OUT_MAGIC,fh.index,1u,0u,0u,fh.pts};
+            if (!WriteExact(g_wire,&ack,sizeof(ack))) return 10;
+            continue;
+        }
         if (msg == 12) continue;
         if (msg == 11)
         {
@@ -6276,6 +6288,7 @@ static void CleanupVideoNgx()
 {
     CloseNvofa();
     CloseFgResources();
+    CloseDetailResources();
     CloseSrResources();
     if (g_sr.params) { NVSDK_NGX_D3D12_DestroyParameters(g_sr.params); g_sr.params = nullptr; }
     if (h.feature != nullptr)

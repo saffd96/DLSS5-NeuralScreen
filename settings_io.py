@@ -11,6 +11,7 @@ file: a crash mid-write used to truncate the config and lose every setting.
 """
 from __future__ import annotations
 
+import math
 import json
 import os
 import sys
@@ -375,6 +376,12 @@ def load_config(path: Path) -> dict:
     except (TypeError, ValueError):
         sr_scale = .65
     cfg["dlss_sr_scale"] = min(1.0, max(.25, sr_scale))
+    try:
+        detail = float(cfg.get("detail_strength", 0.0))
+        if not math.isfinite(detail): detail = 0.0
+    except (ValueError, TypeError):
+        detail = 0.0
+    cfg["detail_strength"] = min(1.0, max(0.0, detail))
     cfg["dlss_sr"] = bool(cfg.get("dlss_sr", False))
     cfg["ui_detection"] = bool(cfg.get("ui_detection", False))
     cfg["frame_generation"] = bool(cfg.get("frame_generation", False))
@@ -521,6 +528,7 @@ def _menu_layout_payload(cfg: dict, params: dict, monitor: int, lang: str,
         # so it survives a restart through the config alone.
         "skip_static": bool(cfg.get("skip_static", False)),
         "dlss_sr_scale": float(cfg.get("dlss_sr_scale", .65)),
+        "detail_strength": float(cfg.get("detail_strength", 0.0)),
         "dlss_sr": bool(cfg.get("dlss_sr", False)),
         "ui_detection": bool(cfg.get("ui_detection", False)),
         "frame_generation": bool(cfg.get("frame_generation", False)),
@@ -859,6 +867,7 @@ def menu_payload(st) -> dict:
         "skip_static": bool(st.cfg.get("skip_static", False)),
         "library_updates_enabled": st.cfg.get("library_updates_enabled", False) is True,
         "dlss_sr_scale": float(st.cfg.get("dlss_sr_scale", .65)),
+        "detail_strength": float(st.cfg.get("detail_strength", 0.0)),
         "dlss_sr": bool(st.cfg.get("dlss_sr", False)),
         "ui_detection": bool(st.cfg.get("ui_detection", False)),
         "frame_generation": bool(st.cfg.get("frame_generation", False)),
