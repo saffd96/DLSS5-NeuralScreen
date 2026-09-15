@@ -22,9 +22,9 @@ cbuffer Params : register(b0) { uint Width, Height; float Strength; };
     // kernel plus contrast gate suppressed precisely those blurry details.
     float3 blur = (n+s+e+w)*.125 + (n2+s2+e2+w2)*.125;
     float3 residual = c.rgb-blur;
-    // Soft noise floor (half an 8-bit level), then a 0..6 gain (0..200%).
+    // Soft noise floor (half an 8-bit level), then a 0..3 gain (0..100%).
     residual = sign(residual)*max(abs(residual)-.002,0);
-    float3 delta = clamp(residual*(3*clamp(Strength,0,2)),-.12,.12);
+    float3 delta = clamp(residual*(3*saturate(Strength)),-.12,.12);
     Target[p] = float4(clamp(c.rgb+delta,low,high),c.a);
 }
 )hlsl";

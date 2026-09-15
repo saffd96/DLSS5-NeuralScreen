@@ -144,7 +144,7 @@ int main(int argc, char**) {
   check(halfEffect>=1 && fullEffect>=3 && fullEffect>halfEffect,"soft detail suppressed");
   params.strength=2;dispatch(kDetailHlsl,{input.Get()},output.Get(),&params);
   auto twice=read(output.Get(),4);
-  check(twice!=full,"200% is clamped to 100%");
+  check(twice==full,"out-of-range strength must clamp to 100%");
   for(UINT i=0;i<W*H*4;i+=4) {
    check(abs(int(twice[i])-pixels[i])>=abs(int(full[i])-pixels[i]),"200% weakened effect");
    check(abs(int(twice[i])-pixels[i])<=31,"200% exceeded bounds");

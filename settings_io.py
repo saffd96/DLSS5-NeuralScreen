@@ -381,7 +381,7 @@ def load_config(path: Path) -> dict:
         if not math.isfinite(detail): detail = 0.0
     except (ValueError, TypeError):
         detail = 0.0
-    cfg["detail_strength"] = min(2.0, max(0.0, detail))
+    cfg["detail_strength"] = min(1.0, max(0.0, detail))
     cfg["dlss_sr"] = bool(cfg.get("dlss_sr", False))
     cfg["ui_detection"] = bool(cfg.get("ui_detection", False))
     cfg["frame_generation"] = bool(cfg.get("frame_generation", False))

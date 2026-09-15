@@ -14,13 +14,16 @@ import protocol as wire
 from test_prepared_capture import exact
 
 
-def capture(name, sr, scale, baseline=False):
+def capture(name, sr, scale, baseline=False, source_image=None, strengths=(0, 50, 100, 0)):
     w, h = 640, 360
     source = np.full((h, w, 4), (90, 90, 90, 255), np.uint8)
     cv2.putText(source, 'Soft text 0123', (25, 110), cv2.FONT_HERSHEY_SIMPLEX,
                 1.8, (160, 160, 160, 255), 3, cv2.LINE_AA)
     cv2.rectangle(source, (80, 180), (540, 300), (190, 150, 120, 255), -1)
     source = cv2.GaussianBlur(source, (9, 9), 1.6)
+    if source_image is not None:
+        source = np.ascontiguousarray(source_image)
+        h, w = source.shape[:2]
     motion = np.zeros((h, w, 2), np.float16)
     env = dict(os.environ, NS_HDR='0', NS_FRAMEGEN='0', NS_NR_SMALL='0')
     worker = subprocess.Popen([str(ROOT/'native/nvngx.dll'), '--live'],
@@ -51,7 +54,7 @@ def capture(name, sr, scale, baseline=False):
         index = 0
         control(wire.SR_SCALE_MAGIC, scale)
         results = []
-        for strength in (0, 100, 200, 0):
+        for strength in strengths:
             control(wire.DETAIL_MAGIC, 0 if baseline else strength)
             # Reset identical source to isolate spatial changes from history.
             for _ in range(3):
@@ -63,7 +66,7 @@ def capture(name, sr, scale, baseline=False):
             results.append(out)
             cv2.imwrite(str(folder/f'{name}-{len(results)}-{strength}-baseline{int(baseline)}.png'), cv2.cvtColor(out, cv2.COLOR_RGBA2BGRA))
         # Keep saved strength while SR is toggled off and back on live.
-        control(wire.DETAIL_MAGIC, 0 if baseline else 200)
+        control(wire.DETAIL_MAGIC, 0 if baseline else 100)
         for enabled in (False, sr):
             for _ in range(3):
                 wire.send_frame(worker, index, source, motion, True, index, dlss_sr=enabled)
@@ -72,7 +75,7 @@ def capture(name, sr, scale, baseline=False):
                 assert a[3] == w*h*4
                 out = np.frombuffer(exact(worker.stdout, a[3]), np.uint8).reshape(h, w, 4).copy()
             results.append(out)
-        control(wire.DETAIL_MAGIC, 200)
+        control(wire.DETAIL_MAGIC, 100)
         wire.send_frame(worker, index, source, motion, True, index, bypass=True, dlss_sr=sr)
         index += 1
         a = ack()
@@ -100,7 +103,7 @@ if __name__ == '__main__':
             # Compare matching frame positions in an unsharpened control run,
             # not unrelated frames at different points in its initialization.
             deltas = []
-            for strength, raw, out in zip((0, 100, 200, 0, 0, 200), baseline, enhanced):
+            for strength, raw, out in zip((0, 50, 100, 0, 0, 100), baseline, enhanced):
                 delta = np.abs(out.astype(int)-raw.astype(int))
                 assert np.array_equal(raw[:, :, 3], out[:, :, 3]), 'alpha changed'
                 if strength == 0 or not mode[1]:
@@ -111,7 +114,7 @@ if __name__ == '__main__':
                     deltas.append(delta.max())
             if mode[1]:
                 assert deltas[0] >= 2 and deltas[1] > deltas[0], 'weak slider response'
-                print(f'PASS {mode[0]}: max changes 100%={deltas[0]}, 200%={deltas[1]}; zero and bypass exact', flush=True)
+                print(f'PASS {mode[0]}: max changes 50%={deltas[0]}, 100%={deltas[1]}; zero and bypass exact', flush=True)
             else:
                 print('PASS: SR/DLAA off: all sharpness strengths leave NR output pixel-exact', flush=True)
     else:

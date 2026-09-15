@@ -1031,8 +1031,8 @@ class OverlayMenu:
                        value_text=sr_size, ends=("25%", "100% (DLAA)"))
 
                 detail = float(self.state.get("detail_strength", 0.0))
-                slider("detail_strength", 0.0, 2.0, detail, s["detail_strength"],
-                       value_text=f"{int(detail*100+.5)}%", ends=("0%", "200%"))
+                slider("detail_strength", 0.0, 1.0, detail, s["detail_strength"],
+                       value_text=f"{int(detail*100+.5)}%", ends=("0%", "100%"))
 
             # What is being processed - the first question anyone has, and
             # until now the only one answered on another page. The segment

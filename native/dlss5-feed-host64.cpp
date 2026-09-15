@@ -5222,7 +5222,7 @@ static int ReadVideoMessage(VideoState &v, VideoFrameHeader &fh, std::vector<BYT
         g_ui_index = fh.index; g_ui_valid = true;
         return 12;
     }
-    if (fh.magic == 0x31524853u) return fh.reset <= 200 && fh.reserved == 0 ? 13 : 0; // SHR1
+    if (fh.magic == 0x31524853u) return fh.reset <= 100 && fh.reserved == 0 ? 13 : 0; // SHR1
     if (fh.magic == 0x31435353u) return 11; // SSC1: independent SR input scale
     if (fh.magic == CAPTURE_MAGIC) return 10;
     if (fh.magic == FRAME_MAGIC)

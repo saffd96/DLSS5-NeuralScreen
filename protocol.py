@@ -427,7 +427,7 @@ DETAIL_MAGIC = 0x31524853  # SHR1
 
 
 def sync_detail(worker, reader, strength: float) -> None:
-    percent = min(200, max(0, int(round(strength * 100))))
+    percent = min(100, max(0, int(round(strength * 100))))
     if getattr(worker, "_detail_sent", None) == percent:
         return
     worker.stdin.write(struct.pack(FRAME_FMT, DETAIL_MAGIC, 0, percent, 0, 0))
