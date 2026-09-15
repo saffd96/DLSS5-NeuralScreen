@@ -56,3 +56,11 @@ protocol commands coexist with parameter read-back and capture-stall resets.
 Validation: native build; 14 targeted Python/config/UI checks; GPU SR/DLAA toggle,
 resize and bypass; HDR FG dynamic multiplier with UI protection; prepared capture.
 Personal configuration is restored separately and is not committed.
+
+## v1.12.0 integration (2026-09-16)
+
+Merged v1.12.0 at 5cd26b4: bounded capture recovery, WGC resize/format
+handling, staged GPU failure diagnostics, screenshot freezing before the
+save dialog, recording fixes and multiplier controls. Preserved SR/DLAA,
+GPU LK, UI protection, opt-in library updates and 0?100% sharpness
+(active only with SR/DLAA). Personal configuration is not packaged.
