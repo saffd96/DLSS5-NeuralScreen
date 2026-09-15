@@ -51,7 +51,9 @@ static void ConfigureSrFrame(uint32_t flags)
 
 static bool EnsureSr(VideoState &v)
 {
-    if (!SrRequested()) { g_sr.history = false; return false; }
+    // At native size keep the ordinary NR output: captured frames do not
+    // provide the engine jitter/depth required for reliable temporal DLAA.
+    if (!SrRequested() || g_sr.scale >= 100) { g_sr.history = false; return false; }
     const UINT ow = v.upscale ? v.full_w : v.w, oh = v.upscale ? v.full_h : v.hgt;
     UINT sw = std::max(64u, ((ow * g_sr.scale + 100) / 200) * 2);
     UINT sh = std::max(64u, ((oh * g_sr.scale + 100) / 200) * 2);
