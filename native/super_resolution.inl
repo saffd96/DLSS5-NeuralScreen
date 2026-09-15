@@ -51,14 +51,11 @@ static void ConfigureSrFrame(uint32_t flags)
 
 static bool EnsureSr(VideoState &v)
 {
-    // At native size keep the ordinary NR output: captured frames do not
-    // provide the engine jitter/depth required for reliable temporal DLAA.
-    if (!SrRequested() || g_sr.scale >= 100) { g_sr.history = false; return false; }
+    if (!SrRequested()) { g_sr.history = false; return false; }
     const UINT ow = v.upscale ? v.full_w : v.w, oh = v.upscale ? v.full_h : v.hgt;
     UINT sw = std::max(64u, ((ow * g_sr.scale + 100) / 200) * 2);
     UINT sh = std::max(64u, ((oh * g_sr.scale + 100) / 200) * 2);
     SafeProcessingSize(ow,oh,sw,sh);
-    if (sw == ow && sh == oh) { g_sr.history = false; return false; }
     // Boost is relative to the already reduced SR input, independently of
     // the motion grid. No full-size NR/composite is needed on this path.
     UINT nw = v.nr_small ? std::max(64u, UINT((uint64_t(sw)*v.nr_w + ow)/(2*ow))*2) : sw;

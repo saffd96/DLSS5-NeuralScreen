@@ -1581,5 +1581,5 @@ STRINGS['ja'].update({'dlss_sr': 'DLSS Super Resolution', 'dlss_sr_hint': 'the n
 STRINGS['ko'].update({'dlss_sr': 'DLSS Super Resolution', 'dlss_sr_hint': 'the network runs at a lower resolution;\nDLSS restores the output resolution (experimental)', 'dlss_sr_failed': 'DLSS Super Resolution failed. Neural rendering remains active.', 'dlss_sr_input': 'DLSS input resolution', 'nr_min_hint': 'minimum processing size is limited automatically'})
 
 for _table in STRINGS.values():
-    _table["dlss_sr_hint"] += "\n100%: bypass DLSS, preserve the NR output."
-STRINGS["ru"]["dlss_sr_hint"] = "DLSS: \u043c\u0435\u043d\u044c\u0448\u0435 100% \u2014 \u0430\u043f\u0441\u043a\u0435\u0439\u043b; 100% \u2014 \u0431\u0435\u0437 \u043e\u0431\u0440\u0430\u0431\u043e\u0442\u043a\u0438 DLSS."
+    _table["dlss_sr_hint"] += "\n100%: DLAA (native-resolution anti-aliasing; additional GPU work)."
+STRINGS["ru"]["dlss_sr_hint"] = "На пониженном разрешении DLSS восстанавливает размер кадра.\n100%: DLAA — сглаживание без апскейла, с дополнительной нагрузкой на GPU."

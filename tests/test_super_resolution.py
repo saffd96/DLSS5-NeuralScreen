@@ -42,13 +42,6 @@ def run():
             out=np.frombuffer(exact(p.stdout,a[3]),np.uint8).reshape(oh,ow,4)
             if bypass:assert np.array_equal(out,frame),'SR changed bypass'
             assert out[:,:,:3].mean()>20,'black output'
-        # Native-size SR is an identity routing choice, including history reset.
-        native_outputs=[]
-        for index,enabled in ((80,True),(81,False)):
-            wire.send_frame(p,index,frame,np.zeros((h,w,2),np.float16),True,index,dlss_sr=enabled)
-            a=ack(wire.OUT_FMT);assert a[2]==1 and a[3]==ow*oh*4,a
-            native_outputs.append(bytes(exact(p.stdout,a[3])))
-        assert native_outputs[0]==native_outputs[1], 'native-size SR changed the NR output'
         p.stdin.close();p.wait(timeout=10)
     finally:
         if p.poll() is None:p.kill();p.wait()
@@ -56,11 +49,11 @@ def run():
     log=b''.join(logs).decode('utf-8','replace')
     print(log)
     assert p.returncode==0,p.returncode
-    assert log.count('[sr] ready:')==7,log
+    assert log.count('[sr] ready:')==8,log
     assert 'reduced 480x270 -> NR 320x180 -> SR input 480x270 -> 960x540' in log
     assert 'reduced 480x270 -> NR 256x144 -> SR input 480x270 -> 960x540' in log
     assert 'reduced 480x270 -> NR 480x270 -> SR input 480x270 -> 960x540' in log
-    assert 'reduced 960x540 -> NR 960x540 -> SR input 960x540 -> 960x540' not in log
+    assert 'reduced 960x540 -> NR 960x540 -> SR input 960x540 -> 960x540' in log
     assert 'input scale: 50% (before NR; Boost ratio unchanged)' in log
     assert log.count('[sr] first evaluation succeeded')>=4,log
     assert '[sr] Evaluate failed' not in log and '[sr] CreateFeature failed' not in log
