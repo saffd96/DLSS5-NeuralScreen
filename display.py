@@ -52,6 +52,17 @@ user32.SetLayeredWindowAttributes.argtypes = [wintypes.HWND, wintypes.COLORREF,
 user32.SetLayeredWindowAttributes.restype = wintypes.BOOL
 user32.SetWindowDisplayAffinity.argtypes = [wintypes.HWND, wintypes.DWORD]
 user32.SetWindowDisplayAffinity.restype = wintypes.BOOL
+# The z-order walkers used by raise_topmost's guard (flicker audit 15.09).
+user32.GetTopWindow.argtypes = [wintypes.HWND]
+user32.GetTopWindow.restype = wintypes.HWND
+user32.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
+user32.GetWindow.restype = wintypes.HWND
+user32.IsWindowVisible.argtypes = [wintypes.HWND]
+user32.IsWindowVisible.restype = wintypes.BOOL
+user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+user32.GetWindowRect.restype = wintypes.BOOL
+user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+user32.GetSystemMetrics.restype = ctypes.c_int
 
 
 class CURSORINFO(ctypes.Structure):
@@ -655,28 +666,23 @@ class Display:
         user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
         user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0,
                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED)
-        if enabled:
-            # Focus is needed for the keyboard. The mouse works without it -
-            # the click goes to the window under the cursor now that it is no
-            # longer transparent. SetForegroundWindow alone is refused when
-            # the foreground window belongs to another process that has not
-            # received input from the user (a game in the foreground): the
-            # system blocks the steal. AttachThreadInput is the standard
-            # workaround - it makes the foreground thread share its input
-            # state with ours, so the activation is treated as user-initiated.
-            try:
-                fg = user32.GetForegroundWindow()
-                fg_tid = user32.GetWindowThreadProcessId(fg, None)
-                my_tid = ctypes.windll.kernel32.GetCurrentThreadId()
-                if fg_tid and fg_tid != my_tid:
-                    user32.AttachThreadInput(my_tid, fg_tid, True)
-                user32.SetForegroundWindow(hwnd)
-                user32.SetActiveWindow(hwnd)
-                user32.SetFocus(hwnd)
-                if fg_tid and fg_tid != my_tid:
-                    user32.AttachThreadInput(my_tid, fg_tid, False)
-            except Exception:
-                pass
+        # R2: no focus is taken here - ever. The old code attached our thread
+        # to the foreground thread and called SetForegroundWindow, which
+        # re-stole the keyboard focus within 0.5 s of every Alt+Tab, monitor
+        # change and window-mode rebuild that re-opened the menu (flicker
+        # audit F2; the user-visible bug: the NR window "stops working"
+        # while another window takes focus). The model now:
+        #   - the global hotkeys are RegisterHotKey(NULL, ...) - they work
+        #     without focus, so Num1..Num6 close/switch regardless;
+        #   - the mouse works without focus (WS_EX_TRANSPARENT removal is
+        #     what makes the clicks land on the panel);
+        #   - the panel activates NATURALLY on the user's first click on it
+        #     - a click is the user gesture Windows requires, no theft
+        #     needed - and SDL's KEYDOWN (Esc, Enter, the remap capture)
+        #     flows from that focus.
+        # The NOACTIVATE style is still removed while the menu is open (the
+        # click must be able to activate); the activation itself is left to
+        # the user's click, never to our code.
         self._click_through = not enabled
 
     def resize(self, w: int, h: int) -> None:
@@ -930,30 +936,93 @@ class Display:
         # another window).
         # Picture first, HUD last. Keep the two raises independent: a missing
         # or not-yet-created present window must never hide the HUD raise.
+        hud = None
+        try:
+            hud = pygame.display.get_wm_info()["window"]
+        except Exception:
+            hud = None
+        present = None
+        top = None
+        top_is_foreign = False
         try:
             present = user32.FindWindowW("NeuralScreenPresent", "NeuralScreen")
-            if present:
-                # The worker's ReassertPresentTopmost skips its raise while
-                # the HUD sits above the picture - mirror that here. Two
-                # unconditional TOPMOST inserts every 30 frames (and on every
-                # follow step) churn the pair's z-order and read as a periodic
-                # blink while idle (flicker audit, finding 1).
-                top = user32.GetTopWindow(None)
-                if top != present:
-                    buf = ctypes.create_unicode_buffer(64)
-                    ours = top and user32.GetClassNameW(top, buf, 64) > 0 and buf.value in (
-                        "pygame", "NeuralScreenPresent")
-                    if not ours:
-                        user32.SetWindowPos(present, -1, 0, 0, 0, 0,
-                                            0x0001 | 0x0002 | 0x0010)
+            top = self._top_real_window()
+            # "Foreign" is decided by HWND, not by the window class: a game
+            # or test helper built on SDL/pygame IS class "pygame" too, and
+            # the old class check read it as our own HUD and skipped the
+            # raise - the NR output stayed under a topmost foreign window
+            # (the focus z-order test caught exactly this).
+            top_is_foreign = top is not None and top != hud and top != present
+            # The picture goes first, and only when something ELSE took the
+            # top slot: an unconditional insert every 30 frames churns the
+            # pair's z-order (flicker audit, finding 1).
+            if present and top_is_foreign:
+                user32.SetWindowPos(present, -1, 0, 0, 0, 0,
+                                    0x0001 | 0x0002 | 0x0010)
         except Exception:
-            pass
+            present = None
+            top = None
         try:
-            hwnd = pygame.display.get_wm_info()["window"]
-            ctypes.windll.user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0,
-                                              0x0001 | 0x0002 | 0x0010)
+            if hud is None:
+                return
+            if top == hud:
+                pass  # the HUD is on top; nothing to do
+            elif top == present:
+                # The picture took the band: insert the HUD above it (one
+                # placement, after the picture) - the invariant is owned.
+                user32.SetWindowPos(hud, present, 0, 0, 0, 0,
+                                    0x0001 | 0x0002 | 0x0010 | 0x0004)
+            elif top_is_foreign:
+                # A foreign window took the topmost slot: re-assert the pair.
+                user32.SetWindowPos(hud, -1, 0, 0, 0, 0,
+                                    0x0001 | 0x0002 | 0x0010)
         except Exception:
             pass
+
+    def _top_real_window(self) -> int | None:
+        """The first VISIBLE window in the z-order walk that can COVER us.
+
+        The old guard took GetTopWindow() at face value - and on this
+        machine the top of the z-order is a stack of helper windows:
+        invisible 0x0 IME/MSCTFIME/ForegroundStaging entries, a VISIBLE
+        1x1 ThumbnailDeviceHelperWnd (dwm) and an off-screen 20x20
+        NarratorHelperWindow. Every 30-frame check read the first of those
+        that passed a naive size test as "a foreign window took the top
+        slot" and re-asserted the pair with two SetWindowPos calls - a DWM
+        recompose ~10 times a second, the hard blinking of the panel over
+        the picture window (user, 15.09; the worker's own
+        ReassertPresentTopmost skips zero-sized windows, the client guard
+        never did).
+
+        A window counts only if it can actually be covering our layer:
+        visible, at least HELPER_MIN_PX in both dimensions, and its rect
+        intersecting the virtual screen (the Narrator helper lives at
+        -40000,-40000).
+        """
+        HELPER_MIN_PX = 16
+        try:
+            screen_w = user32.GetSystemMetrics(0)    # SM_CXSCREEN
+            screen_h = user32.GetSystemMetrics(1)    # SM_CYSCREEN
+            if screen_w <= 0:
+                screen_w = 3840
+            if screen_h <= 0:
+                screen_h = 2160
+            hwnd = user32.GetTopWindow(None)
+            for _ in range(16):        # bounded walk - the stack is shallow
+                if not hwnd:
+                    return None
+                if user32.IsWindowVisible(hwnd):
+                    rect = wintypes.RECT()
+                    if user32.GetWindowRect(hwnd, ctypes.byref(rect)) and \
+                            (rect.right - rect.left) >= HELPER_MIN_PX and \
+                            (rect.bottom - rect.top) >= HELPER_MIN_PX and \
+                            rect.right > 0 and rect.bottom > 0 and \
+                            rect.left < screen_w and rect.top < screen_h:
+                        return hwnd
+                hwnd = user32.GetWindow(hwnd, 2)   # GW_HWNDNEXT
+        except Exception:
+            pass
+        return None
 
     def enter_switch_mode(self, last_frame: "np.ndarray | None" = None,
                           full_w: int = 0, full_h: int = 0) -> None:

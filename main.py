@@ -275,6 +275,7 @@ class _Pipeline:
         "gpu_ok",
         "gpu_alerted",
         "gpu_switch_pending",
+        "fg_alerted",
         "gray_active",
         "mon_origin",
         "guide_fails",
@@ -550,6 +551,9 @@ def main() -> int:
             # something was added to this loop.
             if st.frame_index % 30 == 0:
                 settings_io.refresh_gpu_ok(st)
+                # And whether Frame Generation came up at all (issue #76:
+                # the switch used to stay ON after the runtime refused).
+                settings_io.refresh_fg_ok(st)
                 # And whether the display being captured is in HDR. The
                 # network is trained on SDR: on an HDR desktop the result
                 # reads as "everything is too bright and the sliders do
@@ -715,7 +719,7 @@ def main() -> int:
                     for line in st.worker_logs[-15:]:
                         print(f"  {line}")
                 st.worker, st.worker_logs, st.reader, st.worker_stop = restart_worker(
-                    st.worker, st.params, st.work_w, st.work_h, 10,
+                    st.worker, st.params, st.work_w, st.work_h, st.effective_warmup,
                     st.width if (st.work_w != st.width or st.work_h != st.height) else 0,
                     st.height if (st.work_w != st.width or st.work_h != st.height) else 0,
                     st.worker_stop, st.shm)
@@ -819,7 +823,7 @@ def main() -> int:
                 print(f"[main] worker silent/dead on frame {st.frame_index} ({exc}) - restarting "
                       f"({st.consecutive_restarts}/{MAX_CONSECUTIVE_RESTARTS})")
                 st.worker, st.worker_logs, st.reader, st.worker_stop = restart_worker(
-                    st.worker, st.params, st.work_w, st.work_h, 10,
+                    st.worker, st.params, st.work_w, st.work_h, st.effective_warmup,
                     st.width if (st.work_w != st.width or st.work_h != st.height) else 0,
                     st.height if (st.work_w != st.width or st.work_h != st.height) else 0,
                     st.worker_stop, st.shm)

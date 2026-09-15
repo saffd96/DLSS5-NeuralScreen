@@ -51,6 +51,7 @@
 #include <chrono>
 #include "hdr_display.h"
 #include "hdr_shaders.h"
+#include "dll_trust.h"
 
 #include <nvsdk_ngx.h>
 #include <nvsdk_ngx_helpers.h>
@@ -438,7 +439,8 @@ static bool LoadNrForwarder(const wchar_t *dll_name)
     // substring must be refused. Without a way to aim the worker at that copy
     // the rule could only be asserted in a comment.
     wchar_t path[MAX_PATH] = {};
-    if (GetEnvironmentVariableW(L"NS_FORWARDER", path, MAX_PATH) == 0)
+    if (GetEnvironmentVariableW(L"NS_FORWARDER", path, MAX_PATH) == 0
+        || wcscmp(path, L"1") == 0)   // NS_FORWARDER=1: the shipped module
     {
         GetModuleFileNameW(nullptr, path, MAX_PATH);
         if (wchar_t *s = wcsrchr(path, L'\\')) *(s + 1) = L'\0';
@@ -533,27 +535,51 @@ static bool InitDirectNr(const wchar_t *data_path)
     {
         // The BYO library folder wins over the bundled copy: native\libraries\
         // is where users drop their own runtime build (see libraries/README).
-        wchar_t worker_dir[MAX_PATH] = {}, candidate[MAX_PATH] = {};
+        // A writable directory next to an executable - the file is verified
+        // (NVIDIA signature, machine-root chain, product name) before it is
+        // mapped, and held open so the verified bytes are the mapped ones.
+        wchar_t worker_dir[MAX_PATH] = {};
         GetModuleFileNameW(nullptr, worker_dir, MAX_PATH);
         if (auto slash = wcsrchr(worker_dir, L'\\')) *(slash + 1) = 0;
-        wcscat_s(worker_dir, L"libraries\\nvngx_dlssnr.dll");
-        if (GetFileAttributesW(worker_dir) != INVALID_FILE_ATTRIBUTES)
+        wchar_t candidate[MAX_PATH] = {};
+        wcscpy_s(candidate, worker_dir);
+        wcscat_s(candidate, L"libraries\\nvngx_dlssnr.dll");
+        if (GetFileAttributesW(candidate) != INVALID_FILE_ATTRIBUTES)
         {
-            dll_name = worker_dir;
-            Log("[pure] NR runtime from native\\libraries\\ (BYO)");
+            if (!NsGateByoDll(candidate, "nvngx_dlssnr.dll"))
+            {
+                Log("[pure] BYO refused: nvngx_dlssnr.dll is not a "
+                    "NVIDIA-signed runtime - falling back to the bundled "
+                    "copy (%ls)", candidate);
+            }
+            else
+            {
+                dll_name = candidate;
+                Log("[pure] NR runtime from native\\libraries\\ (BYO, verified)");
+            }
         }
     }
-    // NS_NO_FORWARDER=1 keeps the old shape, where the calls leave this
-    // executable - which the feature library serves only while the executable
-    // is named nvngx.dll. Kept for comparison, and as a way out on a machine
-    // that will not load the forwarder for some reason of its own.
-    char nofwd[8] = {};
-    const DWORD nofwd_got = GetEnvironmentVariableA("NS_NO_FORWARDER", nofwd, sizeof(nofwd));
-    const bool asked_direct = nofwd_got > 0 && nofwd_got < sizeof(nofwd) && nofwd[0] == '1';
-    if (asked_direct) Log("[pure] NS_NO_FORWARDER=1: calling the feature library from the worker");
-    const bool direct = asked_direct || !LoadNrForwarder(dll_name);
+    // The calls leave this executable by default (R8): the feature library
+    // serves a caller whose module path contains "nvngx.dll" - and the
+    // worker's own path native\nvngx.dll does. Measured on a 5070 Ti:
+    // Init_Ext, CreateFeature(18) and hours of evaluate from the exe all
+    // return Success with zero restarts; the forwarder existed for a
+    // constraint our executable never had. NS_FORWARDER=1 brings the old
+    // forwarding layer back as an escape hatch on a machine that refuses
+    // the direct calls for some reason of its own.
+    // NS_FORWARDER is set to either "1" (the shipped module) or a path -
+    // any value asks for the forwarding layer; unset means direct.
+    const DWORD fwd_got = GetEnvironmentVariableA("NS_FORWARDER", nullptr, 0);
+    const bool asked_fwd = fwd_got > 0;
+    // Direct unless the old layer is explicitly asked for - and the
+    // forwarder stays as the fallback when the direct path fails to load
+    // the runtime for some reason of its own.
+    const bool direct = !asked_fwd || !LoadNrForwarder(dll_name);
     if (direct)
     {
+        if (!asked_fwd)
+            Log("[pure] NGX calls leave the worker itself (the module path "
+                "carries nvngx.dll)");
         g_nr_module = LoadLibraryW(dll_name);
         if (!g_nr_module) { Log("[pure] LoadLibrary(%ls) failed %lu", dll_name, GetLastError()); return false; }
         g_nr_init_ext = reinterpret_cast<PFN_NR_InitExt>(GetProcAddress(g_nr_module, "NVSDK_NGX_D3D12_Init_Ext"));
@@ -1249,18 +1275,88 @@ static bool InitDisguise()
     return true;
 }
 
+// NGX writes its own log file next to the program and mirrors lines into
+// every sink it finds. We log everything that matters ourselves, so the
+// runtime's file is pure noise: a discard callback with NextCallback=null
+// plus DisableOtherLoggingSinks closes every sink but ours. The logging
+// level is a floor, not a ceiling - only the discard callback + NextCallback
+// NULL actually silences the other sinks (verified against the runtime's
+// behavior, roadmap R3).
+static void NVSDK_CONV NgxDiscardCallback(const char *, NVSDK_NGX_Logging_Level,
+                                          NVSDK_NGX_Feature) {}
+
+static NVSDK_NGX_FeatureCommonInfo g_ngx_common = {};
+
+// R8 groundwork: fill PathListInfo so the driver's NGX core can find the
+// feature DLL by itself. Our earlier NS_NGX_VIA_CORE attempt failed with
+// Init -> FAIL_UnableToInitializeFeature, and the suspect was the nullptr
+// FeatureCommonInfo the core had to work with. NS_NGX_PATHLIST=1 builds the
+// real struct; the forwarder-removal decision rides on this test.
+// PathListInfo holds raw pointers, so the strings outlive Init: static.
+static wchar_t g_ngx_paths[2][MAX_PATH];
+static const wchar_t *g_ngx_path_ptrs[2] = { g_ngx_paths[0], g_ngx_paths[1] };
+
+static NVSDK_NGX_FeatureCommonInfo *NgxCommonInfo(const wchar_t *data_path)
+{
+    // Logging discard is unconditional (R3): the runtime's own log file
+    // next to the program is noise - everything worth knowing is logged
+    // by us, and a discard callback with NextCallback left null silences
+    // the other sinks for good.
+    g_ngx_common = {};
+    g_ngx_common.LoggingInfo.LoggingCallback = NgxDiscardCallback;
+    g_ngx_common.LoggingInfo.MinimumLoggingLevel = NVSDK_NGX_LOGGING_LEVEL_OFF;
+    g_ngx_common.LoggingInfo.DisableOtherLoggingSinks = true;
+
+    char v[8] = {};
+    const DWORD got = GetEnvironmentVariableA("NS_NGX_PATHLIST", v, sizeof(v));
+    if (got > 0 && got < sizeof(v) && v[0] == '1')
+    {
+        // R8 groundwork: exe dir first, then the data dir we were already
+        // passing as hint, so the driver's NGX core can find the feature
+        // DLL without our forwarder. PathListInfo is a pointer list plus a
+        // single length, and the strings must outlive the Init call.
+        wcscpy_s(g_ngx_paths[0], MAX_PATH, data_path);
+        wchar_t exe_dir[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, exe_dir, MAX_PATH);
+        if (wchar_t *s = wcsrchr(exe_dir, L'\\')) *(s + 1) = L'\0';
+        wcscpy_s(g_ngx_paths[1], MAX_PATH, exe_dir);
+        g_ngx_common.PathListInfo.Path = g_ngx_path_ptrs;
+        g_ngx_common.PathListInfo.Length = 2;
+        Log("[host] NS_NGX_PATHLIST=1: PathListInfo = exe dir + worker dir");
+    }
+    return &g_ngx_common;
+}
+
 static bool InitNgx()
 {
     wchar_t data_path[MAX_PATH] = {};
     GetModuleFileNameW(nullptr, data_path, MAX_PATH);
     if (wchar_t *s = wcsrchr(data_path, L'\\')) *(s + 1) = L'\0';
 
-    NVSDK_NGX_Result r = NVSDK_NGX_D3D12_Init(0x1000000ULL, data_path, h.dev, nullptr, NVSDK_NGX_Version_API);
+    // R4: debug toggles must land BEFORE Init - the runtime reads them once
+    // at startup. NS_NGX_INDICATOR shows the in-model overlay (version,
+    // preset, buffer sizes); NS_NGX_NO_CUBIN_CACHE skips the driver's cubin
+    // cache, so a swapped runtime takes effect without a driver restart.
+    char iv[8] = {};
+    if (GetEnvironmentVariableA("NS_NGX_INDICATOR", iv, sizeof(iv)) > 0 && iv[0] == '1')
+    {
+        SetEnvironmentVariableA("__NGX_SHOW_INDICATOR", "1024");
+        Log("[host] NS_NGX_INDICATOR=1: the in-model debug overlay is on");
+    }
+    char cv[8] = {};
+    if (GetEnvironmentVariableA("NS_NGX_NO_CUBIN_CACHE", cv, sizeof(cv)) > 0 && cv[0] == '1')
+    {
+        SetEnvironmentVariableA("__NGX_CUBIN_DISABLE_RESOURCE_CACHE", "1");
+        Log("[host] NS_NGX_NO_CUBIN_CACHE=1: the cubin cache is off");
+    }
+
+    NVSDK_NGX_FeatureCommonInfo *common = NgxCommonInfo(data_path);
+    NVSDK_NGX_Result r = NVSDK_NGX_D3D12_Init(0x1000000ULL, data_path, h.dev, common, NVSDK_NGX_Version_API);
     Log("[host] NVSDK_NGX_D3D12_Init -> 0x%08X (%s)", r, NgxResultName(r));
     if (NVSDK_NGX_FAILED(r))
     {
         r = NVSDK_NGX_D3D12_Init_with_ProjectID("a0f57b54-1daf-4934-90ae-c4035c19df04", NVSDK_NGX_ENGINE_TYPE_CUSTOM,
-                                                "1.0", data_path, h.dev, nullptr, NVSDK_NGX_Version_API);
+                                                "1.0", data_path, h.dev, common, NVSDK_NGX_Version_API);
         Log("[host] Init_with_ProjectID -> 0x%08X (%s)", r, NgxResultName(r));
     }
     if (NVSDK_NGX_FAILED(r)) return false;
@@ -1309,6 +1405,54 @@ static bool CreateFeature(UINT w, UINT h_, int flags, NVSDK_NGX_Result *out_r, U
     h.params->Set("DLSSNR.ScalingRatio", upscale ? static_cast<float>(w) / static_cast<float>(full_w) : 1.0f);
     h.params->Set("DLSSNR.Hint.Render.Preset", NrPresetHint());
     h.params->Set("DLSS.Feature.Create.Flags", 0u);
+
+    // R6: decode the runtime's own requirements before the create - the
+    // result names the exact refusal reason (missing file vs driver vs
+    // adapter vs OS) instead of a bare 0x FAIL code. Init is not required
+    // for this query; the bitmask meanings come from the NGX header
+    // (1 check absent, 2 driver, 4 adapter, 8 OS, 16 not implemented).
+    // Measured on the bundled 310.8.0 runtime: the query itself returns
+    // FAIL_OutOfDate (0xBAD00012) - discovery for feature 18 is newer than
+    // this build. The query is diagnostic only: the create's own result
+    // stays the truth, and a NEWER BYO runtime (310.9+) answers it - which
+    // is exactly the BYO UX case this is for.
+    {
+        wchar_t data_path[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, data_path, MAX_PATH);
+        if (wchar_t *sl = wcsrchr(data_path, L'\\')) *(sl + 1) = L'\0';
+        NVSDK_NGX_FeatureDiscoveryInfo di = {};
+        di.SDKVersion = NVSDK_NGX_Version_API;
+        di.FeatureID = NVSDK_NGX_Feature_Reserved18;
+        di.Identifier.IdentifierType = NVSDK_NGX_Application_Identifier_Type_Project_Id;
+        di.Identifier.v.ProjectDesc.ProjectId = "a0f57b54-1daf-4934-90ae-c4035c19df04";
+        di.Identifier.v.ProjectDesc.EngineType = NVSDK_NGX_ENGINE_TYPE_CUSTOM;
+        di.Identifier.v.ProjectDesc.EngineVersion = "1.0";
+        di.ApplicationDataPath = data_path;
+        di.FeatureInfo = &g_ngx_common;
+        NVSDK_NGX_FeatureRequirement req = {};
+        const NVSDK_NGX_Result qrr = NVSDK_NGX_D3D12_GetFeatureRequirements(g_adapter3, &di, &req);
+        if (!NVSDK_NGX_FAILED(qrr))
+        {
+            if (req.FeatureSupported == NVSDK_NGX_FeatureSupportResult_Supported)
+                Log("[host] feature requirements: supported (min arch 0x%X)", req.MinHWArchitecture);
+            else
+            {
+                static const char *bits[] = {"check-not-present", "driver-unsupported",
+                                             "adapter-unsupported", "os-below-minimum",
+                                             "not-implemented"};
+                char why[160] = {};
+                int off = 0;
+                for (int b = 0; b < 5; ++b)
+                    if (req.FeatureSupported & (1 << b))
+                        off += _snprintf_s(why + off, sizeof(why) - off, _TRUNCATE, "%s%s",
+                                           off ? "+" : "", bits[b]);
+                Log("[host] feature requirements: REFUSED (%s), min arch 0x%X, min OS %s",
+                    why, req.MinHWArchitecture, req.MinOSVersion);
+            }
+        }
+        else
+            Log("[host] feature requirements query failed 0x%08X - continuing with the create", qrr);
+    }
 
     if (!BeginCommands()) return false;
     DWORD ccode = 0;
@@ -1844,6 +1988,9 @@ static HWND                       g_wgc_hwnd = nullptr;
 
 
 static IDXGISwapChain3           *g_present_swap;
+// R11: DWM releases the FG presenter on this handle, one vblank before the
+// previous frame reaches the screen. Null = the wall-clock fallback path.
+static HANDLE                     g_fg_waitable = nullptr;
 // What the swap chain has already been told its colours mean. Asking DXGI
 // every frame is both a waste and a way to fail on the SDR path, which has
 // never made the call at all - see EnsurePresentFormat.
@@ -1963,6 +2110,7 @@ static void ClosePresent()
 {
     CloseFgResources();
     if (g_present_swap != nullptr) { g_present_swap->Release(); g_present_swap = nullptr; }
+    g_fg_waitable = nullptr;  // the handle dies with the swapchain
     // Only the thread that created the window can destroy it. This used to
     // post WM_QUIT to the thread FIRST, which ended the message loop before
     // the WM_CLOSE behind it could be dispatched, and then called
@@ -2036,7 +2184,10 @@ static bool OpenPresent(UINT width, UINT height, uint32_t flags)
     sd.Format      = DXGI_FORMAT_R8G8B8A8_UNORM;   // must match VideoState::output for CopyResource
     sd.SampleDesc.Count = 1;
     sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    sd.BufferCount = 2;
+    // R11: three buffers with a frame-latency waitable object - the FG
+    // presenter waits on DWM's release before it presents, which paces it
+    // to the compositor instead of wall-clock deadlines that drift.
+    sd.BufferCount = 3;
     sd.SwapEffect  = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     sd.AlphaMode   = DXGI_ALPHA_MODE_IGNORE;
     IDXGISwapChain1 *sc1 = nullptr;
@@ -2050,6 +2201,19 @@ static bool OpenPresent(UINT width, UINT height, uint32_t flags)
     }
     factory->MakeWindowAssociation(g_present_hwnd, DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_WINDOW_CHANGES);
     factory->Release();
+    // R11: latency 1 + the waitable object - but ONLY while Frame
+    // Generation owns the present loop. The ordinary NR path presents
+    // Present(0,0) per frame without consuming the waitable: with latency 1
+    // the swapchain would queue one present and every ordinary present
+    // would block or drop unpredictably against the compositor - the
+    // fullscreen flicker. Default latency while NR runs; latency 1 is set
+    // by FgStart (the FG thread consumes the releases) and restored to the
+    // default by FgStop.
+    IDXGISwapChain2 *sc2 = nullptr;
+    hr = sc1->QueryInterface(__uuidof(IDXGISwapChain2), reinterpret_cast<void **>(&sc2));
+    if (SUCCEEDED(hr) && sc2 != nullptr)
+        sc2->Release();
+    g_fg_waitable = nullptr;
     hr = sc1->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void **>(&g_present_swap));
     sc1->Release();
     if (FAILED(hr) || g_present_swap == nullptr)
@@ -2175,8 +2339,16 @@ static void FollowCapturedWindow()
             if (left < r.left) left = r.left;
             if (top < r.top) top = r.top;
         }
-        SetWindowPos(g_present_hwnd, HWND_TOPMOST, left, top, w, hgt,
-                     SWP_NOACTIVATE);
+        // The raise is the client HUD raise's business (P3 ownership): a
+        // bare move keeps the window in place inside the topmost band
+        // (SWP_NOZORDER) instead of re-inserting it above the HUD on every
+        // follow step - the picture-over-HUD ping-pong read as hard
+        // flicker with the menu open.
+        const bool picture_on_top = GetTopWindow(nullptr) == g_present_hwnd;
+        SetWindowPos(g_present_hwnd,
+                     picture_on_top ? nullptr : HWND_TOPMOST,
+                     left, top, w, hgt,
+                     SWP_NOACTIVATE | (picture_on_top ? SWP_NOZORDER : 0));
     }
 }
 
@@ -2197,8 +2369,15 @@ static void ReassertPresentTopmost()
     HWND top = GetTopWindow(0);
     if (top == nullptr || top == g_present_hwnd) return;
     wchar_t cls[64];
-    if (GetClassNameW(top, cls, 64) > 0 && wcscmp(cls, L"pygame") == 0)
-        return;  // the HUD is on top - leave it there
+    // Both our windows count as "the pair is fine": the HUD class is pygame,
+    // and our own picture class must not be re-raised above - the client's
+    // HUD raise owns the HUD-over-picture order now (v1.10-review P3), and
+    // the old single-class check re-inserted the picture over the HUD every
+    // 300 frames while the client inserted the HUD back over the picture -
+    // the ping-pong read as hard flicker.
+    if (GetClassNameW(top, cls, 64) > 0
+        && (wcscmp(cls, L"pygame") == 0 || wcscmp(cls, L"NeuralScreenPresent") == 0))
+        return;  // ours on top - leave it there
     RECT r;
     if (GetWindowRect(top, &r) && r.right == r.left && r.bottom == r.top)
         return;  // zero-sized (IME, helpers) cannot cover the picture
@@ -2440,6 +2619,15 @@ static void OwnTheProtocolPipe()
     // From here a printf to stdout is a line in the log, not four bytes in
     // the middle of a reply.
     _dup2(_fileno(stderr), _fileno(stdout));
+    // _dup2 only rewires the CRT's fd table. GetStdHandle(STD_OUTPUT_HANDLE)
+    // still returns the original pipe handle, so a module that logs through
+    // the Win32 handle - NVIDIA's runtime logger did exactly that on the
+    // issue #61 machine - would sail past this redirect. Point the process
+    // standard handle at stderr as well; the private fd 1 copy keeps the
+    // protocol (the std handle is only read by whoever asks, our writes go
+    // through g_wire).
+    HANDLE err = GetStdHandle(STD_ERROR_HANDLE);
+    if (err != nullptr) SetStdHandle(STD_OUTPUT_HANDLE, err);
 }
 
 static bool WriteExact(FILE *f, const void *p, size_t n)
@@ -4436,6 +4624,19 @@ static bool WgcGrab(VideoState &v)
     {
         const double t_acq = PhaseNow();
         auto frame = g_wgc->pool.TryGetNextFrame();
+        // Drain-to-latest: the frame pool queues every frame the window
+        // produces. After a stall (a slow eval, a resize hold, a lagging
+        // main loop) the queue holds stale frames; grabbing one frame per
+        // loop would replay the backlog at one frame per tick. Walk to the
+        // LAST available frame and keep only that - one pool slot at a
+        // time, closing everything older.
+        for (int drained = 0; drained < 8; ++drained)
+        {
+            auto next = g_wgc->pool.TryGetNextFrame();
+            if (next == nullptr) break;
+            if (frame != nullptr) frame.Close();
+            frame = next;
+        }
         PhaseAdd(PH_ACQ, t_acq);
         // Nothing new: the window has not redrawn. Same meaning as
         // DXGI_ERROR_WAIT_TIMEOUT on the duplication path - the caller keeps
@@ -4704,6 +4905,26 @@ static bool ProfileWait(ProfileStage stage, UINT64 fence, DWORD ms)
     return ok;
 }
 
+// R5: every scalar parameter is read back after Set. A silent param drop
+// (the runtime rejecting a key without failing the call) would otherwise
+// ship a feature that runs on defaults while our UI reports the user's
+// numbers - the read-back names the key and both values the moment it
+// happens. Cost: ~40 Get calls per eval, nanoseconds next to the 20+ ms
+// GPU pass.
+static bool SetVerifiedF(NVSDK_NGX_Parameter *p, const char *name, float value)
+{
+    p->Set(name, value);
+    float got = -1.0f;
+    return !NVSDK_NGX_FAILED(static_cast<NVSDK_NGX_Result>(p->Get(name, &got))) && got == value;
+}
+
+static bool SetVerifiedU(NVSDK_NGX_Parameter *p, const char *name, unsigned int value)
+{
+    p->Set(name, value);
+    unsigned int got = 0xFFFFFFFFu;
+    return !NVSDK_NGX_FAILED(static_cast<NVSDK_NGX_Result>(p->Get(name, &got))) && got == value;
+}
+
 #include "super_resolution.inl"
 
 static bool EvaluateVideo(VideoState &v, int reset, UINT64 *submitted = nullptr)
@@ -4753,14 +4974,18 @@ static bool EvaluateVideo(VideoState &v, int reset, UINT64 *submitted = nullptr)
     h.params->Set("DLSSNR.OutputSubrectWidth", nw); h.params->Set("DLSSNR.OutputSubrectHeight", nh);
     h.params->Set("DLSSNR.MVecScaleX", (use_sr || v.nr_small) ? float(nw)/v.w : 1.0f);
     h.params->Set("DLSSNR.MVecScaleY", (use_sr || v.nr_small) ? float(nh)/v.hgt : 1.0f);
-    h.params->Set("DLSSNR.Enabled", 1u); h.params->Set("DLSSNR.Reset", reset);
-    h.params->Set("DLSSNR.Intensity", g_video_options.intensity);
-    h.params->Set("DLSSNR.LocalToneStrength", g_video_options.local_tone);
-    h.params->Set("DLSSNR.LocalStructureStrength", g_video_options.local_structure);
-    h.params->Set("DLSSNR.SkinStructureStrength", g_video_options.skin_structure);
-    h.params->Set("DLSSNR.UseAutoMask", g_video_options.auto_mask);
-    h.params->Set("DLSSNR.Style", g_video_options.style);
-    h.params->Set("DLSSNR.UICorrection", g_video_options.ui_correction);
+    bool verified = true;
+    verified &= SetVerifiedU(h.params, "DLSSNR.Enabled", 1u);
+    verified &= SetVerifiedU(h.params, "DLSSNR.Reset", (unsigned int)reset);
+    verified &= SetVerifiedF(h.params, "DLSSNR.Intensity", g_video_options.intensity);
+    verified &= SetVerifiedF(h.params, "DLSSNR.LocalToneStrength", g_video_options.local_tone);
+    verified &= SetVerifiedF(h.params, "DLSSNR.LocalStructureStrength", g_video_options.local_structure);
+    verified &= SetVerifiedF(h.params, "DLSSNR.SkinStructureStrength", g_video_options.skin_structure);
+    verified &= SetVerifiedU(h.params, "DLSSNR.UseAutoMask", g_video_options.auto_mask);
+    verified &= SetVerifiedU(h.params, "DLSSNR.Style", g_video_options.style);
+    verified &= SetVerifiedU(h.params, "DLSSNR.UICorrection", g_video_options.ui_correction);
+    if (!verified)
+        Log("[host] NGX parameter read-back mismatch - a value did not stick");
     h.params->Set("DLSS.Pre.Exposure", 1.0f);
     h.params->Set("DLSS.Exposure.Scale", g_pw_exposure);
     DWORD code = 0;
@@ -5116,6 +5341,7 @@ static int ReadVideoMessage(VideoState &v, VideoFrameHeader &fh, std::vector<BYT
 static void ReleaseVideoTextures(VideoState &v)
 {
     CloseNvofa();
+    NvofaResetLatch();
     if (PhaseEnabled()) { ++g_capture_generation; g_previous_source_qpc = 0; g_frame_stamp = {}; }
     CloseSrResources();
     CloseFgResources();
@@ -5701,6 +5927,13 @@ static int RunVideo()
         bool source_fresh = true;
         bool defer_tail = false;
         UINT64 upload_done = 0, eval_done = 0, present_done = 0;
+        // R12: a capture pause longer than a second leaves every history
+        // (NR temporal accumulation, FG interpolation slots) pointing at a
+        // picture that no longer exists. Marked here; the pause itself
+        // forces the reset when frames resume.
+        static ULONGLONG last_fresh_tick = GetTickCount64();
+        static bool stall_pending = false;
+        const ULONGLONG now_tick = GetTickCount64();
         if (CaptureActive())
         {
             // Capture mode: the colour comes from the desktop (DDA1) or from
@@ -5763,6 +5996,21 @@ static int RunVideo()
             }
             source_fresh = got && g_capture_visual_changed;
             if (phase_on && source_fresh) ++g_ph_fresh_sources;            PhaseAdd(PH_DDA, t_dda);
+            // R12: the pause detector. Fresh source = the clock restarts; a
+            // silence longer than a second marks the reset for the next
+            // fresh frame - evaluated with stale history once is enough to
+            // see the smear, resetting on the FIRST stale frame keeps it
+            // invisible.
+            if (source_fresh)
+            {
+                if (stall_pending && now_tick - last_fresh_tick > 1000)
+                    Log("[reset] capture resumed after %lu ms - NR and FG history reset",
+                        (unsigned long)(now_tick - last_fresh_tick));
+                stall_pending = false;
+                last_fresh_tick = now_tick;
+            }
+            else if (!got && now_tick - last_fresh_tick > 1000)
+                stall_pending = true;
             if (!got && !g_dda_ready)
             {
                 // Not a single real desktop frame yet: keep the protocol
@@ -5906,7 +6154,13 @@ static int RunVideo()
             SplitXFromFlags(fh.reserved, v.upscale ? v.full_w : v.w) : UINT_MAX;
         const bool bypass = (fh.reserved & FRAME_FLAG_BYPASS) != 0 || h.feature == nullptr;
         if (bypass) g_sr.history = false;
-        g_fg_reset = frame == 0 || fh.reset != 0 || bypass || previous_hdr_split != g_hdr_split;
+        g_fg_reset = frame == 0 || fh.reset != 0 || bypass
+                     || previous_hdr_split != g_hdr_split
+                     || (stall_pending && source_fresh);
+        // The NR evaluate shares the same stall reset: one forced reset
+        // frame, then the ordinary flow.
+        const bool stall_reset = stall_pending && source_fresh;
+        if (stall_reset) { fh.reset = 1; stall_pending = false; Log("[video] history reset after the capture pause"); }
         if (!bypass)
         {
             const double t_eval = PhaseNow();

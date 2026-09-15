@@ -57,6 +57,7 @@ THEMES = {
 # config["hotkeys"].
 HOTKEY_ROWS = (
     ("toggle", "hk_nr"),
+    ("framegen", "hk_framegen"),
     ("settings", "hk_menu"),
     ("screenshot_menu", "hk_shot"),
     ("record", "hk_record"),
@@ -367,10 +368,20 @@ class OverlayMenu:
 
     @property
     def dragging(self) -> bool:
-        """Whether a slider is being dragged right now - while dragging the
-        state must not be updated, otherwise the value jumps between what the
-        mouse shows and what main has already applied."""
-        return getattr(self, "_drag_item", None) is not None
+        """Whether the panel is being manipulated right now.
+
+        Sliders, the title-bar drag, the edge scale and the grip resize all
+        count. While one is active the state must not be rebuilt (a slider
+        would jump between what the mouse shows and what main has already
+        applied), and the per-frame payload rebuild - EnumWindows + the
+        monitor scan + the worker log scan - is exactly what made the
+        title-bar drag stutter (flicker audit M3: the property used to
+        cover sliders only; user, 15.09: "двигается с рывками").
+        """
+        return (getattr(self, "_drag_item", None) is not None
+                or getattr(self, "_move_from", None) is not None
+                or getattr(self, "_resize_from", None) is not None
+                or getattr(self, "_resize_h_from", None) is not None)
 
     def set_hotkeys(self, mapping: dict) -> None:
         """Hotkey captions: command -> "Num1". Sourced from the real bindings."""
@@ -466,7 +477,27 @@ class OverlayMenu:
         end and shift everything at once - that way the panel height cannot
         drift apart from the content (it used to come from a formula and lag
         behind).
+
+        The settings page resizes itself with every tab - one tab taller than
+        the other - and the jumping panel reads as broken. So on the settings
+        page the panel is sized to the TALLEST tab, always: a guarded pass
+        measures every tab's content height, and the real pass pads the
+        current tab out to that height (the back button lands at the bottom
+        of the tallest tab's panel, on every tab).
         """
+        if self.page == "settings" and not getattr(self, "_measuring", False):
+            tallest = 0
+            saved_tab = self.settings_tab
+            self._measuring = True
+            try:
+                for tab in SETTINGS_TABS:
+                    self.settings_tab = tab
+                    self.layout(screen_w, screen_h)
+                    tallest = max(tallest, self.content_height)
+            finally:
+                self._measuring = False
+                self.settings_tab = saved_tab
+            self._settings_content_h = tallest
         s = STRINGS.get(self.lang, STRINGS["en"])
         w = self._u(PANEL_W)
         pad = self._u(PAD)
@@ -1116,6 +1147,14 @@ class OverlayMenu:
         # The footer: actions with the hotkey printed underneath. "Collapse"
         # and "Exit" used to look equally harmless, even though one hides the
         # menu and the other unloads the program.
+        # The settings page is sized to the tallest tab (measured by the
+        # guarded pass at the head of layout()): the panel keeps one height
+        # across tabs instead of jumping. The padding goes BEFORE the footer,
+        # so the back button stays at the panel's bottom edge on every tab -
+        # padding after it would read as a stretched empty bottom.
+        if self.page == "settings" and not getattr(self, "_measuring", False):
+            cy = max(cy, self._settings_content_h - self._u(14) - self._u(6)
+                     - self._u(ACTION_H) - self._u(PAD))
         cy += self._u(6)
         self._rule_rel = pygame.Rect(pad, cy, inner_w, 1)
         cy += self._u(14)
@@ -1550,6 +1589,10 @@ class OverlayMenu:
         payload. Floats are compared with a tolerance a slider cannot land
         inside: the sliders step in hundredths, and a saved config comes back
         through float() twice.
+
+        The model does NOT count (user rule 15.09): it is its own control,
+        reverting the profile restores the four sliders and leaves the
+        model where the user put it.
         """
         defaults = self.state.get("param_defaults") or {}
         if not defaults:
@@ -1561,8 +1604,6 @@ class OverlayMenu:
             if abs(float(params.get(key, 0.0))
                    - float(defaults[key])) > 0.005:
                 return True
-        if "style" in defaults:
-            return int(self.state.get("style", 1)) != int(defaults["style"])
         return False
 
     def _button_click(self, key: str) -> list[tuple]:

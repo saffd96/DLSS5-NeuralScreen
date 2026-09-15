@@ -89,6 +89,20 @@ static void StopFgPresentation()
     g_fg.stop = true;
     g_fg.wake.notify_all();
     if (g_fg.thread.joinable()) g_fg.thread.join();
+    // Hand the swapchain back to the ordinary present path: default latency,
+    // the waitable handle dies with the swapchain, not with us.
+    if (g_present_swap != nullptr)
+    {
+        IDXGISwapChain2 *sc2 = nullptr;
+        if (SUCCEEDED(g_present_swap->QueryInterface(
+                __uuidof(IDXGISwapChain2), reinterpret_cast<void **>(&sc2)))
+            && sc2 != nullptr)
+        {
+            sc2->SetMaximumFrameLatency(3);
+            sc2->Release();
+        }
+    }
+    g_fg_waitable = nullptr;
     for (auto &slot : g_fg.slots) { slot.real = nullptr; for (auto &image : slot.interpolated) image = nullptr; slot.state = 0; }
     g_fg.history = false;
 }
@@ -120,6 +134,16 @@ static void FgPresenter()
     if (!event) { g_fg.failed = true; return; }
     UINT64 value = 0, previous = 0, shown = 0;
     auto report = std::chrono::steady_clock::now();
+    // R11: when the swapchain gave us a frame-latency waitable object, the
+    // compositor paces us: waiting on it releases one back buffer one
+    // vblank before the previous frame hits the screen. The first wait
+    // returns immediately (documented), so it is consumed here - from then
+    // on every loop iteration waits for the release before presenting,
+    // and the wall-clock deadlines become a second-order hint rather than
+    // the pacing source. Without the waitable (pre-8.1, blocked QI) the
+    // old wall-clock deadlines stay.
+    if (g_fg_waitable != nullptr)
+        WaitForSingleObject(g_fg_waitable, 2000);
     auto present = [&](ID3D12Resource *source) {
         winrt::com_ptr<ID3D12Resource> bb;
         if (FAILED(g_present_swap->GetBuffer(g_present_swap->GetCurrentBackBufferIndex(), IID_PPV_ARGS(bb.put()))) ||
@@ -136,7 +160,23 @@ static void FgPresenter()
             FAILED(fence->SetEventOnCompletion(value, event)) ||
             WaitForSingleObject(event, 2000) != WAIT_OBJECT_0 ||
             fence->GetCompletedValue() < value) return false;
-        if (FAILED(g_present_swap->Present(0, 0))) return false;
+        const HRESULT pr = g_present_swap->Present(0, 0);
+        if (pr == DXGI_STATUS_MODE_CHANGED)
+        {
+            // The mode changed under us. The present did not happen; treat
+            // it as a benign skip - the pipeline's resize path rebuilds the
+            // swapchain when the size follows, and the next frame presents
+            // normally. Presenting into the old surface until then is what
+            // froze the overlay black (v1.10-review H2).
+            Log("[fg] present reports a mode change - skipping a frame");
+            return true;
+        }
+        if (pr == DXGI_STATUS_OCCLUDED)
+        {
+            // The window is hidden (minimised target): benign.
+            return true;
+        }
+        if (FAILED(pr)) return false;
         RevealOnFirstPresent();
         ++shown;
         return true;
@@ -167,6 +207,14 @@ static void FgPresenter()
                     chosen->interval * (index + 1) / (chosen->count + 1));
                 // A delayed GPU copy must not cause a burst of obsolete generated frames.
                 if (std::chrono::steady_clock::now() >= deadline) continue;
+                if (g_fg_waitable != nullptr)
+                {
+                    // The compositor's pacing: wait for the back buffer to
+                    // be released instead of sleeping to a wall-clock
+                    // deadline that drifts against the vblank.
+                    if (WaitForSingleObject(g_fg_waitable, 2000) != WAIT_OBJECT_0)
+                        Log("[fg] waitable timeout - the compositor stalled");
+                }
                 if (!present(chosen->interpolated[index].get())) g_fg.failed = true;
                 std::unique_lock<std::mutex> lock(g_fg.mutex);
                 if (g_fg.wake.wait_until(lock, deadline, [&] {
@@ -177,7 +225,13 @@ static void FgPresenter()
                 })) break;
             }
         }
-        if (!g_fg.stop && !g_fg.failed && !present(chosen->real.get())) g_fg.failed = true;
+        if (!g_fg.stop && !g_fg.failed)
+        {
+            if (g_fg_waitable != nullptr
+                && WaitForSingleObject(g_fg_waitable, 2000) != WAIT_OBJECT_0)
+                Log("[fg] waitable timeout on the real frame");
+            if (!present(chosen->real.get())) g_fg.failed = true;
+        }
         previous = chosen->sequence;
         {
             std::lock_guard<std::mutex> lock(g_fg.mutex);
@@ -214,7 +268,22 @@ static bool EnsureFg(VideoState &v, DXGI_FORMAT format)
         wchar_t lib_path[MAX_PATH]; wcscpy_s(lib_path, libraries);
         wcscat_s(lib_path, L"nvngx_dlssg.dll");
         if (GetFileAttributesW(lib_path) != INVALID_FILE_ATTRIBUTES)
-            g_fg.module = LoadLibraryW(lib_path);
+        {
+            // The BYO file is verified (NVIDIA signature, machine-root
+            // chain, product name) before it is mapped - a writable folder
+            // next to the executable is otherwise the easiest DLL plant.
+            if (NsGateByoDll(lib_path, "nvngx_dlssg.dll"))
+            {
+                g_fg.module = LoadLibraryW(lib_path);
+                if (g_fg.module)
+                    Log("[fg] FG runtime from native\\libraries\\ (BYO, "
+                        "verified NVIDIA signature)");
+            }
+            else
+                Log("[fg] BYO refused: nvngx_dlssg.dll is not a "
+                    "NVIDIA-signed runtime - falling back to the bundled "
+                    "copy (%ls)", lib_path);
+        }
         if (!g_fg.module)
         {
             wcscpy_s(path, directory);
@@ -293,6 +362,25 @@ static bool EnsureFg(VideoState &v, DXGI_FORMAT format)
         D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(g_fg.disable_readback.put())))) return false;
     g_fg.w = w; g_fg.height = height; g_fg.mw = v.w; g_fg.mh = v.hgt; g_fg.format = format;
     g_fg.stop = false;
+    // R11 refined: latency 1 belongs to the FG presenter while it owns the
+    // present loop. The ordinary NR path presents Present(0,0) per frame and
+    // never consumes the waitable - with latency 1 the swapchain would hold
+    // a single queued present and every ordinary present would block or drop
+    // against the compositor (the fullscreen flicker). The waitable handle
+    // is taken here, from the same thread that will wait on it.
+    if (g_present_swap != nullptr)
+    {
+        IDXGISwapChain2 *sc2 = nullptr;
+        if (SUCCEEDED(g_present_swap->QueryInterface(
+                __uuidof(IDXGISwapChain2), reinterpret_cast<void **>(&sc2)))
+            && sc2 != nullptr)
+        {
+            sc2->SetMaximumFrameLatency(1);
+            g_fg_waitable = sc2->GetFrameLatencyWaitableObject();
+            sc2->Release();
+            Log("[fg] the presenter is paced by the compositor (latency 1)");
+        }
+    }
     g_fg.thread = std::thread(FgPresenter);
     Log("[fg] %ux enabled at %ux%u, format=%u; flat depth and estimated motion (experimental)", g_fg_count + 1, w, height, format);
     return true;

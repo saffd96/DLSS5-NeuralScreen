@@ -7,6 +7,7 @@ Every check reports PASS / FAIL / SKIP plus a reason. Exit: 0 = all PASS,
 1 = there is a FAIL.
 """
 import hashlib
+import re
 import json
 import os
 import subprocess
@@ -88,9 +89,9 @@ def personal_config_keys():
 
 
 def zip_integrity():
-    zpath = ROOT / "neuralscreen-v1.9.0-full.zip"
+    zpath = ROOT / "neuralscreen-v1.11.0-full.zip"
     if not zpath.is_file():
-        return False, "no neuralscreen-v1.9.0-full.zip"
+        return False, "no neuralscreen-v1.11.0-full.zip"
     required = [
         "main.py", "gpuinfo.py", "overlay_ui.py", "i18n.py", "recorder.py",
         "display.py", "guides.py", "hotkeys.py", "tray.py", "capture.py",
@@ -183,8 +184,12 @@ def zip_integrity():
         zsha = hashlib.sha256(zip_dll).hexdigest()
         if f"sha256 {zsha}" not in vt:
             return False, "VERSION.txt runtime sha != the DLL inside the archive"
-        if "NeuralScreen 1.9.0" not in vt:
-            return False, "VERSION.txt version does not match v1.9.0"
+        packer = (ROOT / "build_release_zip.py").read_text(encoding="utf-8")
+        m = re.search(r'VERSION = "([^"]+)"', packer)
+        if not m:
+            return False, "build_release_zip.py has no VERSION"
+        if f"NeuralScreen {m.group(1)}" not in vt:
+            return False, f"VERSION.txt version does not match {m.group(1)}"
     return True, f"{zpath.stat().st_size} bytes, all files, the hook, a default config, a truthful manifest"
 
 
@@ -323,6 +328,7 @@ def release_notes_short():
 
 # --- driving the running program (the GUI and smoke checks share this) ---
 LOG = ROOT / "NeuralScreen.log"
+_test_config_path = None
 KEYEVENTF_KEYUP = 0x0002
 _MOD_VK = {0x0002: 0x11, 0x0001: 0x12, 0x0004: 0x10}  # Ctrl / Alt / Shift
 
@@ -384,11 +390,34 @@ def running_instances():
             if "pythonw.exe" in l or "nvngx.dll" in l]
 
 
-def launch():
-    """Start the program the way a user does and return the log offset."""
+def launch(overrides: dict | None = None):
+    """Start the program with the DEFAULT config and return the log offset.
+
+    The worktree config.json is the user's live file - whatever they tweaked
+    last (split, theme, profile, work_scale) leaks straight into every smoke
+    and GUI check that launches the app "the way a user does". Tests want the
+    shipped defaults: git HEAD's config.json is copied to a disposable path
+    and passed with --config. The path is cleaned up at quit_app time.
+
+    overrides: a test that needs a specific launch state (menu open at
+    start, a theme) passes {key: value} - applied on top of the defaults,
+    so the user's file is never touched at all.
+    """
+    import json
+    global _test_config_path
     offset = log_offset()
-    subprocess.run(["cscript", "//nologo", "NeuralScreen.vbs"], cwd=ROOT,
-                   capture_output=True)
+    head = subprocess.run(["git", "show", "HEAD:config.json"], cwd=ROOT,
+                          capture_output=True)
+    cfg = json.loads(head.stdout.decode("utf-8"))
+    if overrides:
+        cfg.update(overrides)
+    path = ROOT / "_work" / "test-config.json"
+    path.parent.mkdir(exist_ok=True)
+    with path.open("w", encoding="utf-8") as fh:
+        json.dump(cfg, fh, indent=2)
+    _test_config_path = path
+    subprocess.run(["cscript", "//nologo", "NeuralScreen.vbs", "--config", str(path)],
+                   cwd=ROOT, capture_output=True)
     return offset
 
 
@@ -416,6 +445,11 @@ def quit_app(timeout=8.0):
         left = [l for l in text.splitlines()
                 if "pythonw.exe" in l or "nvngx.dll" in l]
         if not left:
+            try:
+                if _test_config_path and _test_config_path.is_file():
+                    _test_config_path.unlink()
+            except Exception:
+                pass
             return []
         time.sleep(0.5)
     return left

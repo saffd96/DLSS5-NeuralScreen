@@ -1776,6 +1776,22 @@ STRINGS['en'].update({'dlss_sr': 'DLSS Super Resolution', 'dlss_sr_hint': 'the n
 
 STRINGS['ru'].update({'dlss_sr': 'DLSS Super Resolution', 'dlss_sr_hint': 'сеть работает на пониженном разрешении;\nDLSS восстанавливает размер кадра (эксперимент)', 'dlss_sr_failed': 'DLSS Super Resolution не сработал. Нейрорендеринг продолжает работать.', 'dlss_sr_input': 'Входное разрешение DLSS', 'nr_min_hint': 'минимальный размер обработки ограничен автоматически', 'frame_generation': 'DLSS Frame Generation', 'frame_multiplier': 'Множитель кадров', 'ui_detection': 'Защита UI при генерации (эксперимент)'})
 
+for _strings in STRINGS.values():
+    _strings.update({
+        "fg_on": "DLSS FG ON",
+        "fg_off": "DLSS FG OFF",
+        "fg_fail": "Frame Generation could not start on this GPU - the switch is back off",
+        "hk_framegen": "Frame Generation on/off",
+    })
+STRINGS["ru"].update({
+    "fg_on": "DLSS FG ВКЛ",
+    "fg_off": "DLSS FG ВЫКЛ",
+    "fg_fail": "Генерация кадров не запустилась на этой видеокарте - переключатель выключен обратно",
+    "hk_framegen": "Генерация кадров вкл/выкл",
+})
+
+STRINGS['ru'].update({'frame_generation': 'DLSS Frame Generation', 'frame_multiplier': 'Множитель кадров'})
+
 STRINGS['fr'].update({'dlss_sr': 'DLSS Super Resolution', 'dlss_sr_hint': 'the network runs at a lower resolution;\nDLSS restores the output resolution (experimental)', 'dlss_sr_failed': 'DLSS Super Resolution failed. Neural rendering remains active.', 'dlss_sr_input': 'DLSS input resolution', 'nr_min_hint': 'minimum processing size is limited automatically', 'frame_generation': 'DLSS Frame Generation', 'frame_multiplier': 'Multiplicateur d’images', 'ui_detection': 'HUD protection in FG (experimental)'})
 
 STRINGS['de'].update({'dlss_sr': 'DLSS Super Resolution', 'dlss_sr_hint': 'the network runs at a lower resolution;\nDLSS restores the output resolution (experimental)', 'dlss_sr_failed': 'DLSS Super Resolution failed. Neural rendering remains active.', 'dlss_sr_input': 'DLSS input resolution', 'nr_min_hint': 'minimum processing size is limited automatically', 'frame_generation': 'DLSS Frame Generation', 'frame_multiplier': 'Bildmultiplikator', 'ui_detection': 'HUD protection in FG (experimental)'})

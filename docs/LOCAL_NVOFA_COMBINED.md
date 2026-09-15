@@ -45,3 +45,14 @@ NVOFA follow-up includes the single-update regression and cost-calibration harne
 See NVOFA_COST_VALIDATION.md: 71 captured pairs did not justify a global cost mask,
 so normal rendering still uses unfiltered NVOFA. The combined app smoke delivered
 2361 frames with NVOFA and HDR FG active and no guide-processing errors.
+
+## v1.11.0 integration (2026-09-15)
+
+Merged upstream main at 7a27455, including WGC queue draining, z-order fixes,
+FG refusal feedback and hotkey, GPU identity and NGX diagnostics. Retained SR,
+GPU LK, UI protection and opt-in library updates. Combined SR motion scaling and
+protocol commands coexist with parameter read-back and capture-stall resets.
+
+Validation: native build; 14 targeted Python/config/UI checks; GPU SR/DLAA toggle,
+resize and bypass; HDR FG dynamic multiplier with UI protection; prepared capture.
+Personal configuration is restored separately and is not committed.

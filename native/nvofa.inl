@@ -58,6 +58,14 @@ static bool NvofaError(const char *operation, NV_OF_STATUS status)
     return false;
 }
 
+// The pipeline rebuild (RNSZ) releases everything video-related: the latch
+// goes with it, so a transient failure that tripped NvofaError does not
+// permanently disable the backend until a process restart (v1.10-review M3).
+static void NvofaResetLatch()
+{
+    g_nvofa.failed = false;
+}
+
 static std::vector<uint32_t> NvofaCaps(NV_OF_CAPS capability)
 {
     auto &f = g_nvofa; uint32_t count = 0;
@@ -129,7 +137,16 @@ static bool EnsureNvofa(UINT width, UINT height)
     params.width = width; params.height = height;
     params.outGridSize = static_cast<NV_OF_OUTPUT_VECTOR_GRID_SIZE>(f.grid);
     params.mode = NV_OF_MODE_OPTICALFLOW; params.perfLevel = NV_OF_PERF_LEVEL_FAST;
-    params.enableOutputCost = NV_OF_TRUE; params.inputBufferFormat = NV_OF_BUFFER_FORMAT_GRAYSCALE8;
+    // M4 (v1.10-review): the cost buffer has no runtime consumer - the #72
+    // study declined a production mask. NS_NVOFA_COST=1 keeps the channel
+    // for the offline experiment (tests/experiment_nvofa_confidence.py);
+    // ordinary runs skip the per-frame cost computation.
+    char cost_env[8] = {};
+    const bool want_cost = GetEnvironmentVariableA("NS_NVOFA_COST", cost_env,
+                                                    sizeof(cost_env)) > 0
+                           && cost_env[0] == '1';
+    params.enableOutputCost = want_cost ? NV_OF_TRUE : NV_OF_FALSE;
+    params.inputBufferFormat = NV_OF_BUFFER_FORMAT_GRAYSCALE8;
     status = f.api.nvOFInit(f.session, &params);
     if (status != NV_OF_SUCCESS) return NvofaError("initialize", status);
     if (FAILED(h.dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(f.fence.put()))))
@@ -137,9 +154,10 @@ static bool EnsureNvofa(UINT width, UINT height)
     const UINT fw = (width + f.grid - 1) / f.grid, fh = (height + f.grid - 1) / f.grid;
     for (auto &input : f.inputs) input.attach(MakeTex(width, height, DXGI_FORMAT_R8_UNORM, false));
     f.flow.attach(MakeTex(fw, fh, DXGI_FORMAT_R16G16_SINT, true));
-    f.cost.attach(MakeTex(fw, fh, DXGI_FORMAT_R8_UINT, true));
+    if (want_cost) f.cost.attach(MakeTex(fw, fh, DXGI_FORMAT_R8_UINT, true));
+    unsigned resource_count = f.cost ? 4 : 3;
     ID3D12Resource *resources[] = {f.inputs[0].get(), f.inputs[1].get(), f.flow.get(), f.cost.get()};
-    for (unsigned i = 0; i < 4; ++i) {
+    for (unsigned i = 0; i < resource_count; ++i) {
         if (!resources[i]) return NvofaError("allocate buffers", NV_OF_ERR_OUT_OF_MEMORY);
         NV_OF_REGISTER_RESOURCE_PARAMS_D3D12 p{};
         p.resource = resources[i]; p.hOFGpuBuffer = &f.registered[i];
@@ -199,7 +217,12 @@ static bool RunNvofa(VideoState &v, bool reset, UINT64 *submitted)
     in.disableTemporalHints = reset || !f.valid ? NV_OF_TRUE : NV_OF_FALSE;
     in.numFencePoints = 1; in.fencePoint = &ready;
     NV_OF_EXECUTE_OUTPUT_PARAMS_D3D12 out{};
-    out.outputBuffer = f.registered[2]; out.outputCostBuffer = f.registered[3]; out.fencePoint = &complete;
+    out.outputBuffer = f.registered[2];
+    // The driver rejects a valid outputCostBuffer while enableOutputCost is
+    // unset (NvOFExecute error 4): with cost off, registered[3] stays null
+    // and must be handed over as null too.
+    out.outputCostBuffer = f.cost ? f.registered[3] : nullptr;
+    out.fencePoint = &complete;
     auto status = f.api.nvOFExecuteD3D12(f.session, &in, &out);
     if (status != NV_OF_SUCCESS) { --f.value; return NvofaError("execute", status); }
     if (FAILED(h.queue->Wait(f.fence.get(),f.value)) || !BeginCommands())
