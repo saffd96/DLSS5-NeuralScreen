@@ -38,7 +38,9 @@ def main():
     assert protocol.struct.unpack(protocol.FRAME_FMT,worker.stdin.getvalue()[-size:])[2]==200
     pygame.init()
     try:
-        menu=build();menu.set_state({'detail_strength':.4,'lang':'ru'});menu.layout(3840,2160);paint(menu)
+        menu=build();menu.set_state({'detail_strength':.4,'lang':'ru','dlss_sr':False});menu.layout(3840,2160);paint(menu)
+        assert find(menu,'slider','detail_strength') is None
+        menu.set_state({'dlss_sr':True});menu.layout(3840,2160);paint(menu)
         item=find(menu,'slider','detail_strength');assert item is not None and item.value==.4
         track=item.extra['track']
         position=(track.right-1,track.centery)
@@ -46,6 +48,10 @@ def main():
         menu.handle_event(pygame.event.Event(pygame.MOUSEBUTTONUP,pos=position,button=1))
         assert ('detail_strength',2.0) in actions, actions
         assert menu.state['detail_strength']==2.0
+        menu.set_state({'dlss_sr':False});menu.layout(3840,2160);paint(menu)
+        assert find(menu,'slider','detail_strength') is None
+        menu.set_state({'dlss_sr':True});menu.layout(3840,2160);paint(menu)
+        assert find(menu,'slider','detail_strength').value==2.0
         st=SimpleNamespace(cfg={},lang='ru')
         with patch.object(settings_io,'save_menu_layout') as save:
             commands.apply_menu_action(st,('detail_strength',2.0))

@@ -56,7 +56,7 @@ static bool EnsureDetail(VideoState &v)
     return true;
 }
 
-// Run once on real NR output, before HDR reconstruction, FG and pixel export.
+// Run only after active SR/DLAA, before HDR reconstruction, FG and pixel export.
 // Strength zero does not allocate, copy, or dispatch. Bypass never calls here.
 static void ApplyDetail(VideoState &v)
 {

@@ -1,7 +1,8 @@
 # Output sharpness
 
-The main menu's Sharpness slider controls a spatial GPU filter after neural
-rendering and SR/DLAA, before HDR reconstruction, frame generation and export.
+The main menu's Sharpness slider appears and runs only with SR/DLAA enabled,
+after neural rendering and SR/DLAA, before HDR reconstruction, frame generation and export.
+Disabling SR/DLAA disables sharpening but preserves its chosen strength.
 It does not change the resolution or the existing SR/DLAA behavior.
 
 The range is 0?200%. Start around 50%; 0% disables the pass completely (no allocation, copy or

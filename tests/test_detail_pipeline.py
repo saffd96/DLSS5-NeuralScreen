@@ -62,7 +62,17 @@ def capture(name, sr, scale, baseline=False):
                 out = np.frombuffer(exact(worker.stdout, a[3]), np.uint8).reshape(h, w, 4).copy()
             results.append(out)
             cv2.imwrite(str(folder/f'{name}-{len(results)}-{strength}-baseline{int(baseline)}.png'), cv2.cvtColor(out, cv2.COLOR_RGBA2BGRA))
-        control(wire.DETAIL_MAGIC, 100)
+        # Keep saved strength while SR is toggled off and back on live.
+        control(wire.DETAIL_MAGIC, 0 if baseline else 200)
+        for enabled in (False, sr):
+            for _ in range(3):
+                wire.send_frame(worker, index, source, motion, True, index, dlss_sr=enabled)
+                index += 1
+                a = ack()
+                assert a[3] == w*h*4
+                out = np.frombuffer(exact(worker.stdout, a[3]), np.uint8).reshape(h, w, 4).copy()
+            results.append(out)
+        control(wire.DETAIL_MAGIC, 200)
         wire.send_frame(worker, index, source, motion, True, index, bypass=True, dlss_sr=sr)
         index += 1
         a = ack()
@@ -90,16 +100,19 @@ if __name__ == '__main__':
             # Compare matching frame positions in an unsharpened control run,
             # not unrelated frames at different points in its initialization.
             deltas = []
-            for strength, raw, out in zip((0, 100, 200, 0), baseline, enhanced):
+            for strength, raw, out in zip((0, 100, 200, 0, 0, 200), baseline, enhanced):
                 delta = np.abs(out.astype(int)-raw.astype(int))
                 assert np.array_equal(raw[:, :, 3], out[:, :, 3]), 'alpha changed'
-                if strength == 0:
+                if strength == 0 or not mode[1]:
                     assert np.array_equal(raw, out), f'{mode[0]}: zero changed pixels'
                 else:
                     assert delta.max() <= 31, 'unbounded sharpening'
                     assert np.count_nonzero(delta) > 1000, 'too few affected pixels'
                     deltas.append(delta.max())
-            assert deltas[0] >= 2 and deltas[1] > deltas[0], 'weak slider response'
-            print(f'PASS {mode[0]}: max changes 100%={deltas[0]}, 200%={deltas[1]}; zero and bypass exact', flush=True)
+            if mode[1]:
+                assert deltas[0] >= 2 and deltas[1] > deltas[0], 'weak slider response'
+                print(f'PASS {mode[0]}: max changes 100%={deltas[0]}, 200%={deltas[1]}; zero and bypass exact', flush=True)
+            else:
+                print('PASS: SR/DLAA off: all sharpness strengths leave NR output pixel-exact', flush=True)
     else:
         print('SKIP: requires --run and NVIDIA runtime')
