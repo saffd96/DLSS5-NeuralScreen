@@ -21,3 +21,12 @@ Validation:
 - `runtime/python.exe tests/test_motion_floor.py`
 
 The native tests require Windows and an NVIDIA GPU; shader tests use WARP and MSVC.
+
+## Native-size passthrough
+
+At 100% input resolution SR/DLAA is bypassed. The ordinary NR result is used
+without an extra temporal reconstruction pass. The same applies when the minimum
+size guard rounds the requested input back to output size. This is not DLAA;
+the UI labels the endpoint 1:1. It avoids the softness observed with captured
+frames that lack native engine depth and jitter. Below native size SR remains
+experimental. The GPU regression checks that native SR on/off output is byte-exact.
