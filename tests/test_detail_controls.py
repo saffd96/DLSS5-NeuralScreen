@@ -13,11 +13,13 @@ os.environ.setdefault('SDL_VIDEODRIVER','dummy')
 import pygame
 import commands
 import protocol
+import pipeline
 import settings_io
 from test_config_atomic import GOOD,_payload
 from test_ui_buttons import build,paint,find
 
 def main():
+    assert pipeline._log_wanted("[detail] unavailable; keeping NR output")
     with tempfile.TemporaryDirectory() as tmp:
         path=Path(tmp)/'config.json'
         for value,expected in [(None,0),('bad',0),(-1,0),(2,1),(.4,.4),(float('nan'),0)]:
