@@ -50,7 +50,7 @@ def main():
         send = Mock()
         namespace = dict(st=st, bypass=bypass, motion_status=status, time=time, sys=sys,
                          check_worker=Mock(), prepare_capture=capture, send_frame=send,
-                         _perf=Mock(), sync_sr_scale=Mock(), send_ui_regions=Mock())
+                         _perf=Mock(), sync_detail=Mock(), sync_sr_scale=Mock(), send_ui_regions=Mock())
         exec(code, namespace)
         assert calls == (['capture'] if bypass else ['capture', 'guides'])
         assert send.call_count == 1

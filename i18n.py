@@ -1829,3 +1829,7 @@ STRINGS["ru"]["gpu_motion_hint"] = "Резкое движение: искаже�
 for _table in STRINGS.values():
     _table["dlss_sr_hint"] += "\n100%: DLAA (native-resolution anti-aliasing; additional GPU work)."
 STRINGS["ru"]["dlss_sr_hint"] = "На пониженном разрешении DLSS восстанавливает размер кадра.\n100%: DLAA — сглаживание без апскейла, с дополнительной нагрузкой на GPU."
+
+for _table in STRINGS.values():
+    _table["detail_strength"] = "Sharpness"
+STRINGS["ru"]["detail_strength"] = "\u0420\u0435\u0437\u043a\u043e\u0441\u0442\u044c"
