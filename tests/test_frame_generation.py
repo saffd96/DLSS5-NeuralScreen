@@ -30,7 +30,7 @@ def exact(pipe, count):
     return result
 
 
-def run(hdr=False, dynamic=False, check_pixels=False, sr=False, ui=False, detail=False):
+def run(hdr=False, dynamic=False, check_pixels=False, sr=False, ui=False):
     w, h = 640, 360
     work_w, work_h = (428, 240) if sr else (w, h)
     if hdr:
@@ -61,10 +61,6 @@ def run(hdr=False, dynamic=False, check_pixels=False, sr=False, ui=False, detail
         worker.stdin.write(struct.pack(wire.HEADER_FMT, wire.VIDEO_MAGIC,
             work_w, work_h, 1, 0, 0, 0, 1, 0, 0, 1., 1., 1., -1., w, h))
         worker.stdin.flush()
-        if detail:
-            worker.stdin.write(struct.pack(wire.FRAME_FMT,wire.DETAIL_MAGIC,0,50,0,0));worker.stdin.flush()
-            assert struct.unpack(wire.OUT_FMT,exact(worker.stdout,struct.calcsize(wire.OUT_FMT)))[2]==1
-
         if hdr:
             wire.send_wgc(worker, hwnd)
             ack = struct.unpack(wire.WGC_ACK_FMT, exact(worker.stdout, struct.calcsize(wire.WGC_ACK_FMT)))
@@ -188,6 +184,6 @@ def run(hdr=False, dynamic=False, check_pixels=False, sr=False, ui=False, detail
 
 if __name__ == "__main__":
     if "--run" in sys.argv or "--hdr" in sys.argv or "--dynamic" in sys.argv:
-        run("--hdr" in sys.argv, "--dynamic" in sys.argv, "--check-pixels" in sys.argv, "--sr" in sys.argv, "--ui" in sys.argv, "--detail" in sys.argv)
+        run("--hdr" in sys.argv, "--dynamic" in sys.argv, "--check-pixels" in sys.argv, "--sr" in sys.argv, "--ui" in sys.argv)
     else:
         print("SKIP: opt-in DLSS-G/GPU test; pass --run")

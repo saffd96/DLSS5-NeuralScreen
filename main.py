@@ -142,7 +142,7 @@ from protocol import (  # noqa: F401
     SHM_MAGIC, VIDEO_MAGIC, WGC_ACK_FMT, WGC_ACK_MAGIC, WGC_FMT,
     WGC_MAGIC, WINDOW_ACK_FMT, WINDOW_ACK_MAGIC, WINDOW_FLAG_CAPTURABLE,
     WINDOW_FLAG_DISABLE, WINDOW_FMT, WINDOW_MAGIC, WorkerReader,
-    _read_exact, sync_detail, sync_sr_scale, prepare_capture, send_ui_regions, send_dda, send_frame, send_gray, send_motion_size,
+    _read_exact, sync_sr_scale, prepare_capture, send_ui_regions, send_dda, send_frame, send_gray, send_motion_size,
     send_out, send_resize, send_wgc, send_window)
 
 
@@ -613,7 +613,6 @@ def main() -> int:
             try:
                 check_worker(st.worker, st.worker_logs)
                 sync_sr_scale(st.worker, st.reader, float(st.cfg.get("dlss_sr_scale", .65)))
-                sync_detail(st.worker, st.reader, float(st.cfg.get("detail_strength", 0.0)))
                 if st.gray_active:
                     prepare_capture(st.worker, st.reader, st.frame_index, st.pts)
                 try:

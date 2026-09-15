@@ -192,7 +192,6 @@ class OverlayMenu:
             # report); the HUD pairs it with the network fps. None while off.
             "display_fps": None,
             "dlss_sr_scale": .65,
-            "detail_strength": 0.0,
             "dlss_sr": False,
             "ui_detection": False,
             "frame_generation": False,
@@ -1026,13 +1025,9 @@ class OverlayMenu:
                 except ValueError:
                     pass
                 if sr_scale >= 1.0:
-                    sr_size += " (1:1)"
+                    sr_size += " (DLAA)"
                 slider("dlss_sr_scale", .25, 1.0, sr_scale, s["dlss_sr_input"],
-                       value_text=sr_size, ends=("25%", "100% (1:1)"))
-
-            detail = float(self.state.get("detail_strength", 0.0))
-            slider("detail_strength", 0.0, 1.0, detail, s["detail_strength"],
-                   value_text=f"{int(detail*100+.5)}%", ends=("0%", "100%"))
+                       value_text=sr_size, ends=("25%", "100% (DLAA)"))
 
             # What is being processed - the first question anyone has, and
             # until now the only one answered on another page. The segment
@@ -1694,9 +1689,6 @@ class OverlayMenu:
         if item.key == "split":
             self.state["split"] = value
             return [("split", value)]
-        if item.key == "detail_strength":
-            self.state["detail_strength"] = value
-            return [("detail_strength", value)]
         if item.key == "dlss_sr_scale":
             self.state["dlss_sr_scale"] = value
             return [("dlss_sr_scale", value)]

@@ -56,11 +56,3 @@ protocol commands coexist with parameter read-back and capture-stall resets.
 Validation: native build; 14 targeted Python/config/UI checks; GPU SR/DLAA toggle,
 resize and bypass; HDR FG dynamic multiplier with UI protection; prepared capture.
 Personal configuration is restored separately and is not committed.
-
-## Clarity experiment (2026-09-15)
-
-Native-size SR now bypasses DLAA and preserves ordinary NR output. A separate
-Sharpness slider works after NR, defaults off, and has a no-dispatch zero path.
-See DETAIL_EXPERIMENT.md for GPU timing, tests and the rejected Real-ESRGAN
-model/runtime experiment. The SR fixes are committed in feature/dlss-super-resolution
-and integrated here; personal settings remain local.

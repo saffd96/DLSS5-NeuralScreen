@@ -423,19 +423,6 @@ def sync_sr_scale(worker, reader, scale: float) -> None:
     worker._sr_scale_sent = percent
 
 
-DETAIL_MAGIC = 0x31524853  # SHR1
-
-
-def sync_detail(worker, reader, strength: float) -> None:
-    percent = min(100, max(0, int(round(strength * 100))))
-    if getattr(worker, "_detail_sent", None) == percent:
-        return
-    worker.stdin.write(struct.pack(FRAME_FMT, DETAIL_MAGIC, 0, percent, 0, 0))
-    worker.stdin.flush()
-    reader.recv(0, timeout=5.0)
-    worker._detail_sent = percent
-
-
 def prepare_capture(worker, reader, index: int, pts: int) -> None:
     """Latch capture and gray together; FRM1 will consume that exact capture."""
     worker.stdin.write(struct.pack(FRAME_FMT, CAPTURE_MAGIC, index, 0, 0, pts))

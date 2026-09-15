@@ -1827,9 +1827,5 @@ STRINGS["ru"]["gpu_motion"] = "Расчёт движения на GPU (эксп�
 STRINGS["ru"]["gpu_motion_hint"] = "Резкое движение: искажения. Смена режима: перезапуск."
 
 for _table in STRINGS.values():
-    _table["dlss_sr_hint"] += "\n100%: bypass DLSS, preserve the NR output."
-STRINGS["ru"]["dlss_sr_hint"] = "DLSS: \u043c\u0435\u043d\u044c\u0448\u0435 100% \u2014 \u0430\u043f\u0441\u043a\u0435\u0439\u043b; 100% \u2014 \u0431\u0435\u0437 \u043e\u0431\u0440\u0430\u0431\u043e\u0442\u043a\u0438 DLSS."
-
-for _table in STRINGS.values():
-    _table["detail_strength"] = "Sharpness"
-STRINGS["ru"]["detail_strength"] = "\u0420\u0435\u0437\u043a\u043e\u0441\u0442\u044c"
+    _table["dlss_sr_hint"] += "\n100%: DLAA (native-resolution anti-aliasing; additional GPU work)."
+STRINGS["ru"]["dlss_sr_hint"] = "На пониженном разрешении DLSS восстанавливает размер кадра.\n100%: DLAA — сглаживание без апскейла, с дополнительной нагрузкой на GPU."
