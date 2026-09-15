@@ -42,6 +42,13 @@ def run():
             out=np.frombuffer(exact(p.stdout,a[3]),np.uint8).reshape(oh,ow,4)
             if bypass:assert np.array_equal(out,frame),'SR changed bypass'
             assert out[:,:,:3].mean()>20,'black output'
+        # Native-size SR is an identity routing choice, including history reset.
+        native_outputs=[]
+        for index,enabled in ((80,True),(81,False)):
+            wire.send_frame(p,index,frame,np.zeros((h,w,2),np.float16),True,index,dlss_sr=enabled)
+            a=ack(wire.OUT_FMT);assert a[2]==1 and a[3]==ow*oh*4,a
+            native_outputs.append(bytes(exact(p.stdout,a[3])))
+        assert native_outputs[0]==native_outputs[1], 'native-size SR changed the NR output'
         p.stdin.close();p.wait(timeout=10)
     finally:
         if p.poll() is None:p.kill();p.wait()
