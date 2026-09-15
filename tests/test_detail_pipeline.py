@@ -51,7 +51,7 @@ def capture(name, sr, scale, baseline=False):
         index = 0
         control(wire.SR_SCALE_MAGIC, scale)
         results = []
-        for strength in (0, 50, 100, 0):
+        for strength in (0, 100, 200, 0):
             control(wire.DETAIL_MAGIC, 0 if baseline else strength)
             # Reset identical source to isolate spatial changes from history.
             for _ in range(3):
@@ -90,7 +90,7 @@ if __name__ == '__main__':
             # Compare matching frame positions in an unsharpened control run,
             # not unrelated frames at different points in its initialization.
             deltas = []
-            for strength, raw, out in zip((0, 50, 100, 0), baseline, enhanced):
+            for strength, raw, out in zip((0, 100, 200, 0), baseline, enhanced):
                 delta = np.abs(out.astype(int)-raw.astype(int))
                 assert np.array_equal(raw[:, :, 3], out[:, :, 3]), 'alpha changed'
                 if strength == 0:
@@ -100,6 +100,6 @@ if __name__ == '__main__':
                     assert np.count_nonzero(delta) > 1000, 'too few affected pixels'
                     deltas.append(delta.max())
             assert deltas[0] >= 2 and deltas[1] > deltas[0], 'weak slider response'
-            print(f'PASS {mode[0]}: max changes 50%={deltas[0]}, 100%={deltas[1]}; zero and bypass exact', flush=True)
+            print(f'PASS {mode[0]}: max changes 100%={deltas[0]}, 200%={deltas[1]}; zero and bypass exact', flush=True)
     else:
         print('SKIP: requires --run and NVIDIA runtime')

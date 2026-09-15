@@ -4,7 +4,7 @@ The main menu's Sharpness slider controls a spatial GPU filter after neural
 rendering and SR/DLAA, before HDR reconstruction, frame generation and export.
 It does not change the resolution or the existing SR/DLAA behavior.
 
-Start around 50%; 0% disables the pass completely (no allocation, copy or
+The range is 0?200%. Start around 50%; 0% disables the pass completely (no allocation, copy or
 dispatch). NR OFF remains an unprocessed bypass. Strength is saved locally.
 Changes apply without restarting the worker and force a refresh of static frames.
 

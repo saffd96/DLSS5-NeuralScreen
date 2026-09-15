@@ -142,9 +142,18 @@ int main(int argc, char**) {
    halfEffect=(std::max)(halfEffect,a);fullEffect=(std::max)(fullEffect,b);
   }
   check(halfEffect>=1 && fullEffect>=3 && fullEffect>halfEffect,"soft detail suppressed");
+  params.strength=2;dispatch(kDetailHlsl,{input.Get()},output.Get(),&params);
+  auto twice=read(output.Get(),4);
+  check(twice!=full,"200% is clamped to 100%");
+  for(UINT i=0;i<W*H*4;i+=4) {
+   check(abs(int(twice[i])-pixels[i])>=abs(int(full[i])-pixels[i]),"200% weakened effect");
+   check(abs(int(twice[i])-pixels[i])<=31,"200% exceeded bounds");
+   check(twice[i+3]==pixels[i+3],"200% changed alpha");
+  }
   params.strength=0;dispatch(kDetailHlsl,{input.Get()},output.Get(),&params);
   check(read(output.Get(),4)==pixels,"returning to zero changed pixels");
   std::fill(pixels.begin(),pixels.end(),static_cast<unsigned char>(100));
+  params.strength=2;
   input=texture(DXGI_FORMAT_R8G8B8A8_UNORM,pixels.data(),4);
   dispatch(kDetailHlsl,{input.Get()},output.Get(),&params);
   check(read(output.Get(),4)==pixels,"flat area changed");
