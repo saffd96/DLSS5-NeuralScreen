@@ -2034,6 +2034,7 @@ struct VideoState
 // presentation path with the switch off, and the screen went black.
 static bool g_capture_float = false;
 static bool g_hdr_capture = false;
+static bool g_nr_frame_enabled = true;
 static HMONITOR g_capture_monitor = nullptr;
 static HdrDisplayInfo g_capture_display;
 static float g_hdr_frame_white = 1.0f;
@@ -2581,7 +2582,7 @@ static bool PresentFrame(VideoState &v, UINT64 *submitted = nullptr)
 {
     if (!RebuildPresentIfStale()) return false;
     if (submitted) *submitted = 0;
-    if (g_hdr_capture) return PresentHdr(v, false);
+    if (g_hdr_capture && g_nr_frame_enabled) return PresentHdr(v, false);
     // Only when HDR compatibility is on. With it off there is nothing to put
     // back: the swap chain was created R8G8B8A8 and no HDR frame has ever
     // touched it, so the call has nothing to do - and it is not free. 1.8.0
@@ -2662,7 +2663,7 @@ static bool PresentBypass(VideoState &v)
 {
     if (!RebuildPresentIfStale()) return false;
     StopFgPresentation();
-    if (g_hdr_capture) return PresentHdr(v, true);
+    if (g_hdr_capture && g_nr_frame_enabled) return PresentHdr(v, true);
     // Same as PresentFrame: nothing to restore unless HDR has been on (#58).
     if (HdrEnabled() && !EnsurePresentFormat(false)) return false;
     ID3D12Resource *bb = nullptr;
@@ -5184,6 +5185,38 @@ static bool SetVerifiedU(NVSDK_NGX_Parameter *p, const char *name, unsigned int 
 #include "super_resolution.inl"
 #include "detail_enhancement.inl"
 
+// NR OFF retains independently enabled spatial/temporal effects. No NR
+// evaluate or Boost composite occurs here; output remains full resolution.
+static bool EvaluateIndependent(VideoState &v, bool reset)
+{
+    const bool use_sr = EnsureSr(v, false);
+    if (!BeginCommands()) return false;
+    if (use_sr) {
+        PrepareSrInput(v);
+        auto to_uav = Transition(g_sr.input.get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        h.list->ResourceBarrier(1, &to_uav);
+        ScaleColorInto(g_sr.raw.get(), g_sr.w, g_sr.height, g_sr.input.get(), g_sr.w, g_sr.height, 0);
+        auto to_srv = Transition(g_sr.input.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        h.list->ResourceBarrier(1, &to_srv);
+        EvaluateSr(v, reset);
+    } else {
+        D3D12_RESOURCE_BARRIER before[] = {
+            Transition(v.color.tex, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE),
+            Transition(v.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST)};
+        h.list->ResourceBarrier(2, before);
+        h.list->CopyResource(v.output, v.color.tex);
+        D3D12_RESOURCE_BARRIER after[] = {
+            Transition(v.color.tex, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+            Transition(v.output, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)};
+        h.list->ResourceBarrier(2, after);
+    }
+    ApplyDetail(v);
+    const UINT64 fence = EndCommands();
+    return fence != 0 && ProfileWait(PS_EVAL, fence, 60000);
+}
+
 static bool EvaluateVideo(VideoState &v, int reset, UINT64 *submitted = nullptr)
 {
     if (submitted) *submitted = 0;
@@ -6211,6 +6244,17 @@ static int RunVideo()
             if (!WriteExact(g_wire, &ack, sizeof(ack))) return 10;
             continue;
         }
+        const bool nr_enabled = (fh.reserved & FRAME_FLAG_BYPASS) == 0 && h.feature != nullptr;
+        const bool nr_changed = nr_enabled != g_nr_frame_enabled;
+        if (nr_changed) {
+            g_nr_frame_enabled = nr_enabled;
+            g_sr.history = false;
+            g_force_next_frame = true;
+            fh.reset = 1;
+            StopFgPresentation();
+            Log("[video] NR %s; independent effects remain enabled; HDR %s",
+                nr_enabled ? "on" : "off", nr_enabled ? "follows setting" : "off");
+        }
         ConfigureSrFrame(fh.reserved);
         ConfigureFgFrame(fh.reserved);
         g_ui_regions.clear();
@@ -6409,11 +6453,12 @@ static int RunVideo()
                 ? SplitXFromFlags(fh.reserved, v.upscale ? v.full_w : v.w) : 0u;
             g_force_next_frame = false;
             const double t_up = PhaseNow();
-            const bool try_nvofa = NvofaRequested() && !g_nvofa.failed && g_gray_mapped;
+            const bool needs_motion = nr_enabled || SrRequested() || FgRequested();
+            const bool try_nvofa = needs_motion && NvofaRequested() && !g_nvofa.failed && g_gray_mapped;
             const bool nvofa_used = try_nvofa && RunNvofa(v, fh.reset != 0, defer_tail ? &upload_done : nullptr);
             if (try_nvofa && !nvofa_used) fh.reset = 1; // do not reuse history after backend failure
             static bool gpu_failed = false;
-            const bool try_gpu = !NvofaRequested() && GpuMotionExperiment() && !gpu_failed && g_gray_mapped;
+            const bool try_gpu = needs_motion && !NvofaRequested() && GpuMotionExperiment() && !gpu_failed && g_gray_mapped;
             const bool gpu_used = try_gpu && RunGpuMotionExperiment(v, fh.reset != 0, defer_tail ? &upload_done : nullptr);
             if (try_gpu && !gpu_used) {
                 gpu_failed = true; fh.reset = 1;
@@ -6434,7 +6479,7 @@ static int RunVideo()
             PhaseAdd(PH_UPLOAD, t_up);
             if (!up_ok) return 6;
         }
-        if (!warmup_done)
+        if (!warmup_done && nr_enabled)
         {
             // No feature (SAFE PASSTHROUGH): nothing to warm up - the raw
             // frame goes out as-is. Evaluating with a null handle would
@@ -6457,9 +6502,10 @@ static int RunVideo()
         const UINT previous_hdr_split = g_hdr_split;
         g_hdr_split = (fh.reserved & FRAME_FLAG_SPLIT) ?
             SplitXFromFlags(fh.reserved, v.upscale ? v.full_w : v.w) : UINT_MAX;
-        const bool bypass = (fh.reserved & FRAME_FLAG_BYPASS) != 0 || h.feature == nullptr;
+        const bool independent = !nr_enabled && (SrRequested() || FgRequested() || g_detail_strength != 0);
+        const bool bypass = !nr_enabled && !independent;
         if (bypass) g_sr.history = false;
-        g_fg_reset = frame == 0 || fh.reset != 0 || bypass
+        g_fg_reset = frame == 0 || fh.reset != 0 || nr_changed || bypass
                      || previous_hdr_split != g_hdr_split
                      || (stall_pending && source_fresh);
         // The NR evaluate shares the same stall reset: one forced reset
@@ -6469,8 +6515,10 @@ static int RunVideo()
         if (!bypass)
         {
             const double t_eval = PhaseNow();
-            const bool ev_ok = EvaluateVideo(v, (frame == 0 || fh.reset != 0) ? 1 : 0,
-                                             defer_tail ? &eval_done : nullptr);
+            const bool ev_ok = nr_enabled
+                ? EvaluateVideo(v, (frame == 0 || fh.reset != 0) ? 1 : 0,
+                                defer_tail ? &eval_done : nullptr)
+                : EvaluateIndependent(v, frame == 0 || fh.reset != 0);
             PhaseAdd(PH_EVAL, t_eval);
             if (!ev_ok) return 9;
             if (defer_tail && eval_done <= upload_done)

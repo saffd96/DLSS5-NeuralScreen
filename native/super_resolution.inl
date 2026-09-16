@@ -50,7 +50,7 @@ static void ConfigureSrFrame(uint32_t flags)
     Log("[sr] UI: %s", enabled ? "on" : "off");
 }
 
-static bool EnsureSr(VideoState &v)
+static bool EnsureSr(VideoState &v, bool neural = true)
 {
     if (!SrRequested()) { g_sr.history = false; return false; }
     const UINT ow = v.upscale ? v.full_w : v.w, oh = v.upscale ? v.full_h : v.hgt;
@@ -59,8 +59,8 @@ static bool EnsureSr(VideoState &v)
     SafeProcessingSize(ow,oh,sw,sh);
     // Boost is relative to the already reduced SR input, independently of
     // the motion grid. No full-size NR/composite is needed on this path.
-    UINT nw = v.nr_small ? std::max(64u, UINT((uint64_t(sw)*v.nr_w + ow)/(2*ow))*2) : sw;
-    UINT nh = v.nr_small ? std::max(64u, UINT((uint64_t(sh)*v.nr_h + oh)/(2*oh))*2) : sh;
+    UINT nw = neural && v.nr_small ? std::max(64u, UINT((uint64_t(sw)*v.nr_w + ow)/(2*ow))*2) : sw;
+    UINT nh = neural && v.nr_small ? std::max(64u, UINT((uint64_t(sh)*v.nr_h + oh)/(2*oh))*2) : sh;
     SafeProcessingSize(sw,sh,nw,nh);
     if (g_sr.feature && g_sr.w == sw && g_sr.height == sh &&
         g_sr.ow == ow && g_sr.oh == oh && g_sr.nw == nw && g_sr.nh == nh) return true;

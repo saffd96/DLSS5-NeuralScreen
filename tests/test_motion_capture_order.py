@@ -26,7 +26,8 @@ def main():
                    body=blocks, orelse=[])
     code = compile(ast.fix_missing_locations(ast.Module(body=[loop], type_ignores=[])),
                    'production-send-block', 'exec')
-    for hardware, bypass in ((False, False), (True, False), (True, True)):
+    for hardware, bypass, effects in ((False, False, False), (True, False, False), (True, True, False), (True, True, True)):
+        needs_guides = not bypass or effects
         calls = []
         frame = object()
         guide = SimpleNamespace(motion=object(), reset=False, ui_regions=())
@@ -42,7 +43,7 @@ def main():
                                  zero_guide=Mock(return_value=guide), previous_gray=object())
         worker = object()
         st = SimpleNamespace(worker=worker, worker_logs=[], reader=object(),
-             cfg={'motion_backend': 'nvofa'}, gray_active=True, frame_index=7, pts=70,
+             cfg={'motion_backend': 'nvofa', 'dlss_sr': effects}, gray_active=True, frame_index=7, pts=70,
              guides=guides, shm=SimpleNamespace(read_gray=lambda: frame), work_frame=None,
              pending_shot=None, recorder=None, motion_small=True, dda_mode=True,
              split_pos=0, lang='en', guide_fails=0)
@@ -52,11 +53,11 @@ def main():
                          check_worker=Mock(), prepare_capture=capture, send_frame=send,
                          _perf=Mock(), sync_detail=Mock(), sync_sr_scale=Mock(), send_ui_regions=Mock())
         exec(code, namespace)
-        assert calls == (['capture'] if bypass else ['capture', 'guides'])
+        assert calls == (['capture', 'guides'] if needs_guides else ['capture'])
         assert send.call_count == 1
         assert send.call_args.kwargs['prepared'] is True
-        assert guides.process.call_count == (0 if bypass else 1)
-        if bypass:
+        assert guides.process.call_count == (1 if needs_guides else 0)
+        if not needs_guides:
             assert guides.previous_gray is None
             guides.zero_guide.assert_called_once()
     print('PASS: capture precedes one guide update; NVOFA skips DIS; bypass skips guides')

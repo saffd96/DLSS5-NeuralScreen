@@ -75,8 +75,8 @@ def capture(name, sr, scale, baseline=False, source_image=None, strengths=(0, 50
                 assert a[3] == w*h*4
                 out = np.frombuffer(exact(worker.stdout, a[3]), np.uint8).reshape(h, w, 4).copy()
             results.append(out)
-        control(wire.DETAIL_MAGIC, 100)
-        wire.send_frame(worker, index, source, motion, True, index, bypass=True, dlss_sr=sr)
+        control(wire.DETAIL_MAGIC, 0)
+        wire.send_frame(worker, index, source, motion, True, index, bypass=True, dlss_sr=False)
         index += 1
         a = ack()
         assert np.array_equal(np.frombuffer(exact(worker.stdout, a[3]), np.uint8).reshape(h, w, 4), source)

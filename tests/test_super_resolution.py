@@ -37,7 +37,7 @@ def run():
             motion=np.zeros((h,w,2),np.float16);motion[:,:,0]=-3*w/ow
             bypass=45<=i<48
             sr=10<=i<55 or i>=60
-            wire.send_frame(p,i,frame,motion,i in (0,35,48,60),i,bypass=bypass,dlss_sr=sr)
+            wire.send_frame(p,i,frame,motion,i in (0,35,48,60),i,bypass=bypass,dlss_sr=sr and not bypass)
             a=ack(wire.OUT_FMT);assert a[2]==1 and a[3]==ow*oh*4,a
             out=np.frombuffer(exact(p.stdout,a[3]),np.uint8).reshape(oh,ow,4)
             if bypass:assert np.array_equal(out,frame),'SR changed bypass'
@@ -49,7 +49,7 @@ def run():
     log=b''.join(logs).decode('utf-8','replace')
     print(log)
     assert p.returncode==0,p.returncode
-    assert log.count('[sr] ready:')==8,log
+    assert log.count('[sr] ready:')==9,log  # raw comparison explicitly disables/re-enables SR
     assert 'reduced 480x270 -> NR 320x180 -> SR input 480x270 -> 960x540' in log
     assert 'reduced 480x270 -> NR 256x144 -> SR input 480x270 -> 960x540' in log
     assert 'reduced 480x270 -> NR 480x270 -> SR input 480x270 -> 960x540' in log

@@ -1,13 +1,13 @@
 # Output sharpness
 
 The main menu's Sharpness switch enables the filter independently of SR/DLAA.
-Its 0?100% slider appears while enabled. Turning it off preserves the chosen
+Its 0-100% slider appears while enabled. Turning it off preserves the chosen
 strength and sends zero to the worker; turning it back on restores that value.
-It runs on neural output before HDR reconstruction, frame generation and export.
+It runs on captured or neural output before presentation, frame generation and export.
 It does not change the resolution or the existing SR/DLAA behavior.
 
-The range is 0?100%. Start around 50%; 0% disables the pass completely (no allocation, copy or
-dispatch). NR OFF remains an unprocessed bypass. Strength is saved locally.
+The range is 0-100%. Start around 50%; 0% disables the pass completely (no allocation, copy or
+dispatch). NR OFF keeps sharpness active when its switch is enabled. Strength is saved locally.
 Changes apply without restarting the worker and force a refresh of static frames.
 
 The filter uses a two-pixel axial neighborhood, a small noise floor and a

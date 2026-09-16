@@ -537,8 +537,8 @@ def main() -> int:
             if not st.running:
                 break
 
-            # NR OFF - bypass: the pipeline keeps spinning (grab -> show the
-            # raw frame in the worker's window) but the NGX effect is skipped.
+            # NR OFF skips neural rendering while independent effects keep running.
+            # All effects off shows the raw capture.
             # The overlay (picture + HUD) stays alive and predictable; we hide
             # everything only on a real exit. A bypass frame is sent like any
             # other (the flag lives in the header) so send/recv stay paired.
@@ -688,23 +688,8 @@ def main() -> int:
                 try:
                     t0 = time.perf_counter()
                     detect_ui = bool(st.cfg.get("ui_detection", False) and st.cfg.get("frame_generation", False))
-                    if bypass:
-                        # NR OFF: the worker skips the NGX evaluate, so nothing
-                        # ever reads this motion field. Computing it anyway cost
-                        # 2.9 ms of DIS per frame (measured, 320x180 flow, moving
-                        # content) - and it cost it on the mode that runs
-                        # FASTEST, 121-133 FPS in bypass, where it came to about
-                        # half a core spent filling a buffer the worker throws
-                        # away. The frame still CARRIES a motion field: the
-                        # header's size contract does not change just because the
-                        # effect is off.
-                        #
-                        # previous_gray goes with it. Keeping the last pre-bypass
-                        # frame as history would mean correlating against a
-                        # screen that is minutes old the moment NR comes back on,
-                        # and the first real flow field would be garbage.
-                        # Cleared, the first NR frame reports a scene cut
-                        # instead - which is what a resumed pipeline is.
+                    if bypass and not (st.cfg.get("dlss_sr", False) or st.cfg.get("frame_generation", False)):
+                        # Spatial-only processing does not consume motion.
                         st.guides.previous_gray = None
                         guide = st.guides.zero_guide()
                     elif st.gray_active:

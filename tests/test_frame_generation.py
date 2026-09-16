@@ -30,7 +30,7 @@ def exact(pipe, count):
     return result
 
 
-def run(hdr=False, dynamic=False, check_pixels=False, sr=False, ui=False, detail=False):
+def run(hdr=False, dynamic=False, check_pixels=False, sr=False, ui=False, detail=False, nr_off=False):
     w, h = 640, 360
     work_w, work_h = (428, 240) if sr else (w, h)
     if hdr:
@@ -81,14 +81,23 @@ def run(hdr=False, dynamic=False, check_pixels=False, sr=False, ui=False, detail
             x = 80 + (i % 80) * 4
             frame[80:280, x:x+120, :3] = (220, 100, 50)
             frame[15:65, 500:620, :3] = 255  # static HDR white patch
-            bypass = 125 <= i < 130
+            bypass = nr_off or 125 <= i < 130
             flags = wire.FRAME_FLAG_WANT_PIXELS if bypass else 0
             if bypass:
                 flags |= wire.FRAME_FLAG_BYPASS
+                if not nr_off:
+                    flags |= 0x800 | 0x4000  # disable independent FG/SR for raw comparison
             if dynamic:
                 multiplier = 2 if i < 140 else 3 if i < 270 else 4
                 enabled = 15 <= i < 400 or i >= 410
                 flags |= 0x800 | (0x100 if enabled else 0) | ((multiplier - 2) << 9)
+            if sr:
+                flags |= 0x4000 | 0x2000
+            if bypass and not nr_off:
+                flags = (flags | 0x800 | 0x4000) & ~(0x100 | 0x2000)
+            if detail:
+                worker.stdin.write(struct.pack(wire.FRAME_FMT,wire.DETAIL_MAGIC,0,0 if bypass and not nr_off else 50,0,0));worker.stdin.flush()
+                assert struct.unpack(wire.OUT_FMT,exact(worker.stdout,struct.calcsize(wire.OUT_FMT)))[2]==1
             if hdr:
                 pygame.event.pump()
                 screen.blit(pygame.image.frombuffer(frame.tobytes(), (w, h), "RGBA"), (0, 0))
@@ -113,14 +122,16 @@ def run(hdr=False, dynamic=False, check_pixels=False, sr=False, ui=False, detail
             if ack[3]:
                 output = exact(worker.stdout, ack[3])
                 if bypass and not hdr:
-                    assert output == frame.tobytes(), "bypass export changed"
+                    assert nr_off or output == frame.tobytes(), "bypass export changed"
             time.sleep(max(0, 1/60 - (time.monotonic() - started)))
         if hdr:
             wire.send_wgc(worker, 0)
             ack = struct.unpack(wire.WGC_ACK_FMT, exact(worker.stdout, struct.calcsize(wire.WGC_ACK_FMT)))
             assert ack[1] == 1, ack
+            worker.stdin.write(struct.pack(wire.FRAME_FMT,wire.DETAIL_MAGIC,0,0,0,0));worker.stdin.flush()
+            assert struct.unpack(wire.OUT_FMT,exact(worker.stdout,struct.calcsize(wire.OUT_FMT)))[2]==1
             worker.stdin.write(struct.pack(wire.FRAME_FMT, wire.FRAME_MAGIC, total, 1,
-                wire.FRAME_FLAG_BYPASS | wire.FRAME_FLAG_WANT_PIXELS, total))
+                wire.FRAME_FLAG_BYPASS | wire.FRAME_FLAG_WANT_PIXELS | 0x800 | 0x4000, total))
             worker.stdin.write(frame.tobytes())
             worker.stdin.write(motion.tobytes())
             worker.stdin.flush()
@@ -141,7 +152,7 @@ def run(hdr=False, dynamic=False, check_pixels=False, sr=False, ui=False, detail
         if hdr:
             pygame.quit()
     assert worker.returncode == 0, worker.returncode
-    assert log.count("[fg] 2x enabled") >= 2, "FG did not resume after bypass"
+    assert log.count("[fg] 2x enabled") >= (1 if nr_off else 2), "FG did not resume after bypass"
     if dynamic:
         assert "[fg] 3x enabled" in log and "[fg] 4x enabled" in log
         assert log.count("[fg] UI: off") >= 2 and log.count("[fg] 4x enabled") >= 2
@@ -152,7 +163,10 @@ def run(hdr=False, dynamic=False, check_pixels=False, sr=False, ui=False, detail
     rates = [float(x) for x in re.findall(r"\[fg\] displayed ([\d.]+) FPS", log)]
     assert rates and max(rates) > 75, rates
     assert "[fg] presenter failed" not in log and "[fg] Evaluate failed" not in log
-    if hdr:
+    if nr_off:
+        assert "discarded warmup frames" not in log, "NR evaluated while disabled"
+        assert "presentation=HDR10" not in log and "presentation=FP16 scRGB" not in log, "HDR enabled without NR"
+    if hdr and not nr_off:
         assert "capture=FP16 scRGB" in log and "format=24" in log, "HDR path not exercised"
         assert "presentation=8-bit SDR" in log
     if dumps:
@@ -188,6 +202,6 @@ def run(hdr=False, dynamic=False, check_pixels=False, sr=False, ui=False, detail
 
 if __name__ == "__main__":
     if "--run" in sys.argv or "--hdr" in sys.argv or "--dynamic" in sys.argv:
-        run("--hdr" in sys.argv, "--dynamic" in sys.argv, "--check-pixels" in sys.argv, "--sr" in sys.argv, "--ui" in sys.argv, "--detail" in sys.argv)
+        run("--hdr" in sys.argv, "--dynamic" in sys.argv, "--check-pixels" in sys.argv, "--sr" in sys.argv, "--ui" in sys.argv, "--detail" in sys.argv, "--nr-off" in sys.argv)
     else:
         print("SKIP: opt-in DLSS-G/GPU test; pass --run")

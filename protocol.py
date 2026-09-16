@@ -377,7 +377,7 @@ DDA_ACK_MAGIC = 0x4B434144  # 'DACK'
 DDA_FMT = "<4Iq"        # magic, width, height, flags, pts (24 bytes)
 DDA_ACK_FMT = "<4Iq"    # magic, ok, reserved0, reserved1, pts
 FRAME_FLAG_NO_COLOR = 0x8  # in DDA mode: we send no colour (the worker takes it)
-FRAME_FLAG_BYPASS = 0x10  # NR OFF: skip NGX, show the raw capture
+FRAME_FLAG_BYPASS = 0x10  # NR OFF: independent SR, sharpness and FG remain active
 
 # GRAY: the worker writes luminance (a downsample of the screen, ~320x180)
 # into a reverse mapping for Python - for the guides' optical flow. In DDA
@@ -460,8 +460,8 @@ def send_frame(worker: subprocess.Popen, index: int, rgba: np.ndarray,
 
     no_color (DDA mode): the worker takes the colour itself from Desktop
     Duplication - only motion goes down the pipe, rgba is ignored.
-    bypass (NR OFF): the worker skips NGX and shows the raw capture - the
-    overlay (window, HUD) stays alive while the effect is off.
+    bypass (NR OFF): skips neural rendering and HDR presentation, preserving
+    independent SR/DLAA, sharpness and FG. All effects off returns raw pixels.
     split (0..1): the share of the frame on the left the worker leaves
     unprocessed - the before/after wipe. 0 means off.
     skip_static: the capture has no new frame (Desktop Duplication timeout,
