@@ -1452,8 +1452,13 @@ class OverlayMenu:
             if item.kind == "action":
                 out.extend(self._action_click(item.key))
             elif item.kind == "hotkey":
-                self.capturing = item.key
-                out.append(("capture", item.key))
+                clear = item.extra.get("clear")
+                if clear is not None and clear.collidepoint(event.pos):
+                    self.capturing = None
+                    out.extend([("hotkey", item.key, ""), ("capture", None)])
+                else:
+                    self.capturing = item.key
+                    out.append(("capture", item.key))
             elif item.kind == "segmented":
                 cells = item.extra.get("cells") or []
                 for idx, cr in enumerate(cells):
@@ -2465,7 +2470,14 @@ class OverlayMenu:
         surface.blit(label, (item.rect.x,
                              item.rect.centery - label.get_height() // 2))
         fw = self._u(170)
-        field = pygame.Rect(item.rect.right - fw, item.rect.y, fw, item.rect.h)
+        clear_w = self._u(28)
+        clear = pygame.Rect(item.rect.right - clear_w, item.rect.y, clear_w, item.rect.h)
+        field = pygame.Rect(clear.x - self._u(6) - fw, item.rect.y, fw, item.rect.h)
+        item.extra["clear"] = clear
+        pygame.draw.rect(surface, _rgb(self.c["surface"]), clear,
+                         border_radius=self._u(RADIUS // 2))
+        icon = self._small_font.render("×", True, _rgb(self.c["muted"]))
+        surface.blit(icon, icon.get_rect(center=clear.center))
         capturing = bool(item.extra.get("capturing"))
         radius = self._u(RADIUS // 2)
         if capturing:

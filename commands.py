@@ -336,7 +336,7 @@ def apply_menu_action(st, action: tuple) -> None:
     elif kind == "hotkey":
         cmd, text = action[1], action[2]
         parsed = parse_binding(text)
-        if parsed is None:
+        if parsed is None and text != "":
             print(f"[main] could not parse the combination {text!r}", file=sys.stderr)
             st.display.alert(UI_STRINGS[st.lang]["hotkey_bad"])
         else:

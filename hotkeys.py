@@ -167,13 +167,17 @@ def build_bindings(overrides: dict | None = None) -> dict:
     """Bindings with the user's overrides from the config applied.
 
     overrides: {"toggle": "F10", "record": "Insert", ...} — command -> string.
-    Unknown or malformed strings are ignored and the default stays.
+    An empty string disables the command. Unknown or malformed values
+    keep the default; omitting the command also keeps its default.
     """
     bindings = {hk_id: tuple(entry) for hk_id, entry in DEFAULT_BINDINGS.items()}
     if not overrides:
         return bindings
     for hk_id, (mods, vk, cmd, name) in list(bindings.items()):
         text = overrides.get(cmd)
+        if text == "":
+            del bindings[hk_id]
+            continue
         if not text:
             continue
         parsed = parse_binding(text)
@@ -186,7 +190,7 @@ def build_bindings(overrides: dict | None = None) -> dict:
 
 def describe(bindings: dict | None = None) -> str:
     """A line like 'Num1=toggle, Num2=settings, ...' for the startup log."""
-    src = bindings or DEFAULT_BINDINGS
+    src = DEFAULT_BINDINGS if bindings is None else bindings
     return ", ".join(f"{name}={cmd}" for _, (_, _, cmd, name) in sorted(src.items()))
 
 
@@ -203,7 +207,7 @@ def numlock_needed(bindings: dict | None = None) -> list:
     fire at all. Worth saying out loud rather than letting the user conclude
     the program is broken.
     """
-    src = bindings or DEFAULT_BINDINGS
+    src = DEFAULT_BINDINGS if bindings is None else bindings
     return [name for _, (_, vk, _cmd, name) in sorted(src.items())
             if vk in _NUMPAD_VKS]
 
@@ -252,7 +256,7 @@ class HotkeyController:
 
     def __init__(self, commands: queue.Queue, bindings: dict | None = None):
         self._commands = commands
-        self._bindings = bindings or DEFAULT_BINDINGS
+        self._bindings = DEFAULT_BINDINGS if bindings is None else bindings
         self._thread: threading.Thread | None = None
         self._tid = 0
         self.registered: list[str] = []

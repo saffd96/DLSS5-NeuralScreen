@@ -87,6 +87,10 @@ def main() -> int:
         else:
             print("rebind: the old one was released, the new one is taken")
 
+    hk.rebind({})
+    time.sleep(0.4)
+    if hk.registered or not can_grab(PROBE_MODS, VK_F6):
+        failures.append("clearing all assignments did not release the hotkeys")
     hk.stop()
     time.sleep(0.4)
     if not can_grab(PROBE_MODS, VK_F5) and not can_grab(PROBE_MODS, VK_F6):
