@@ -2582,7 +2582,7 @@ static bool PresentFrame(VideoState &v, UINT64 *submitted = nullptr)
 {
     if (!RebuildPresentIfStale()) return false;
     if (submitted) *submitted = 0;
-    if (g_hdr_capture && g_nr_frame_enabled) return PresentHdr(v, false);
+    if (g_hdr_capture) return PresentHdr(v, false);
     // Only when HDR compatibility is on. With it off there is nothing to put
     // back: the swap chain was created R8G8B8A8 and no HDR frame has ever
     // touched it, so the call has nothing to do - and it is not free. 1.8.0
@@ -2663,7 +2663,7 @@ static bool PresentBypass(VideoState &v)
 {
     if (!RebuildPresentIfStale()) return false;
     StopFgPresentation();
-    if (g_hdr_capture && g_nr_frame_enabled) return PresentHdr(v, true);
+    if (g_hdr_capture) return PresentHdr(v, true);
     // Same as PresentFrame: nothing to restore unless HDR has been on (#58).
     if (HdrEnabled() && !EnsurePresentFormat(false)) return false;
     ID3D12Resource *bb = nullptr;
@@ -6252,8 +6252,8 @@ static int RunVideo()
             g_force_next_frame = true;
             fh.reset = 1;
             StopFgPresentation();
-            Log("[video] NR %s; independent effects remain enabled; HDR %s",
-                nr_enabled ? "on" : "off", nr_enabled ? "follows setting" : "off");
+            Log("[video] NR %s; independent effects and HDR follow their settings",
+                nr_enabled ? "on" : "off");
         }
         ConfigureSrFrame(fh.reserved);
         ConfigureFgFrame(fh.reserved);

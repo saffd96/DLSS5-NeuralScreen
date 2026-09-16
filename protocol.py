@@ -460,7 +460,7 @@ def send_frame(worker: subprocess.Popen, index: int, rgba: np.ndarray,
 
     no_color (DDA mode): the worker takes the colour itself from Desktop
     Duplication - only motion goes down the pipe, rgba is ignored.
-    bypass (NR OFF): skips neural rendering and HDR presentation, preserving
+    bypass (NR OFF): skips neural rendering while preserving HDR presentation and
     independent SR/DLAA, sharpness and FG. All effects off returns raw pixels.
     split (0..1): the share of the frame on the left the worker leaves
     unprocessed - the before/after wipe. 0 means off.

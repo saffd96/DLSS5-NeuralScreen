@@ -165,10 +165,10 @@ def run(hdr=False, dynamic=False, check_pixels=False, sr=False, ui=False, detail
     assert "[fg] presenter failed" not in log and "[fg] Evaluate failed" not in log
     if nr_off:
         assert "discarded warmup frames" not in log, "NR evaluated while disabled"
-        assert "presentation=HDR10" not in log and "presentation=FP16 scRGB" not in log, "HDR enabled without NR"
-    if hdr and not nr_off:
+    if hdr:
         assert "capture=FP16 scRGB" in log and "format=24" in log, "HDR path not exercised"
         assert "presentation=8-bit SDR" in log
+        assert "presentation=FP16 scRGB" in log, "HDR passthrough lost while FG/NR was off"
     if dumps:
         checked = 0
         def decode(path):
