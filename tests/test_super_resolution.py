@@ -2,6 +2,7 @@
 import os
 from pathlib import Path
 import struct
+from worker_reply import read_reply
 import subprocess
 import sys
 import threading
@@ -19,7 +20,7 @@ def run():
         stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,creationflags=subprocess.CREATE_NO_WINDOW)
     logs=[];thread=threading.Thread(target=lambda:logs.extend(iter(p.stderr.readline,b'')),daemon=True);thread.start()
     watchdog=threading.Timer(45,p.kill);watchdog.start()
-    def ack(fmt):return struct.unpack(fmt,exact(p.stdout,struct.calcsize(fmt)))
+    def ack(fmt):return struct.unpack(fmt,read_reply(p.stdout, struct.calcsize(fmt)))
     try:
         p.stdin.write(struct.pack(wire.HEADER_FMT,wire.VIDEO_MAGIC,w,h,1,0,0,0,1,0,0,1.,1.,1.,-1.,ow,oh));p.stdin.flush()
         for i in range(80):

@@ -1,9 +1,12 @@
-"""The bypass path (NR OFF): the worker skips NGX and shows the raw capture.
+"""The explicit-consumer bypass path: the worker skips NGX.
 
 Driven directly, like test_split: we send the colour ourselves, so the
 "raw capture" is exactly our input frame. With FRAME_FLAG_BYPASS the
 output must equal the input bit for bit (no NGX ran), and the pipeline
 must stay alive - the next non-bypass frame resumes the network.
+
+Ordinary NR OFF no longer sends frames at all.  This protocol path remains
+for a screenshot, recording, or Frame Generation while NR itself is off.
 
 Checks:
 * bypass frame == input (bit for bit, or within rounding of the swizzle);
@@ -24,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))  # tests/ (autocheck)
 from main import (FRAME_FLAG_BYPASS, FRAME_FLAG_WANT_PIXELS, FRAME_FMT,  # noqa: E402
                   FRAME_MAGIC, HEADER_FMT, OUT_FMT, OUT_MAGIC, PROFILES,
                   VIDEO_MAGIC, WORKER_EXE)
+from worker_reply import read_reply  # noqa: E402
 
 W, H = 1280, 720
 WORK_W, WORK_H = 1280, 720  # 1:1 - the raw capture is exactly the input
@@ -62,7 +66,7 @@ def send_and_get(worker, index: int, frame: np.ndarray, motion: np.ndarray,
     worker.stdin.write(motion.tobytes())
     worker.stdin.flush()
 
-    head = read_exact(worker.stdout, struct.calcsize(OUT_FMT))
+    head = read_reply(worker.stdout, struct.calcsize(OUT_FMT))
     magic, _idx, ok, nbytes, ngx, _pts = struct.unpack(OUT_FMT, head)
     if magic != OUT_MAGIC:
         raise RuntimeError(f"foreign reply 0x{magic:08X}")

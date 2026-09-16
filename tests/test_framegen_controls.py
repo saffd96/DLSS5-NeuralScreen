@@ -157,7 +157,7 @@ def main():
         settings_io.refresh_sr(failed)
         assert save.call_count == 1
     # The real serializer must retain both settings, not just the command handler.
-    cfg = settings_io.load_config(ROOT / "config.json")
+    cfg = settings_io.load_config(ROOT / "config.default.json")
     cfg.update(frame_generation=True, frame_multiplier=4, dlss_sr=True, dlss_sr_scale=.5, ui_detection=True)
     params = settings_io.resolve_params(cfg)
     data = dict(cfg)

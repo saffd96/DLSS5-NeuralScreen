@@ -30,7 +30,8 @@ import threading
 
 import numpy as np
 
-from capture import ScreenCapture, list_adapters, resolve_output_idx
+from capture import (ScreenCapture, list_adapters, list_monitors,
+                     monitor_origin, resolve_output_idx)
 from display import Display
 from gpuinfo import describe as gpu_describe, probe as gpu_probe
 from guides import TemporalGuideGenerator
@@ -39,7 +40,7 @@ from hotkeys import (HotkeyController, build_bindings,
                      numlock_on)
 from i18n import STRINGS as UI_STRINGS
 from paths import BASE_DIR
-from pipeline import start_worker
+from pipeline import require_compatibility, start_worker
 from protocol import SharedFrameBuffer, WorkerReader
 from recorder import VideoRecorder
 from settings_io import (APP_VERSION, _work_size, hotkey_labels, load_config,
@@ -112,6 +113,22 @@ def _apply_hdr_env(cfg: dict) -> None:
     os.environ["NS_HDR"] = "1" if cfg.get("hdr") else "0"
 
 
+def _apply_monitor_name(name: str) -> tuple[int, int]:
+    """Publish a monitor identity without opening a capture session."""
+    name = str(name or "")
+    if name:
+        os.environ["NS_OUTPUT"] = name
+        origin = monitor_origin(name)
+        if origin is not None:
+            os.environ["NS_WINDOW_POS"] = f"{origin[0]},{origin[1]}"
+            return origin
+    os.environ.pop("NS_OUTPUT", None)
+    os.environ.pop("NS_WINDOW_POS", None)
+    print(f"[main] monitor identity unknown ({name!r}) - "
+          f"output 0 and the primary position stay", file=sys.stderr)
+    return (0, 0)
+
+
 def _apply_monitor_env(capture) -> tuple[int, int]:
     """Publish the chosen monitor to the worker and return its origin.
 
@@ -129,19 +146,8 @@ def _apply_monitor_env(capture) -> tuple[int, int]:
     A monitor whose name cannot be resolved keeps both defaults - the old
     behaviour - and says so in the log.
     """
-    from capture import monitor_origin
     name = getattr(capture, "devicename", "") or ""
-    if name:
-        os.environ["NS_OUTPUT"] = name
-        origin = monitor_origin(name)
-        if origin is not None:
-            os.environ["NS_WINDOW_POS"] = f"{origin[0]},{origin[1]}"
-            return origin
-    os.environ.pop("NS_OUTPUT", None)
-    os.environ.pop("NS_WINDOW_POS", None)
-    print(f"[main] monitor identity unknown ({name!r}) - "
-          f"output 0 and the primary position stay", file=sys.stderr)
-    return (0, 0)
+    return _apply_monitor_name(name)
 
 
 def _apply_gpu_env(cfg: dict) -> None:
@@ -341,19 +347,29 @@ def configure(st) -> None:
     _apply_gpu_env(st.cfg)
     st.lang = str(st.cfg["lang"])
 
-    # The output resolution comes FROM THE REAL MONITOR, not from a stale
-    # config.json (the monitor may have been switched to 1440p while the
-    # config still remembers 4K - the overlay, the recording and the worker
-    # window would start drifting away from the screen).
-    st.capture = ScreenCapture(monitor_idx=st.monitor)
-    st.mon_w, st.mon_h = st.capture.resolution
+    # Resolve the real monitor dimensions before compatibility preflight,
+    # but do not open Desktop Duplication yet.  list_monitors is Win32/DXGI
+    # enumeration only: the isolated Create/Evaluate gate must run before a
+    # ScreenCapture or presentation window exists.
+    monitor_info = next(
+        (item for item in list_monitors() if int(item[0]) == int(st.monitor)),
+        None,
+    )
+    if monitor_info is None:
+        monitor_info = next(iter(list_monitors()), None)
+    if monitor_info is not None:
+        st.monitor = int(monitor_info[0])
+        st.mon_w, st.mon_h = int(monitor_info[1]), int(monitor_info[2])
+        st.monitor_devicename = str(monitor_info[3] or "")
+    else:
+        st.mon_w, st.mon_h = st.width, st.height
+        st.monitor_devicename = ""
     if st.mon_w > 0 and st.mon_h > 0 and (st.mon_w, st.mon_h) != (st.width, st.height):
         print(f"[main] monitor {st.monitor} is {st.mon_w}x{st.mon_h} (config: {st.width}x{st.height}), "
               f"taking the real resolution")
         st.width, st.height = st.mon_w, st.mon_h
-    # The worker and the overlay both need to know WHERE the chosen monitor
-    # is; the resolution alone does not place anything.
-    st.mon_origin = _apply_monitor_env(st.capture)
+    st.mon_origin = _apply_monitor_name(st.monitor_devicename)
+    st.capture = None
 
     print(f"[main] NeuralScreen - profile {st.cfg['profile']!r}, "
           f"resolution {st.width}x{st.height}, monitor {st.monitor}")
@@ -369,6 +385,24 @@ def configure(st) -> None:
     st.tray: TrayController | None = None
     st.hotkeys: HotkeyController | None = None
     st.recorder: VideoRecorder | None = None
+    st.recording_finalizer: VideoRecorder | None = None
+    st.recording_finalize_deadline = 0.0
+    st.last_recording = {}
+    st.compatibility_key = None
+    st.compatibility_result = None
+
+
+def open_capture(st) -> None:
+    """Open desktop capture only after the compatibility gate returned PASS."""
+    st.capture = ScreenCapture(monitor_idx=st.monitor)
+    st.monitor = int(getattr(st.capture, "monitor_idx", st.monitor))
+    st.monitor_devicename = str(getattr(st.capture, "devicename", "") or "")
+    st.mon_w, st.mon_h = st.capture.resolution
+    if st.mon_w > 0 and st.mon_h > 0 and (st.mon_w, st.mon_h) != (st.width, st.height):
+        print(f"[main] opened monitor {st.monitor} at {st.mon_w}x{st.mon_h} "
+              f"(enumerated: {st.width}x{st.height}), taking the capture size")
+        st.width, st.height = st.mon_w, st.mon_h
+    st.mon_origin = _apply_monitor_env(st.capture)
 
 
 def bring_up(st) -> None:
@@ -423,6 +457,7 @@ def bring_up(st) -> None:
     # restarts climbed to NR OFF - the exact storm the shortening exists to
     # prevent (audit F3).
     st.effective_warmup = effective_warmup
+    require_compatibility(st)
     st.worker, st.worker_logs, st.reader, st.worker_stop = start_worker(
         st.params, st.work_w, st.work_h, effective_warmup, full_w, full_h, st.shm)
     print(f"[main] worker started (pid {st.worker.pid}), header sent "
@@ -523,6 +558,11 @@ def bring_up(st) -> None:
     st.buf_full = np.empty((st.height, st.width, 4), dtype=np.uint8)
 
     st.paused = False
+    # True only after NR OFF has closed the worker's capture/present channels
+    # and the main loop has stopped producing frames.  It is distinct from
+    # paused: recording, screenshots and Frame Generation temporarily keep a
+    # bypass stream alive while the NR toggle remains off.
+    st.off_suspended = False
     # The worker died and exhausted the restart budget: the pipeline is
     # stopped (no send/recv, no more restarts) and the overlay is hidden
     # so the desktop is not covered by a black window (issue #3: black
@@ -568,7 +608,11 @@ def bring_up(st) -> None:
     st.gray_active = False       # guides take luminance from the worker's gray channel
     st.pending_shot = None  # frame request before Save As, then cleared
     st.shot_rgba = None  # frozen before Save As, never a dialog-contaminated worker slot
+    st.skipped_static_frames = 0  # explicit OUT1 status, not inferred from empty pixels
     st.recorder: VideoRecorder | None = None  # recording (Num0), MP4 AV1 NVENC
+    st.recording_finalizer: VideoRecorder | None = None
+    st.recording_finalize_deadline = 0.0
+    st.last_recording = {}
     st.work_frame = None  # the current work frame; None -> grab at the top of the loop
 
 

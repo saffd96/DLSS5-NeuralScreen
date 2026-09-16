@@ -55,7 +55,9 @@ except Exception:
 
 from main import (FRAME_FLAG_NO_COLOR, FRAME_FLAG_SKIP_STATIC,  # noqa: E402
                   FRAME_FLAG_WANT_PIXELS, FRAME_FMT, FRAME_MAGIC, HEADER_FMT,
-                  OUT_FMT, OUT_MAGIC, PROFILES, VIDEO_MAGIC, WORKER_EXE)
+                  OUT_FMT, OUT_MAGIC, OUT_STATUS_SKIPPED, PROFILES,
+                  VIDEO_MAGIC, WORKER_EXE)
+from worker_reply import read_exact, read_reply  # noqa: E402
 
 W, H = 960, 540
 WARMUP = 8
@@ -69,20 +71,10 @@ WGC_ACK_FMT = "<4Iq"        # magic, ok, width, height, pts
 TARGET = (31, 97, 211)
 
 
-def read_exact(pipe, n: int) -> bytes:
-    buf = b""
-    while len(buf) < n:
-        chunk = pipe.read(n - len(buf))
-        if not chunk:
-            raise EOFError(f"the worker closed stdout ({len(buf)} of {n})")
-        buf += chunk
-    return buf
-
-
 def send_wgc(worker, hwnd: int) -> tuple:
     worker.stdin.write(struct.pack(WGC_FMT, WGC_MAGIC, W, H, 0, 0, int(hwnd)))
     worker.stdin.flush()
-    ack = read_exact(worker.stdout, struct.calcsize(WGC_ACK_FMT))
+    ack = read_reply(worker.stdout, struct.calcsize(WGC_ACK_FMT))
     magic, ok, aw, ah, _pts = struct.unpack(WGC_ACK_FMT, ack)
     if magic != WGC_ACK_MAGIC:
         raise AssertionError(f"foreign reply to WGCW: 0x{magic:08X}")
@@ -104,13 +96,17 @@ def send_capture_frame(worker, index: int, motion: np.ndarray,
 
 
 def recv_result(worker):
-    """('full', pixels) | ('empty', None) - the worker's answer to one frame."""
-    head = read_exact(worker.stdout, struct.calcsize(OUT_FMT))
+    """Return full/skipped/empty, keeping the OUT1 status observable."""
+    head = read_reply(worker.stdout, struct.calcsize(OUT_FMT))
     magic, _idx, ok, nbytes, ngx, _pts = struct.unpack(OUT_FMT, head)
     if magic != OUT_MAGIC:
         raise AssertionError(f"foreign reply 0x{magic:08X}")
     if not ok:
         raise AssertionError(f"the worker answered ok=0, ngx=0x{ngx:08X}")
+    if ok & OUT_STATUS_SKIPPED:
+        if nbytes != 0:
+            raise AssertionError("a skipped reply unexpectedly carried pixels")
+        return "skipped", None
     if nbytes == 0:
         return "empty", None
     data = read_exact(worker.stdout, nbytes)
@@ -195,7 +191,7 @@ def main() -> int:
         tail = answers[-8:]
         if any(s == "full" for s in tail):
             failures.append(f"a static source produced processed frames: {answers}")
-        if "empty" not in answers:
+        if "skipped" not in answers:
             failures.append("not one frame was skipped on a static source")
 
         # 2. The source redraws: the frame is processed again.

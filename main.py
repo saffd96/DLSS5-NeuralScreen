@@ -88,9 +88,11 @@ from taskbar import TaskbarWindow
 import dialogs
 import channels
 import commands
+import compatibility_runtime
 import startup
 import settings_io
 import pipeline
+from pacing import FramePacer, FrameRateMeter
 # The restart cooldown is the loop's business too: it is what the
 # deferred apply waits for.
 from pipeline import (AUTO_REVIVE_BACKOFF,  # noqa: F401
@@ -119,7 +121,7 @@ from settings_io import (  # noqa: F401
 # on purpose: main is where the rest of the program - and the tests - look
 # them up, and moving code must not move its callers.
 from winapi import (DWMWA_EXTENDED_FRAME_BOUNDS, _RECT,  # noqa: F401
-                    _is_desktop_window, _is_taskbar_window,
+                    _is_desktop_window, _is_our_window, _is_taskbar_window,
                     foreign_foreground, list_capturable_windows,
                     window_frame_rect, window_under_cursor)
 
@@ -130,6 +132,8 @@ from winapi import (DWMWA_EXTENDED_FRAME_BOUNDS, _RECT,  # noqa: F401
 # Named one by one rather than with a star: a star import would drag
 # protocol's own imports into this namespace too.
 from protocol import (  # noqa: F401
+    CREATE_ACK_FMT, CREATE_ACK_MAGIC, CREATE_CATEGORY_FAILED,
+    CREATE_CATEGORY_NONE, CREATE_CATEGORY_UNSUPPORTED,
     DDA_ACK_FMT, DDA_ACK_MAGIC, DDA_FMT, DDA_MAGIC, FRAME_FLAG_BYPASS,
     FRAME_FLAG_MOTION_SMALL, FRAME_FLAG_NO_COLOR, FRAME_FLAG_SHM,
     FRAME_FLAG_SKIP_STATIC, FRAME_FLAG_SPLIT, FRAME_FLAG_WANT_PIXELS,
@@ -137,7 +141,8 @@ from protocol import (  # noqa: F401
     GRAY_ACK_FMT, GRAY_ACK_MAGIC, GRAY_FMT, GRAY_MAGIC, HEADER_FMT,
     MOTION_ACK_FMT, MOTION_ACK_MAGIC, MOTION_FMT, MOTION_MAGIC,
     OUTS_ACK_FMT, OUTS_ACK_MAGIC, OUTS_FMT, OUTS_MAGIC, OUT_BYTES_IN_SHM,
-    OUT_FMT, OUT_MAGIC, RACK_FMT, RESIZE_ACK_MAGIC, RESIZE_FLAG_NR_SMALL,
+    FrameReply, OUT_FMT, OUT_MAGIC, OUT_STATUS_OK, OUT_STATUS_SKIPPED, RACK_FMT,
+    RESIZE_ACK_MAGIC, RESIZE_FLAG_NR_SMALL,
     RESIZE_FMT, RESIZE_MAGIC, SHM_ACK_FMT, SHM_ACK_MAGIC, SHM_FMT,
     SHM_MAGIC, VIDEO_MAGIC, WGC_ACK_FMT, WGC_ACK_MAGIC, WGC_FMT,
     WGC_MAGIC, WINDOW_ACK_FMT, WINDOW_ACK_MAGIC, WINDOW_FLAG_CAPTURABLE,
@@ -305,6 +310,7 @@ class _Pipeline:
         "mon_h",
         "mon_w",
         "monitor",
+        "monitor_devicename",
         "motion_attempted",
         "motion_small",
         "next_auto_revive",
@@ -312,12 +318,14 @@ class _Pipeline:
         "nr_small",
         "out_attempted",
         "out_shm",
+        "off_suspended",
         "output_rgba",
         "params",
         "paused",
         "pending_apply",
         "pending_shot",
         "shot_rgba",
+        "skipped_static_frames",
         "perf",
         "present_attempted",
         "present_mode",
@@ -326,6 +334,9 @@ class _Pipeline:
         "reader",
         "record_audio",
         "recorder",
+        "recording_finalizer",
+        "recording_finalize_deadline",
+        "last_recording",
         "running",
         "shm",
         "shot_dialog_open",
@@ -354,6 +365,8 @@ class _Pipeline:
         "warmup",
         "effective_warmup",
         "hdr_alerted",
+        "compatibility_key",
+        "compatibility_result",
     )
 
 
@@ -381,7 +394,14 @@ def main() -> int:
     # back into it and has no business knowing what argparse is.
     st.cfg_path = args.config
     startup.configure(st)
+    # The compatibility worker receives synthetic RGBA frames only.  Desktop
+    # capture and the presentation window are deliberately created after an
+    # exact N/N PASS (or a cached PASS for the same key).
+    if not compatibility_runtime.startup_gate(st):
+        print("[main] compatibility preflight cancelled - capture was not opened")
+        return 2
     try:
+        startup.open_capture(st)
         startup.bring_up(st)
 
         capture_failures = 0
@@ -468,7 +488,8 @@ def main() -> int:
         # The loop's own state, next to the loop that owns it.
         guide = None  # Num1 before the first NR frame must not raise NameError
         startup_pending = True  # open the menu once the picture is alive
-        fps_window: list[float] = []
+        nr_rate = FrameRateMeter(FPS_LOG_INTERVAL)
+        frame_pacer = FramePacer()
         last_log = time.monotonic()
         last_fps = 0.0
         last_perf_log = time.monotonic()
@@ -480,12 +501,44 @@ def main() -> int:
             """Record the stage duration (ms) into the timings dictionary."""
             st.perf[key].append((time.perf_counter() - t0) * 1000.0)
 
+        def _service_idle_overlay() -> None:
+            """Keep the settings menu usable without waking the frame loop."""
+            if st.display.menu.visible:
+                for ev in pygame.event.get():
+                    for action in st.display.menu.handle_event(ev):
+                        commands.apply_menu_action(st, action)
+                if st.display.menu.visible and not st.display.menu.dragging:
+                    st.display.menu.set_state(settings_io.menu_payload(st))
+
+            if st.display.menu.visible:
+                st.display.set_hud_only(True)
+                # A user may turn NR off before the first processed frame.  In
+                # that case set_visible() intentionally refuses to reveal the
+                # startup window; opening the menu is an explicit reason to
+                # reveal the otherwise transparent HUD layer.
+                if not st.display.is_visible():
+                    st.display.reveal()
+                    st.display.set_visible(True)
+                st.display.raise_topmost()
+                st.display.draw_overlay()
+            else:
+                st.display.set_visible(False)
+
         while st.running:
             loop_start = time.perf_counter()
             now = time.monotonic()
 
             if not commands.drain_commands(st):
                 break
+
+            # The answer from the "Save as" dialog (it runs in its own thread).
+            commands.drain_save_dialog(st)
+            commands.poll_recording_finalizer(st)
+
+            # NR OFF is a real idle state unless an explicit consumer still
+            # needs bypass frames.  No code below this branch captures, sends,
+            # receives or presents a frame.
+            low_cost_off = pipeline.sync_low_cost_off(st)
 
             # The worker is gone (restart budget exhausted): the pipeline is
             # stopped. Commands still run (Num1 revives it), but no frame is
@@ -502,6 +555,7 @@ def main() -> int:
                     st.worker_failed = False
                     print("[main] auto-reviving the worker after the transient failure")
                     try:
+                        pipeline.require_compatibility(st)
                         st.worker, st.worker_logs, st.reader, st.worker_stop = restart_worker(
                             st.worker, st.params, st.work_w, st.work_h,
                             st.effective_warmup,
@@ -522,7 +576,14 @@ def main() -> int:
                     except Exception as exc:
                         print(f"[main] auto-revive failed ({exc}) - staying NR OFF",
                               file=sys.stderr)
+                        st.paused = True
                         st.worker_failed = True
+                _service_idle_overlay()
+                time.sleep(0.05)
+                continue
+
+            if low_cost_off:
+                _service_idle_overlay()
                 time.sleep(0.05)
                 continue
 
@@ -537,16 +598,10 @@ def main() -> int:
             if not st.running:
                 break
 
-            # NR OFF skips neural rendering while independent effects keep running.
-            # All effects off shows the raw capture.
-            # The overlay (picture + HUD) stays alive and predictable; we hide
-            # everything only on a real exit. A bypass frame is sent like any
-            # other (the flag lives in the header) so send/recv stay paired.
+            # NR OFF bypasses the network; independent effects and media
+            # consumers keep capture and presentation running.
             bypass = st.paused
             # (for readability: send_frame is called with bypass=bypass)
-
-            # The answer from the "Save as" dialog (it runs in its own thread).
-            commands.drain_save_dialog(st)
 
             if st.want_present and not st.present_mode and not st.present_attempted:
                 channels.enable_present(st)
@@ -773,6 +828,7 @@ def main() -> int:
                     print("[main] worker stderr (tail):")
                     for line in st.worker_logs[-15:]:
                         print(f"  {line}")
+                pipeline.require_compatibility(st)
                 st.worker, st.worker_logs, st.reader, st.worker_stop = restart_worker(
                     st.worker, st.params, st.work_w, st.work_h, st.effective_warmup,
                     st.width if (st.work_w != st.width or st.work_h != st.height) else 0,
@@ -877,6 +933,7 @@ def main() -> int:
                     continue
                 print(f"[main] worker silent/dead on frame {st.frame_index} ({exc}) - restarting "
                       f"({st.consecutive_restarts}/{MAX_CONSECUTIVE_RESTARTS})")
+                pipeline.require_compatibility(st)
                 st.worker, st.worker_logs, st.reader, st.worker_stop = restart_worker(
                     st.worker, st.params, st.work_w, st.work_h, st.effective_warmup,
                     st.width if (st.work_w != st.width or st.work_h != st.height) else 0,
@@ -892,6 +949,9 @@ def main() -> int:
                 st.work_frame = None
                 continue
             _perf("recv", t0)
+            frame_skipped = bool(getattr(st.reader, "last_skipped", False))
+            if frame_skipped:
+                st.skipped_static_frames += 1
             # A frame arrived - the failure chain is broken. Without the reset
             # the counter accumulated across the whole session and three
             # unrelated failures (even an hour apart) turned NR off.
@@ -933,10 +993,10 @@ def main() -> int:
                         print(f"[main] frame write failed ({rec_exc}) - "
                               f"stopping the recording", file=sys.stderr)
                         try:
-                            st.recorder.close()
-                        except Exception:
-                            pass
-                        st.recorder = None
+                            commands.begin_recording_finalization(st)
+                        except Exception as finish_exc:
+                            print(f"[main] recording finalization could not start: "
+                                  f"{finish_exc}", file=sys.stderr)
                 if st.present_mode:
                     # In WNDO mode the worker draws the frame on screen; in
                     # Python the pixels arrive ONLY on want_pixels
@@ -1029,12 +1089,17 @@ def main() -> int:
                     st.display.raise_topmost()
                 st.display.alert(UI_STRINGS[st.lang]["nr_on"])
             _perf("show", t0)
+            completed_at = time.perf_counter()
+            if not bypass and not frame_skipped:
+                nr_rate.record(completed_at)
+            last_fps = nr_rate.rate(completed_at)
             st.display.set_hud({
                 "fps": last_fps,
                 # What the presenter shows with Frame Generation on - the
                 # worker reports it every two seconds. The HUD pairs the
                 # network rate with it ("42 / 84 fps"); None while FG is off.
                 "display_fps": settings_io._fg_displayed_fps(st),
+                "skipped_static": st.skipped_static_frames,
                 "status": status,
                 "resolution": f"{st.width}x{st.height}",
                 "profile": st.cfg["profile"],
@@ -1062,18 +1127,16 @@ def main() -> int:
                 else:
                     st.display.alert(UI_STRINGS[st.lang]["started"], 3.5)
             st.work_frame = next_frame  # None -> grab at the start of the next iteration
-            fps_window.append(time.perf_counter() - loop_start)
-            if len(fps_window) > 120:
-                fps_window.pop(0)
 
-            if now - last_log >= FPS_LOG_INTERVAL:
-                last_fps = len(fps_window) / sum(fps_window) if fps_window else 0.0
+            log_now = time.monotonic()
+            if log_now - last_log >= FPS_LOG_INTERVAL:
                 scene = f" | scene {guide.scene_score:.3f}" if guide is not None else ""
-                print(f"[main] {status} | FPS {last_fps:5.1f} | frames {st.frame_index} | "
+                print(f"[main] {status} | NR {last_fps:5.1f} fps | "
+                      f"skipped {st.skipped_static_frames} | frames {st.frame_index} | "
                       f"work {st.work_w}x{st.work_h}{scene}")
-                last_log = now
+                last_log = log_now
 
-            if now - last_perf_log >= PERF_LOG_INTERVAL:
+            if log_now - last_perf_log >= PERF_LOG_INTERVAL:
                 parts = []
                 for key in PERF_KEYS:
                     samples = st.perf[key]
@@ -1082,7 +1145,9 @@ def main() -> int:
                     samples.clear()
                 if parts:
                     print("[perf] " + " | ".join(parts))
-                last_perf_log = now
+                last_perf_log = log_now
+
+            frame_pacer.wait(settings_io.frame_limit_fps(st.cfg), loop_start)
 
         print("[main] exiting at the user's request")
     except KeyboardInterrupt:
@@ -1106,13 +1171,20 @@ def main() -> int:
                 print(f"  {line}", file=sys.stderr)
         return 1
     finally:
-        # A recording may have been running at exit: without close() the moov
-        # atom is not written and the file stays broken (players refuse it).
+        # A recording may have been running at exit. Begin the same asynchronous
+        # path the UI uses, then wait here only because the UI is already gone.
         if st.recorder is not None:
             try:
-                st.recorder.close()
+                commands.begin_recording_finalization(st, announce=False)
+            except Exception as exc:
+                print(f"[main] failed to start recording finalization: {exc}",
+                      file=sys.stderr)
+        if st.recording_finalizer is not None:
+            try:
+                st.recording_finalizer.close()
             except Exception as exc:
                 print(f"[main] failed to close the recording: {exc}", file=sys.stderr)
+            commands.poll_recording_finalizer(st)
         if st.worker is not None:
             shutdown_worker(st.worker, st.worker_stop)
         if st.shm is not None:

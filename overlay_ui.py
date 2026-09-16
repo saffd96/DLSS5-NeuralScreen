@@ -31,13 +31,14 @@ from resolution_limits import safe_processing_size
 THEMES = {
     "light": {
         "bg": "#F0EEE6",       # warm cream panel background
-        "surface": "#E8E5DC",  # slider tracks, fields
-        "border": "#DCD8CC",
+        "surface": "#E5DED2",  # warm sand for fields and slider tracks
+        "border": "#82746B",   # 3.37:1 against surface, 3.88:1 on bg
         "text": "#191919",
-        "muted": "#79776F",
-        "accent": "#D97757",   # clay accent
-        "ok": "#5E8C61",       # green of the support indicator
-        "danger": "#BC4C2E",
+        "muted": "#625B55",    # 4.99:1 against surface
+        "accent": "#9E3F28",   # dark clay; safe as text and as a fill
+        "ok": "#39683F",       # green of the support indicator
+        "danger": "#96351F",
+        "focus": "#7A321F",    # stronger clay ring, never colour-only fill
     },
     "dark": {
         "bg": "#262624",
@@ -48,6 +49,7 @@ THEMES = {
         "accent": "#D97757",
         "ok": "#7FB07F",
         "danger": "#E06C4F",
+        "focus": "#F2B098",
     },
 }
 
@@ -154,6 +156,48 @@ def _rgb(color: str) -> tuple[int, int, int]:
     return int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16)
 
 
+def _window_record(value: Any) -> dict:
+    """Return a window's identity and display label as separate values.
+
+    Production payloads use ``{"hwnd": int, "title": str}``.  The tuple and
+    old ``"HEX: title"`` forms are accepted only so an in-process menu built
+    by an older caller does not become unusable during an upgrade.  Once the
+    record is normalised, drawing and hit-testing never recover identity from
+    the visible label; titles may be duplicated and may contain colons.
+    """
+    if isinstance(value, dict):
+        raw_hwnd = value.get("hwnd")
+        try:
+            hwnd = int(raw_hwnd) if raw_hwnd is not None else None
+        except (TypeError, ValueError):
+            hwnd = None
+        title = str(value.get("title", value.get("label", "")))
+        return {"hwnd": hwnd, "label": title,
+                "identity": hwnd if hwnd is not None else value}
+    if isinstance(value, (tuple, list)) and len(value) >= 2:
+        try:
+            hwnd = int(value[0])
+        except (TypeError, ValueError):
+            hwnd = None
+        return {"hwnd": hwnd, "label": str(value[1]),
+                "identity": hwnd if hwnd is not None else value}
+    if isinstance(value, int) and not isinstance(value, bool):
+        return {"hwnd": value, "label": "", "identity": value}
+
+    # Compatibility with pre-1.13 state assembled by tests/plugins.  This is
+    # an identity token from the old contract, not a label emitted by the new
+    # payload.  Strip the technical prefix before it can reach the screen.
+    legacy = str(value or "")
+    prefix, marker, title = legacy.partition(": ")
+    try:
+        hwnd = int(prefix, 16) if marker else None
+    except ValueError:
+        hwnd = None
+    return {"hwnd": hwnd,
+            "label": title if hwnd is not None else legacy,
+            "identity": legacy if hwnd is not None else value}
+
+
 @dataclass
 class Item:
     """A layout item: what it is, where it sits, what it belongs to."""
@@ -201,6 +245,8 @@ class OverlayMenu:
             "ui_detection": False,
             "frame_generation": False,
             "frame_multiplier": 2,
+            "frame_limit_mode": "unlimited",
+            "frame_limit_custom": 90,
             "screen_size": "",
             "profile": "",
             "profiles": [],
@@ -211,15 +257,24 @@ class OverlayMenu:
             "param_ranges": {},
             # version / windows / driver / gpu, from the log header.
             "about": {},
+            "compatibility_status": "not_run",
+            "compatibility_score": "",
             "style": 1,
             "param_defaults": {},
             "preset_active": False,
             "recording": False,
+            "recording_finalizing": False,
+            "recording_status": "",
+            "recording_details": "",
+            "recording_path": "",
             "work_size": "",
             "theme": "light",
             "rec_seconds": 0.0,
             "rec_indicator": True,
+            "recording_dir": "",
             "screenshot_dir": "",
+            "screenshot_mode": "ask",
+            "screenshot_format": "png",
             # The Spout2 bridge flag (RECORDING section). It was missing here
             # in v1.6.0, so set_state dropped it in silence and the toggle
             # always drew as off while the action behind it fired normally.
@@ -345,6 +400,12 @@ class OverlayMenu:
         # Without the highlight these zones are invisible and impossible to
         # find.
         self.hover: str | None = None
+        # Keyboard focus is a stable token rather than an item index.  Layout
+        # objects are rebuilt on every draw and pages contain repeated keys
+        # (notably one row per window), so an index would silently jump to a
+        # different control after a payload refresh.
+        self.focus_token: tuple | None = None
+        self._layout_size: tuple[int, int] | None = None
 
     @property
     def c(self) -> dict:
@@ -473,6 +534,220 @@ class OverlayMenu:
         except Exception:
             pass
 
+    # -- keyboard focus ---------------------------------------------------
+
+    @staticmethod
+    def _focus_id(item: Item) -> tuple:
+        """Stable identity for a control across the next layout rebuild."""
+        identity = None
+        if item.kind == "option" and item.key == "window":
+            identity = item.extra.get("hwnd")
+            if identity is None:
+                identity = repr(item.payload)
+        return item.kind, item.key, identity
+
+    @staticmethod
+    def _is_focusable(item: Item) -> bool:
+        if item.extra.get("disabled") or item.key == "no_windows":
+            return False
+        if item.kind == "info":
+            return item.key == "source_now"
+        return item.kind in {
+            "icon", "action", "hotkey", "button", "toggle", "choice",
+            "slider", "segmented", "option",
+        }
+
+    def _focusables(self) -> list[Item]:
+        """Interactive controls in visual reading order."""
+        controls = [item for item in self.items if self._is_focusable(item)]
+        # Scrolling moves screen rectangles but must not reorder traversal.
+        # Header icons are pinned; content uses its unscrolled Y coordinate.
+        def order(item: Item) -> tuple:
+            if item.kind == "icon":
+                return 0, item.rect.left, item.rect.top, item.key
+            return 1, item.rect.top + self.scroll, item.rect.left, item.key
+        return sorted(controls, key=order)
+
+    @property
+    def focused_item(self) -> Item | None:
+        """The current live layout item, or None before keyboard navigation."""
+        if self.focus_token is None:
+            return None
+        return next((item for item in self.items
+                     if self._focus_id(item) == self.focus_token), None)
+
+    def _set_focus(self, item: Item | None) -> None:
+        self.focus_token = self._focus_id(item) if item is not None else None
+        if self.page == "windows":
+            self.hover_window = (item.extra.get("hwnd")
+                                 if item is not None
+                                 and item.kind == "option"
+                                 and item.key == "window" else None)
+
+    def _reconcile_focus(self) -> None:
+        """Drop a token when its control disappeared after a page rebuild."""
+        if self.focus_token is not None and self.focused_item is None:
+            self.focus_token = None
+            if self.page == "windows":
+                self.hover_window = None
+
+    def _relayout(self) -> None:
+        if self._layout_size is not None and not getattr(self, "_measuring", False):
+            self.layout(*self._layout_size)
+
+    def _ensure_focus_visible(self) -> None:
+        """Scroll just enough to keep the keyboard target inside the viewport."""
+        item = self.focused_item
+        if item is None or item.kind == "icon" or self._max_scroll <= 0:
+            return
+        margin = self._u(6)
+        top = self._viewport.top + margin
+        bottom = self._viewport.bottom - margin
+        new_scroll = self.scroll
+        if item.rect.top < top:
+            new_scroll -= top - item.rect.top
+        elif item.rect.bottom > bottom:
+            new_scroll += item.rect.bottom - bottom
+        new_scroll = min(max(0, int(new_scroll)), self._max_scroll)
+        if new_scroll != self.scroll:
+            self.scroll = new_scroll
+            # Rebuild now, not one frame later: keyboard users must never
+            # focus an off-screen rectangle, even between two draw calls.
+            self._relayout()
+
+    def _cycle_focus(self, direction: int) -> None:
+        controls = self._focusables()
+        if not controls:
+            self._set_focus(None)
+            return
+        current = next((idx for idx, item in enumerate(controls)
+                        if self._focus_id(item) == self.focus_token), None)
+        if current is None:
+            index = 0 if direction > 0 else len(controls) - 1
+        else:
+            index = (current + direction) % len(controls)
+        self._set_focus(controls[index])
+        self._ensure_focus_visible()
+
+    def _open_choice(self, item: Item) -> None:
+        if self.open_choice == item.key:
+            self.open_choice = None
+            return
+        self.open_choice = item.key
+        options = list(item.payload or [])
+        current = str(item.extra.get("current", ""))
+        self._opt_index = next(
+            (idx for idx, value in enumerate(options)
+             if str(value) == current), 0)
+        # Start at the selected row. layout() clamps this back to zero when
+        # every option fits, and to the last valid page otherwise.
+        self._opt_scroll = self._opt_index
+        self._relayout()
+
+    def _keep_option_visible(self) -> None:
+        visible = max(1, len(getattr(self, "options", [])))
+        if self._opt_index < self._opt_scroll:
+            self._opt_scroll = self._opt_index
+        elif self._opt_index >= self._opt_scroll + visible:
+            self._opt_scroll = self._opt_index - visible + 1
+
+    def _activate_item(self, item: Item, *, keyboard: bool = False) -> list[tuple]:
+        """Activate a control without deriving identity from its caption."""
+        if not self._is_focusable(item):
+            return []
+        old_page = self.page
+        out: list[tuple] = []
+        if item.kind == "icon":
+            out.extend(self._icon_click(item.key))
+        elif item.kind == "action":
+            out.extend(self._action_click(item.key))
+        elif item.kind == "hotkey":
+            self.capturing = item.key
+            out.append(("capture", item.key))
+        elif item.kind == "segmented":
+            options = list(item.payload or [])
+            current = str(item.extra.get("current", ""))
+            value = next((value for value in options
+                          if str(value) == current), None)
+            if value is not None:
+                out.extend(self._pick(item.key, value))
+        elif item.kind == "info" and item.key == "source_now":
+            self.page = "windows"
+            self.scroll = 0
+            self.capturing = None
+            out.append(("capture", None))
+        elif item.kind == "toggle":
+            out.append(("nr",) if item.key == "nr" else ("toggle", item.key))
+        elif item.kind == "button":
+            out.extend(self._button_click(item.key))
+        elif item.kind == "option":
+            out.extend(self._pick(item.key, item.payload))
+            self.open_choice = None
+        elif item.kind == "choice":
+            self._open_choice(item)
+
+        if self.page != old_page:
+            self._set_focus(None)
+            self._relayout()
+            if keyboard:
+                self._cycle_focus(1)
+        return out
+
+    def _step_segmented(self, item: Item, direction: int) -> list[tuple]:
+        options = list(item.payload or [])
+        if not options:
+            return []
+        current = str(item.extra.get("current", ""))
+        index = next((idx for idx, value in enumerate(options)
+                      if str(value) == current), 0)
+        index = min(max(0, index + direction), len(options) - 1)
+        value = options[index]
+        if str(value) == current:
+            return []
+        item.extra["current"] = str(value)
+        out = self._pick(item.key, value)
+        self._relayout()
+        self._ensure_focus_visible()
+        return out
+
+    def _step_toggle(self, item: Item, turn_on: bool) -> list[tuple]:
+        if bool(item.value) == turn_on:
+            return []
+        item.value = 1.0 if turn_on else 0.0
+        self.state[item.key] = turn_on
+        return [("nr",) if item.key == "nr" else ("toggle", item.key)]
+
+    def _handle_focused_key(self, event) -> list[tuple]:
+        item = self.focused_item
+        if item is None:
+            return []
+        if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE):
+            return self._activate_item(item, keyboard=True)
+        if event.key not in (pygame.K_LEFT, pygame.K_RIGHT,
+                             pygame.K_UP, pygame.K_DOWN):
+            return []
+        direction = (1 if event.key in (pygame.K_RIGHT, pygame.K_UP) else -1)
+        if item.kind == "slider":
+            return self._step_slider(item, direction)
+        if item.kind == "segmented" and event.key in (pygame.K_LEFT,
+                                                       pygame.K_RIGHT):
+            return self._step_segmented(item, direction)
+        if item.kind == "choice":
+            choice_direction = (1 if event.key in (pygame.K_RIGHT,
+                                                    pygame.K_DOWN) else -1)
+            self._open_choice(item)
+            if self.open_choice:
+                total = len(item.payload or [])
+                self._opt_index = min(max(
+                    0, self._opt_index + choice_direction), max(0, total - 1))
+                self._keep_option_visible()
+                self._relayout()
+            return []
+        if item.kind == "toggle" and event.key in (pygame.K_LEFT,
+                                                    pygame.K_RIGHT):
+            return self._step_toggle(item, direction > 0)
+        return []
+
     # -- layout ------------------------------------------------------------
 
     def layout(self, screen_w: int, screen_h: int) -> None:
@@ -490,6 +765,7 @@ class OverlayMenu:
         current tab out to that height (the back button lands at the bottom
         of the tallest tab's panel, on every tab).
         """
+        self._layout_size = (int(screen_w), int(screen_h))
         if self.page == "settings" and not getattr(self, "_measuring", False):
             tallest = 0
             saved_tab = self.settings_tab
@@ -718,6 +994,7 @@ class OverlayMenu:
         elif self.page == "windows":
             section(s["sec_windows"])
             wins = self.state.get("windows") or []
+            current_window = _window_record(self.state.get("window_current"))
             if not wins:
                 items.append(Item("button", "no_windows",
                                   pygame.Rect(pad, cy, inner_w, act_h),
@@ -726,13 +1003,17 @@ class OverlayMenu:
                 cy += act_h + pad
             else:
                 row_h = self._u(CTRL_H) + self._u(8)
-                for idx, wname in enumerate(wins):
+                for raw_window in wins:
+                    window = _window_record(raw_window)
                     items.append(Item("option", "window",
                                       pygame.Rect(pad, cy, inner_w, row_h),
-                                      payload=wname,
-                                      extra={"label": wname,
-                                             "selected": wname == str(
-                                                 self.state.get("window_current", ""))}))
+                                      payload=window["identity"],
+                                      extra={"label": window["label"],
+                                             "hwnd": window["hwnd"],
+                                             "selected": (
+                                                 window["hwnd"] is not None
+                                                 and window["hwnd"]
+                                                 == current_window["hwnd"])}))
                     cy += row_h + self._u(4)
             cy += gap
 
@@ -778,6 +1059,14 @@ class OverlayMenu:
                    self.state.get("motion_backend", "cpu"), ["cpu", "gpu", "nvofa"],
                    labels=["CPU DIS", "GPU LK (experimental)", s.get("motion_nvofa", "NVOFA (experimental)")],
                    hint=s.get("motion_hint", "Restarts the worker; CPU fallback if unavailable"))
+            choice("screenshot_mode", s.get("screenshot_mode", "Screenshot saving"),
+                   str(self.state.get("screenshot_mode", "ask")),
+                   ["ask", "auto"],
+                   labels=[s.get("screenshot_ask", "Save As"),
+                           s.get("screenshot_auto", "Save automatically")])
+            choice("screenshot_format", s.get("screenshot_format", "Screenshot format"),
+                   str(self.state.get("screenshot_format", "png")),
+                   ["png", "jpg"], labels=["PNG", "JPEG"])
             # The screenshot folder: a plain button that opens the folder
             # picker (issue #20). The current value is shown as the caption
             # so the user sees what is configured.
@@ -796,11 +1085,35 @@ class OverlayMenu:
             # processed picture for external recorders; the recording
             # indicator is a display preference of the same subject.
             section(s["sec_recording"], "rec")
+            record_dir = self.state.get("recording_dir") or ""
+            record_label = s.get("record_dir_btn", "Recording folder...")
+            if record_dir:
+                record_label = f"{record_label}  ·  {record_dir}"
+            if show:
+                items.append(Item("button", "record_dir",
+                                  pygame.Rect(pad, cy, inner_w, ctrl_h),
+                                  extra={"label": record_label}))
+                cy += ctrl_h + gap
             toggle("spout", s.get("spout", "Spout2 output (OBS)"),
                    bool(self.state.get("spout")),
                    hint=s.get("spout_hint", ""))
             toggle("rec_indicator", s.get("rec_indicator", "Recording indicator"),
                    bool(self.state.get("rec_indicator", True)))
+            rec_status = str(self.state.get("recording_status") or "")
+            rec_details = str(self.state.get("recording_details") or "")
+            rec_path = str(self.state.get("recording_path") or "")
+            for key, info_label, value in (
+                    ("record_status", s.get("record_state", "State"),
+                     s.get(f"record_status_{rec_status}", rec_status)),
+                    ("record_details", s.get("record_format", "Format"), rec_details),
+                    ("record_path", s.get("record_path", "Path"), rec_path)):
+                if show and value:
+                    items.append(Item("info", key,
+                                      pygame.Rect(pad, cy, inner_w,
+                                                  self._u(LABEL_H)),
+                                      extra={"label": info_label,
+                                             "value": value}))
+                    cy += self._u(LABEL_H) + self._u(4)
 
             section(s["sec_behaviour"], "app")
             # The static-frame skip is OFF and its switch is not drawn. The
@@ -886,6 +1199,27 @@ class OverlayMenu:
                                                   self._u(LABEL_H)),
                                       extra={"label": label, "value": value}))
                     cy += self._u(LABEL_H) + self._u(4)
+                compat_status = str(
+                    self.state.get("compatibility_status") or "not_run")
+                compat_score = str(self.state.get("compatibility_score") or "")
+                if show:
+                    status_label = s.get(
+                        f"compatibility_{compat_status}", compat_status)
+                    value = status_label + (f" · {compat_score}" if compat_score else "")
+                    items.append(Item("info", "compatibility",
+                                      pygame.Rect(pad, cy, inner_w,
+                                                  self._u(LABEL_H)),
+                                      extra={"label": s.get(
+                                          "compatibility", "Compatibility"),
+                                             "value": value}))
+                    cy += self._u(LABEL_H) + self._u(8)
+                    items.append(Item("button", "diagnostics",
+                                      pygame.Rect(pad, cy, inner_w, act_h),
+                                      extra={"label": s.get(
+                                          "diagnostics_create",
+                                          "Create diagnostic package"),
+                                             "filled": False}))
+                    cy += act_h + self._u(6)
                 if show and about:
                     cy += self._u(6)
             section(s["lib_section"])
@@ -964,6 +1298,19 @@ class OverlayMenu:
             toggle("ui_detection", s["ui_detection"], bool(self.state.get("ui_detection")))
 
             toggle("gpu_motion", s["gpu_motion"], bool(self.state.get("gpu_motion")), hint=s["gpu_motion_hint"])
+
+            limit_mode = str(self.state.get("frame_limit_mode", "unlimited"))
+            choice("frame_limit_mode", s.get("frame_limit", "Frame limit"),
+                   limit_mode, ["30", "60", "custom", "unlimited"],
+                   labels=[s.get("frame_limit_30", "30 fps"),
+                           s.get("frame_limit_60", "60 fps"),
+                           s.get("frame_limit_custom", "Custom"),
+                           s.get("frame_limit_unlimited", "Unlimited")])
+            if limit_mode == "custom":
+                custom = int(self.state.get("frame_limit_custom", 90))
+                slider("frame_limit_custom", 15, 240, custom,
+                       s.get("frame_limit_custom_value", "Custom limit"),
+                       value_text=f"{custom} fps")
 
             boost = bool(self.state.get("nr_small"))
             toggle("boost", s["boost"], boost)
@@ -1059,11 +1406,11 @@ class OverlayMenu:
             # settings page - naming it here as well was the same thing
             # said twice (user, 12.09).
             if in_window:
-                current = str(self.state.get("window_current") or "").split(": ", 1)
+                current = _window_record(self.state.get("window_current"))
                 items.append(Item("info", "source_now",
                                   pygame.Rect(pad, cy, inner_w, self._u(LABEL_H)),
-                                  extra={"label": (current[1] if len(current) > 1
-                                                   else s["mode_window"]),
+                                  extra={"label": (current["label"]
+                                                   or s["mode_window"]),
                                          "value": str(self.state.get("work_size")
                                                       or "")}))
                 cy += self._u(LABEL_H) + gap
@@ -1147,8 +1494,11 @@ class OverlayMenu:
             # a setting, and it belongs where the source is named.
             rows = (
                 (("screenshot", s["screenshot"]),
-                 ("record", s["record_stop_short"] if self.state.get("recording")
-                  else s["record"])),
+                 ("record", (s.get("record_finalizing", "Finalizing...")
+                             if self.state.get("recording_finalizing")
+                             else s["record_stop_short"]
+                             if self.state.get("recording")
+                             else s["record"]))),
             )
             for row in rows:
                 for idx, (key, label) in enumerate(row):
@@ -1156,7 +1506,10 @@ class OverlayMenu:
                                       pygame.Rect(pad + idx * (bw + bgap),
                                                   cy, bw, act_h),
                                       extra={"label": label,
-                                             "filled": False}))
+                                             "filled": False,
+                                             "disabled": (key == "record" and
+                                                          bool(self.state.get(
+                                                              "recording_finalizing")))}))
                 cy += act_h + self._u(8)
 
         # The footer: actions with the hotkey printed underneath. "Collapse"
@@ -1324,6 +1677,8 @@ class OverlayMenu:
                                                 else opt),
                                    "selected": str(opt) == str(src.extra.get("current")),
                                    "highlighted": idx == self._opt_index}))
+        if not getattr(self, "_measuring", False):
+            self._reconcile_focus()
 
     # -- input -------------------------------------------------------------
 
@@ -1353,18 +1708,62 @@ class OverlayMenu:
             out.append(("hotkey", cmd, text))
             out.append(("capture", None))
             return out
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_TAB:
+                # Tab belongs to traversal unless a hotkey field is actively
+                # recording it (handled above).  Leaving a combo closes only
+                # that combo, then continues through the page cyclically.
+                if self.open_choice:
+                    self.open_choice = None
+                    self._relayout()
+                mods = getattr(event, "mod", 0)
+                if not mods:
+                    try:
+                        mods = pygame.key.get_mods()
+                    except Exception:
+                        mods = 0
+                self._cycle_focus(-1 if mods & pygame.KMOD_SHIFT else 1)
+                return out
+            if self.open_choice:
+                src = next((item for item in self.items
+                            if item.key == self.open_choice
+                            and item.kind == "choice"), None)
+                options = list(src.payload or []) if src is not None else []
+                total = len(options)
+                if event.key in (pygame.K_UP, pygame.K_LEFT):
+                    if self._opt_index > 0:
+                        self._opt_index -= 1
+                elif event.key in (pygame.K_DOWN, pygame.K_RIGHT):
+                    if self._opt_index < total - 1:
+                        self._opt_index += 1
+                elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER,
+                                   pygame.K_SPACE):
+                    if src is not None and 0 <= self._opt_index < total:
+                        value = options[self._opt_index]
+                        src.extra["current"] = str(value)
+                        out.extend(self._pick(self.open_choice, value))
+                    self.open_choice = None
+                elif event.key == pygame.K_ESCAPE:
+                    self.open_choice = None
+                if self.open_choice:
+                    self._keep_option_visible()
+                self._relayout()
+                return out
+            if event.key == pygame.K_ESCAPE:
+                # Preserve the existing hierarchy: capture -> open list ->
+                # panel.  Settings/windows remain ordinary panel pages here.
+                out.append(("button", "close"))
+                return out
+            return self._handle_focused_key(event)
         if event.type == pygame.MOUSEMOTION:
             self._mouse = event.pos
             # The windows page: hovering a row highlights the real window's
-            # outline on the screen. The hwnd is the hex prefix of the row.
+            # outline.  HWND is metadata on the row, never part of its label.
             self.hover_window = None
             if self.page == "windows":
                 for it in self.items:
                     if it.kind == "option" and it.rect.collidepoint(event.pos):
-                        try:
-                            self.hover_window = int(str(it.payload).split(":")[0], 16)
-                        except (ValueError, IndexError):
-                            self.hover_window = None
+                        self.hover_window = it.extra.get("hwnd")
                         break
             if self._grip.collidepoint(event.pos):
                 self.hover = "grip"
@@ -1430,7 +1829,8 @@ class OverlayMenu:
             # which returns immediately. So the icons are checked first.
             for it in self.items:
                 if it.kind == "icon" and it.rect.collidepoint(event.pos):
-                    out.extend(self._icon_click(it.key))
+                    self._set_focus(it)
+                    out.extend(self._activate_item(it))
                     return out
             if self._grip.collidepoint(event.pos):
                 self._resize_from = (event.pos, self.user_scale)
@@ -1452,47 +1852,25 @@ class OverlayMenu:
                 self._drag_item = None
                 self.open_choice = None
                 return out
-            if item.kind == "action":
-                out.extend(self._action_click(item.key))
-            elif item.kind == "hotkey":
-                clear = item.extra.get("clear")
-                if clear is not None and clear.collidepoint(event.pos):
-                    self.capturing = None
-                    out.extend([("hotkey", item.key, ""), ("capture", None)])
-                else:
-                    self.capturing = item.key
-                    out.append(("capture", item.key))
+            self._set_focus(item if self._is_focusable(item) else None)
+            if item.kind == "hotkey" and item.extra.get("clear") is not None and item.extra["clear"].collidepoint(event.pos):
+                self.capturing = None
+                out.extend([("hotkey", item.key, ""), ("capture", None)])
             elif item.kind == "segmented":
                 cells = item.extra.get("cells") or []
                 for idx, cr in enumerate(cells):
                     if cr.collidepoint(event.pos) and idx < len(item.payload or []):
-                        out.extend(self._pick(item.key, str(item.payload[idx])))
+                        old_page = self.page
+                        out.extend(self._pick(item.key, item.payload[idx]))
+                        if self.page != old_page:
+                            self._set_focus(None)
+                            self._relayout()
                         break
-            elif item.kind == "info" and item.key == "source_now":
-                # The row that names the captured window is the obvious place
-                # to click when you want a different one, and it was the one
-                # line on the page that looked like a control and was not.
-                # The list itself stays on its own page: a desktop can have
-                # twenty windows, and a list that long inside this panel
-                # would push the picture controls off the bottom - the same
-                # unbounded column the settings tabs were made to stop.
-                self.page = "windows"
-                self.scroll = 0
-                self.capturing = None
-                out.append(("capture", None))
-            elif item.kind == "toggle":
-                out.append(("nr",) if item.key == "nr" else ("toggle", item.key))
-            elif item.kind == "button":
-                if not item.extra.get("disabled"):
-                    out.extend(self._button_click(item.key))
-            elif item.kind == "option":
-                out.extend(self._pick(item.key, str(item.payload)))
-                self.open_choice = None
-            elif item.kind == "choice":
-                self.open_choice = None if self.open_choice == item.key else item.key
             elif item.kind == "slider":
                 self._drag_item = item
                 out.extend(self._slide(item, event.pos[0]))
+            else:
+                out.extend(self._activate_item(item))
         elif event.type == pygame.MOUSEMOTION and self._resize_h_from is not None:
             start_y, base = self._resize_h_from
             self.user_height = max(1, base + event.pos[1] - start_y)
@@ -1524,40 +1902,6 @@ class OverlayMenu:
                 # config.
                 self.user_height = (None if self._max_scroll == 0
                                     else self.panel_rect.h)
-        elif (event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE
-                and not self.open_choice):
-            # One Esc closes what is on top. With a drop-down open that is
-            # the drop-down (handled in the branch below, which used to be
-            # unreachable - this branch matched first and shut the whole
-            # panel while someone was stepping down the language list).
-            # Every toolkit on this desktop behaves that way, and the
-            # comment on the branch below already promised it (audit).
-            out.append(("button", "close"))
-        elif event.type == pygame.KEYDOWN and self.open_choice:
-            # The expanded list is keyboard-navigable: Up/Down move the
-            # highlight (scrolling the list into view), Enter picks, Esc
-            # closes. Without this the 12-language list was unreachable by
-            # keyboard (user: cannot step down the list with the arrows).
-            total = len(self.options) + self._opt_scroll
-            if event.key == pygame.K_UP:
-                if self._opt_index > 0:
-                    self._opt_index -= 1
-                    if self._opt_index < self._opt_scroll:
-                        self._opt_scroll = self._opt_index
-            elif event.key == pygame.K_DOWN:
-                if self._opt_index < total - 1:
-                    self._opt_index += 1
-                    if self._opt_index >= self._opt_scroll + len(self.options):
-                        self._opt_scroll = self._opt_index - len(self.options) + 1
-            elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
-                src = next((i for i in self.items
-                            if i.key == self.open_choice), None)
-                if src is not None and self._opt_index < len(src.payload or []):
-                    out.extend(self._pick(self.open_choice,
-                                          str(src.payload[self._opt_index])))
-                    self.open_choice = None
-            elif event.key == pygame.K_ESCAPE:
-                self.open_choice = None
         return out
 
     def _icon_click(self, key: str) -> list[tuple]:
@@ -1641,8 +1985,14 @@ class OverlayMenu:
             return [("profile", str(self.state.get("profile", "")))]
         return [("button", key)]
 
-    def _pick(self, key: str, value: str) -> list[tuple]:
+    def _pick(self, key: str, value: Any) -> list[tuple]:
         """A list entry was picked."""
+        if key == "window":
+            # In the v1.13 payload this is the integer HWND carried by the
+            # row.  A legacy identity token may still pass through unchanged,
+            # but the visible title is never parsed here.
+            return [("window", value)]
+        value = str(value)
         if key == "profile":
             return [("profile", value)]
         if key == "lang":
@@ -1669,11 +2019,26 @@ class OverlayMenu:
             return [("gpu", value)]
         if key == "motion_backend":
             return [("motion_backend", value)]
+        if key == "screenshot_mode":
+            if value in ("ask", "auto"):
+                self.state["screenshot_mode"] = value
+                return [("screenshot_mode", value)]
+            return []
+        if key == "screenshot_format":
+            if value in ("png", "jpg"):
+                self.state["screenshot_format"] = value
+                return [("screenshot_format", value)]
+            return []
         if key == "frame_multiplier":
             # Optimistic like style: the segment highlights at once, main
             # applies the new multiplier to the worker.
             self.state["frame_multiplier"] = int(value)
             return [("frame_multiplier", int(value))]
+        if key == "frame_limit_mode":
+            if value in ("30", "60", "custom", "unlimited"):
+                self.state["frame_limit_mode"] = value
+                return [("frame_limit_mode", value)]
+            return []
         if key == "source":
             # The same two commands the Actions buttons sent: back to the
             # whole screen, or the window list page.
@@ -1684,8 +2049,6 @@ class OverlayMenu:
                 return [("capture", None)]
             return ([("button", "window_mode")]
                     if self.state.get("window_mode") else [])
-        if key == "window":
-            return [("window", value)]
         return []
 
     def _slide(self, item: Item, mouse_x: int) -> list[tuple]:
@@ -1695,6 +2058,17 @@ class OverlayMenu:
             return []
         frac = min(1.0, max(0.0, (mouse_x - track.x) / track.w))
         value = item.lo + frac * (item.hi - item.lo)
+        return self._set_slider_value(item, value)
+
+    def _step_slider(self, item: Item, direction: int) -> list[tuple]:
+        """Move a focused slider by one meaningful keyboard step."""
+        step = (1 if item.key == "frame_multiplier"
+                else 5 if item.key == "frame_limit_custom"
+                else 0.05)
+        return self._set_slider_value(item, item.value + direction * step)
+
+    def _set_slider_value(self, item: Item, value: float) -> list[tuple]:
+        value = min(item.hi, max(item.lo, value))
         if item.key == "frame_multiplier":
             value = min(4, max(2, int(value + 0.5)))
             if value == item.value:
@@ -1702,6 +2076,14 @@ class OverlayMenu:
             item.value = value
             self.state["frame_multiplier"] = value
             return [("frame_multiplier", value)]
+        if item.key == "frame_limit_custom":
+            value = min(240, max(15, int(value + 0.5)))
+            if value == item.value:
+                return []
+            item.value = value
+            self.state["frame_limit_custom"] = value
+            item.extra["value_text"] = f"{value} fps"
+            return [("frame_limit_custom", value)]
         value = round(round(value / 0.05) * 0.05, 2)
         if abs(value - item.value) < 1e-9:
             return []
@@ -1920,11 +2302,29 @@ class OverlayMenu:
                                   shade.get_height()))
             surface.blit(shade, (list_rect.x - fade, list_rect.y - fade))
         self._draw_options(surface)
+        focused = self.focused_item
+        if focused is not None and focused.kind != "icon":
+            self._draw_focus_ring(surface, focused)
         surface.set_clip(prev_clip)
         for item in self.items:
             if item.kind == "icon":
                 self._draw_icon(surface, item, s)
+        if focused is not None and focused.kind == "icon":
+            self._draw_focus_ring(surface, focused)
         self._draw_scrollbar(surface)
+
+    def _draw_focus_ring(self, surface, item: Item) -> None:
+        """A high-contrast, theme-specific ring independent of hover state."""
+        rect = item.rect
+        if item.kind == "choice":
+            rect = item.extra.get("strip") or rect
+        elif item.kind == "hotkey":
+            rect = item.extra.get("field") or rect
+        gap = self._u(2)
+        ring = rect.inflate(gap * 2, gap * 2)
+        pygame.draw.rect(surface, _rgb(self.c["focus"]), ring,
+                         max(2, self._u(2)),
+                         border_radius=self._u(RADIUS // 2) + gap)
 
     def _draw_scrollbar(self, surface) -> None:
         """A thin strip at the right edge. It appears only when there is
@@ -1991,26 +2391,22 @@ class OverlayMenu:
         # here with no upper bound - "NVIDIA GeForce RTX 5070 Ti Laptop GPU"
         # is a real one - so it is the only thing that gets elided, and it
         # disappears rather than collide when the room runs out.
-        # The frame rate stays a frame rate. It used to be replaced by the
-        # word "idle" while the network skipped an unchanged screen, and the
-        # reading jumped between a number and a word as the screen came and
-        # went - a counter that twitches instead of counting (user, 13.09).
-        # The loop keeps running through a skipped stretch, so the number is
-        # true the whole time. State belongs in the sentence on the left;
-        # numbers stay numbers.
+        # NR is the rate of real neural evaluations. Idle acknowledgements do
+        # not inflate it; their cumulative count is shown separately. FG is
+        # the worker presenter's reported output rate, not an inferred display
+        # refresh rate.
         fps = st.get("fps")
         shown = st.get("display_fps")
         readings = []
         if not paused and not failed:
-            # Frame Generation: the presenter's rate next to the network's.
-            # "42 / 84 fps" - the first is what the network produced, the
-            # second what the screen shows (real + generated frames).
-            if isinstance(shown, (int, float)) and isinstance(fps, (int, float)) \
-                    and shown > fps + 0.5:
-                readings.append(f"{fps:.0f} / {shown:.0f} fps")
-            else:
-                readings.append(f"{fps:.1f} fps"
-                                if isinstance(fps, (int, float)) else "— fps")
+            readings.append(
+                f"{s.get('nr_short', 'NR')} {fps:.1f}"
+                if isinstance(fps, (int, float)) else
+                f"{s.get('nr_short', 'NR')} —")
+            if isinstance(shown, (int, float)) and shown > 0:
+                readings.append(f"{s.get('fg_short', 'FG')} {shown:.0f}")
+            skipped = max(0, int(st.get("skipped_static", 0) or 0))
+            readings.append(f"{s.get('skipped_short', 'SKIP')} {skipped}")
             readings.append(str(st.get("resolution", "—")))
         x = rect.right - pad
         for value in reversed(readings):
@@ -2254,8 +2650,10 @@ class OverlayMenu:
                 fill = self.c["bg"]
             pygame.draw.rect(surface, _rgb(fill), opt.rect,
                              border_radius=self._u(RADIUS // 2))
-            pygame.draw.rect(surface, _rgb(self.c["border"]), opt.rect,
-                             self._u(1), border_radius=self._u(RADIUS // 2))
+            edge = self.c["focus"] if highlighted else self.c["border"]
+            pygame.draw.rect(surface, _rgb(edge), opt.rect,
+                             max(2, self._u(2)) if highlighted else self._u(1),
+                             border_radius=self._u(RADIUS // 2))
             color = self.c["bg"] if selected else self.c["text"]
             text = opt.extra.get("label", "")
             # The language list shows every language in its own script; the

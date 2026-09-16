@@ -21,6 +21,7 @@ import sys
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -309,6 +310,17 @@ FRAME_FLAG_PREPARED = 0x1000
 
 FRAME_MAGIC = 0x314D5246  # 'FMR1'
 OUT_MAGIC = 0x3154554F    # 'OUT1'
+OUT_STATUS_OK = 0x1
+OUT_STATUS_SKIPPED = 0x2
+
+# CACK: the worker's explicit verdict for the CreateFeature performed from
+# the initial VIDEO header.  A full RGBA frame is not enough evidence: on an
+# unsupported GPU the worker deliberately stays alive in SAFE PASSTHROUGH.
+CREATE_ACK_MAGIC = 0x4B434143
+CREATE_ACK_FMT = "<4Iq"  # magic, ok, ngx_result, category, pts
+CREATE_CATEGORY_NONE = 0
+CREATE_CATEGORY_UNSUPPORTED = 1
+CREATE_CATEGORY_FAILED = 2
 
 HEADER_FMT = "<10I4f2I"   # magic, w, h, warmup, frame_count, profile, preset,
                           # style, auto_mask, ui_correction, intensity,
@@ -316,6 +328,15 @@ HEADER_FMT = "<10I4f2I"   # magic, w, h, warmup, frame_count, profile, preset,
                           # full_w, full_h
 FRAME_FMT = "<4Iq"        # magic, index, reset, reserved, pts
 OUT_FMT = "<5Iq"          # magic, index, ok, bytes, ngx_result, pts
+
+
+@dataclass(frozen=True)
+class FrameReply:
+    """One OUT1 reply, including work that intentionally did not run."""
+
+    pixels: np.ndarray | None
+    skipped: bool
+    ngx_result: int
 
 # SHMI: the frame travels through shared memory and only the FRM1 header with
 # the FRAME_FLAG_SHM flag goes down the pipe. The worker loads the pixels into
@@ -634,6 +655,8 @@ class WorkerReader:
         self._worker = worker
         self._width = width
         self._height = height
+        self.last_skipped = False
+        self.last_ngx_result = 0
         # The pixels arrive through it once the OUTS channel is agreed.
         self._shm = shm
         self._queue: queue.Queue = queue.Queue()
@@ -651,6 +674,12 @@ class WorkerReader:
                     rest = _read_exact(self._worker.stdout, struct.calcsize(MOTION_ACK_FMT) - 4)
                     _magic, ok, _r0, _r1, _pts = struct.unpack(MOTION_ACK_FMT, magic_raw + rest)
                     self._queue.put(("mack", ok))
+                elif magic == CREATE_ACK_MAGIC:
+                    rest = _read_exact(
+                        self._worker.stdout, struct.calcsize(CREATE_ACK_FMT) - 4)
+                    _magic, ok, ngx_result, category, _pts = struct.unpack(
+                        CREATE_ACK_FMT, magic_raw + rest)
+                    self._queue.put(("cack", (ok, ngx_result, category)))
                 elif magic == WINDOW_ACK_MAGIC:
                     # WACK: acknowledgement of WNDO - the window is up or closed
                     rest = _read_exact(self._worker.stdout, struct.calcsize(WINDOW_ACK_FMT) - 4)
@@ -692,9 +721,11 @@ class WorkerReader:
                     self._queue.put(("gak", ok))
                 elif magic == OUT_MAGIC:
                     rest = _read_exact(self._worker.stdout, struct.calcsize(OUT_FMT) - 4)
-                    _magic, out_index, ok, byte_count, ngx_result, _pts = struct.unpack(OUT_FMT, magic_raw + rest)
-                    if not ok:
-                        raise RuntimeError(f"worker answered with an error for frame {out_index}: ok={ok}")
+                    _magic, out_index, status, byte_count, ngx_result, _pts = struct.unpack(OUT_FMT, magic_raw + rest)
+                    if not (status & OUT_STATUS_OK):
+                        raise RuntimeError(
+                            f"worker answered with an error for frame {out_index}: status={status}")
+                    skipped = bool(status & OUT_STATUS_SKIPPED)
                     # The NGX result is not a boolean: 0x00000000 means "no
                     # frame this call" (the network skipped the evaluation -
                     # a laptop on the iGPU, a driver hiccup) and is NOT a
@@ -710,7 +741,8 @@ class WorkerReader:
                         # showed the frame in its own window) or a skipped
                         # frame (0x00000000). Either way there is nothing
                         # to show - the pipeline waits for the next one.
-                        self._queue.put((out_index, None))
+                        self._queue.put((out_index, FrameReply(
+                            None, skipped, ngx_result)))
                         continue
                     if byte_count == OUT_BYTES_IN_SHM:
                         # The pixels are in the OUTS section. The copy is made
@@ -726,16 +758,19 @@ class WorkerReader:
                             # A torn frame (seqlock retries exhausted): skip
                             # it, but keep the protocol paired - main treats
                             # None as "frame not ready" and moves on.
-                            self._queue.put((out_index, None))
+                            self._queue.put((out_index, FrameReply(
+                                None, skipped, ngx_result)))
                             continue
-                        self._queue.put((out_index, frame))
+                        self._queue.put((out_index, FrameReply(
+                            frame, skipped, ngx_result)))
                         continue
                     if byte_count != self._width * self._height * 4:
                         raise RuntimeError(
                             f"worker returned {byte_count} bytes instead of {self._width * self._height * 4}")
                     data = _read_exact(self._worker.stdout, byte_count)
                     frame = np.frombuffer(data, dtype=np.uint8).reshape(self._height, self._width, 4)
-                    self._queue.put((out_index, frame))
+                    self._queue.put((out_index, FrameReply(
+                        frame, skipped, ngx_result)))
                 else:
                     raise RuntimeError(f"invalid magic in the worker reply: 0x{magic:08X}")
         except Exception as exc:
@@ -764,6 +799,25 @@ class WorkerReader:
                 if not payload:
                     raise RuntimeError("the worker could not enable GPU motion upscaling")
                 return
+
+    def wait_create_ack(self, timeout: float) -> tuple[int, int, int]:
+        """Wait for the initial CreateFeature verdict from the VIDEO header."""
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"the worker did not acknowledge feature creation within {timeout:.0f}s")
+            try:
+                got, payload = self._queue.get(timeout=remaining)
+            except queue.Empty:
+                continue
+            if got is None:
+                raise payload if isinstance(payload, Exception) else EOFError(
+                    "the worker stopped")
+            if got == "cack":
+                ok, ngx_result, category = payload
+                return int(ok), int(ngx_result), int(category)
 
     def wait_wack(self, timeout: float) -> None:
         """Wait for WACK - the acknowledgement of the WNDO command."""
@@ -928,4 +982,12 @@ class WorkerReader:
                     raise payload
                 raise EOFError("the worker stopped")
             if got_index == index:
+                if isinstance(payload, FrameReply):
+                    self.last_skipped = payload.skipped
+                    self.last_ngx_result = payload.ngx_result
+                    return payload.pixels
+                # Compatibility for tests and third-party callers that place
+                # legacy payloads into the private queue.
+                self.last_skipped = False
+                self.last_ngx_result = 0
                 return payload

@@ -25,11 +25,21 @@ runtime/
 # Program log (pythonw launch without a console)
 NeuralScreen.log
 
+# Per-machine compatibility verdict and user-created support bundles
+compatibility-cache.json
+support-bundles/
+
+# Per-user settings. The tracked product defaults live in config.default.json.
+config.json
+
 # Recordings made with Num0
 recordings/
 
 # Release archives in the root (rebuilt at release time)
 *.zip
+
+# The outer checksum sidecar built next to the archive (rebuilt at release time)
+SHA256SUMS
 
 # Screenshots taken with the menu button
 screenshots/

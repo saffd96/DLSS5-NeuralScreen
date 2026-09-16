@@ -3,6 +3,7 @@ import ctypes
 import os
 from pathlib import Path
 import struct
+from worker_reply import read_reply
 import subprocess
 import sys
 import threading
@@ -34,7 +35,7 @@ def run():
     logs=[]
     thread=threading.Thread(target=lambda:logs.extend(iter(p.stderr.readline,b'')),daemon=True);thread.start()
     watchdog=threading.Timer(30,p.kill);watchdog.start()
-    def ack(fmt): return struct.unpack(fmt,exact(p.stdout,struct.calcsize(fmt)))
+    def ack(fmt): return struct.unpack(fmt,read_reply(p.stdout, struct.calcsize(fmt)))
     def capture(index):
         p.stdin.write(struct.pack(wire.FRAME_FMT,wire.CAPTURE_MAGIC,index,0,0,index));p.stdin.flush()
         assert ack(wire.OUT_FMT)[2]==1

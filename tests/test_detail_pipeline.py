@@ -2,6 +2,7 @@
 import os
 from pathlib import Path
 import struct
+from worker_reply import read_reply
 import subprocess
 import sys
 import threading
@@ -38,7 +39,7 @@ def capture(name, sr, scale, baseline=False, source_image=None, strengths=(0, 50
     folder.mkdir(parents=True, exist_ok=True)
 
     def ack():
-        a = struct.unpack(wire.OUT_FMT, exact(worker.stdout, struct.calcsize(wire.OUT_FMT)))
+        a = struct.unpack(wire.OUT_FMT, read_reply(worker.stdout, struct.calcsize(wire.OUT_FMT)))
         assert a[2] == 1, a
         return a
 

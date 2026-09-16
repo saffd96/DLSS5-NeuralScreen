@@ -1721,8 +1721,11 @@ static constexpr uint32_t CAPTURE_MAGIC = 0x31504143u; // CAP1
 static constexpr uint32_t FRAME_FLAG_PREPARED = 0x1000u;
 static constexpr uint32_t FRAME_MAGIC = 0x314D5246u; // "FRM1"
 static constexpr uint32_t OUT_MAGIC   = 0x3154554Fu; // "OUT1"
+static constexpr uint32_t OUT_STATUS_OK = 0x1u;
+static constexpr uint32_t OUT_STATUS_SKIPPED = 0x2u;
 static constexpr uint32_t RESIZE_MAGIC    = 0x5A534E52u; // "RNSZ" -- reconfigure on the fly (work size + params)
 static constexpr uint32_t RESIZE_ACK_MAGIC = 0x4B434152u; // "RACK" -- worker -> client reply to RNSZ
+static constexpr uint32_t CREATE_ACK_MAGIC = 0x4B434143u; // "CACK" -- initial CreateFeature verdict
 static constexpr uint32_t SHM_MAGIC     = 0x494D4853u; // "SHMI" -- client -> worker: frame payload lives in shared memory
 static constexpr uint32_t SHM_ACK_MAGIC = 0x4B434153u; // "SACK" -- worker -> client reply to SHMI
 static constexpr uint32_t WINDOW_MAGIC     = 0x4F444E57u; // "WNDO" -- client -> worker: present results yourself
@@ -1827,6 +1830,15 @@ static constexpr uint32_t RESIZE_FLAG_NR_DIRECT = 0x2u;
 struct VideoResizeAck
 {
     uint32_t magic, ok, ngx_result, reserved;
+    int64_t pts;
+};
+
+struct VideoCreateAck
+{
+    uint32_t magic;
+    uint32_t ok;
+    uint32_t ngx_result;
+    uint32_t category; // 0 success, 1 exact unsupported, 2 other create failure
     int64_t pts;
 };
 // SHMI: client -> worker, once per worker lifetime (right after the stream
@@ -1951,6 +1963,7 @@ static_assert(sizeof(VideoFrameHeader) == 24, "VideoFrameHeader != FRAME_FMT");
 static_assert(sizeof(VideoResultHeader) == 28, "VideoResultHeader != OUT_FMT");
 static_assert(sizeof(VideoResizeCmd) == 64, "VideoResizeCmd != RESIZE_FMT");
 static_assert(sizeof(VideoResizeAck) == 24, "VideoResizeAck != RACK_FMT");
+static_assert(sizeof(VideoCreateAck) == 24, "VideoCreateAck != CREATE_ACK_FMT");
 static_assert(sizeof(VideoShmCmd) == 88, "VideoShmCmd != SHM_FMT");
 static_assert(sizeof(VideoShmAck) == 24, "VideoShmAck != SHM_ACK_FMT");
 static_assert(sizeof(VideoWindowCmd) == 24, "VideoWindowCmd != WINDOW_FMT");
@@ -3833,11 +3846,11 @@ static bool DeliverPixels(const std::vector<BYTE> &output, uint32_t index,
         memcpy(g_out_map + 8, output.data(), output.size());
         ++seq;                              // even: done
         memcpy(g_out_map, &seq, sizeof(seq));
-        VideoResultHeader out = { OUT_MAGIC, index, 1u, OUT_BYTES_IN_SHM,
+        VideoResultHeader out = { OUT_MAGIC, index, OUT_STATUS_OK, OUT_BYTES_IN_SHM,
                                   g_last_eval_result, pts };
         return WriteExact(g_wire, &out, sizeof(out));
     }
-    VideoResultHeader out = { OUT_MAGIC, index, 1u,
+    VideoResultHeader out = { OUT_MAGIC, index, OUT_STATUS_OK,
                               static_cast<uint32_t>(output.size()),
                               g_last_eval_result, pts };
     return WriteExact(g_wire, &out, sizeof(out))
@@ -4228,48 +4241,42 @@ static bool OpenDda(UINT w, UINT hgt)
     g_dda_hdr_mode = HdrEnabled() && g_capture_display.enabled;
     IDXGIOutput5 *output5 = nullptr;
     hr = E_FAIL;
-    if (SUCCEEDED(output->QueryInterface(__uuidof(IDXGIOutput5), (void **)&output5)))
+    if (!g_dda_hdr_mode)
     {
-        // DuplicateOutput() has no format contract. On a 10-bit SDR desktop
-        // it can alternate FP16 and BGRA8 from one frame to the next (#86),
-        // which makes the shared bridge churn and the displayed picture blink.
-        // DuplicateOutput1 converts a format that is not listed here before
-        // AcquireNextFrame returns it. Keep SDR deliberately to one stable
-        // BGRA8 format; HDR compatibility retains the existing FP16-first
-        // path so it can preserve scRGB when the user explicitly asked for it.
+        // DuplicateOutput1 was meant to pin SDR to the one advertised BGRA8
+        // format. Real v1.12 logs from two drivers (#86 and #89) proved that
+        // contract insufficient here: AcquireNextFrame still alternated FP16
+        // and BGRA8 thousands of times although DuplicateOutput1 succeeded.
+        // The original DuplicateOutput has the stronger SDR behaviour we need:
+        // DXGI converts the desktop to 32-bit BGRA. Use it deliberately while
+        // HDR compatibility is off, so one driver quirk cannot rebuild the
+        // bridge on every mouse movement.
+        hr = output1->DuplicateOutput(g_dda_d11, &g_dda_dup);
+        if (SUCCEEDED(hr))
+            Log("[dda] SDR capture fixed to BGRA8 through legacy duplication");
+    }
+    else if (SUCCEEDED(output->QueryInterface(__uuidof(IDXGIOutput5),
+                                               (void **)&output5)))
+    {
+        // HDR compatibility is the only mode that needs a high-colour surface.
+        // Keep BGRA8 as the fallback format accepted by DuplicateOutput1.
         const DXGI_FORMAT hdr_formats[] = {
             DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_B8G8R8A8_UNORM};
-        const DXGI_FORMAT sdr_formats[] = {DXGI_FORMAT_B8G8R8A8_UNORM};
-        const DXGI_FORMAT *formats = g_dda_hdr_mode ? hdr_formats : sdr_formats;
-        const UINT format_count = g_dda_hdr_mode ? _countof(hdr_formats)
-                                                  : _countof(sdr_formats);
-        hr = output5->DuplicateOutput1(g_dda_d11, 0, format_count, formats, &g_dda_dup);
+        hr = output5->DuplicateOutput1(g_dda_d11, 0, _countof(hdr_formats),
+                                       hdr_formats, &g_dda_dup);
         output5->Release();
         if (FAILED(hr))
-            Log(g_dda_hdr_mode
-                    ? "[hdr] FP16 duplication refused 0x%08X - capturing in SDR instead"
-                    : "[dda] BGRA8-pinned duplication refused 0x%08X - using legacy capture",
-                hr);
-        else if (!g_dda_hdr_mode)
-            Log("[dda] SDR capture pinned to BGRA8 (stable across 10-bit scan-out)");
+            Log("[hdr] FP16 duplication refused 0x%08X - capturing in SDR instead", hr);
     }
-    else if (g_dda_hdr_mode)
-        Log("[hdr] this Windows has no IDXGIOutput5 - capturing in SDR instead");
     else
-        Log("[dda] this Windows has no IDXGIOutput5 - legacy capture may change format");
-    if (FAILED(hr))
+        Log("[hdr] this Windows has no IDXGIOutput5 - capturing in SDR instead");
+    if (g_dda_hdr_mode && FAILED(hr))
     {
-        // SDR, and never silently: the first staged frame logs "capture=SDR"
-        // and the menu then says HDR is not being preserved (warn_hdr). The
-        // alternative - refusing to duplicate at all - turns a washed-out
-        // picture into no picture, which is the worse of the two on hardware
-        // nobody here can see.
-        //
-        // g_dda_hdr_mode stays as it is on purpose: it records what this
-        // capture was OPENED for, and DdaGrab compares it against what the
-        // desktop is doing now to notice a mode change. Lowering it here
-        // would make that comparison disagree every second and reopen the
-        // duplication forever.
+        // HDR was requested but Output5 could not provide it. Fall back to the
+        // stable SDR conversion, and never silently: the first staged frame
+        // logs "capture=SDR" and the menu warns that HDR is not preserved.
+        // g_dda_hdr_mode stays true so DdaGrab can still notice a real desktop
+        // HDR mode change without reopening the duplication every second.
         hr = output1->DuplicateOutput(g_dda_d11, &g_dda_dup);
     }
     output1->Release(); output->Release(); adapter->Release(); factory->Release();
@@ -4317,12 +4324,11 @@ static double PhaseNow();
 static void PhaseAdd(int idx, double t0);
 static bool PhaseEnabled();
 
-// FormatChanged is NOT SizeChanged. SDR DDA normally pins its output to
-// BGRA8 through DuplicateOutput1 (#86), so a 10-bit scan-out cannot alternate
+// FormatChanged is NOT SizeChanged. SDR DDA is converted to BGRA8 through the
+// original DuplicateOutput (#86/#89), so a 10-bit scan-out cannot alternate
 // FP16/BGRA8 and churn this bridge. The distinction remains load-bearing for
-// older Windows or a driver that refuses Output5: their legacy duplication can
-// still change format, and reopening the whole duplication for it costs far
-// more than rebuilding this bridge.
+// WGC and the HDR path: those sources can still change format, and reopening
+// the whole capture for it costs far more than rebuilding this bridge.
 enum class StageResult { Ok, SizeChanged, FormatChanged, Failed };
 
 // Everything between "a captured D3D11 texture" and "the bytes are in the
@@ -5905,9 +5911,22 @@ static int RunVideo()
     // In nr_small mode the feature is created at the work resolution and told
     // nothing about the screen: it is handed a work-sized frame and returns a
     // work-sized one, and the scaling on both sides is ours.
-    if (!CreateFeature(vh.width, vh.height, flags, &create_result,
-                       (v.nr_small || !upscale) ? 0 : vh.full_w,
-                       (v.nr_small || !upscale) ? 0 : vh.full_h))
+    const bool feature_created = CreateFeature(
+        vh.width, vh.height, flags, &create_result,
+        (v.nr_small || !upscale) ? 0 : vh.full_w,
+        (v.nr_small || !upscale) ? 0 : vh.full_h);
+    const uint32_t create_category = feature_created ? 0u :
+        (static_cast<uint32_t>(create_result) == 0xBAD00001u ? 1u : 2u);
+    const VideoCreateAck create_ack = {
+        CREATE_ACK_MAGIC, feature_created ? 1u : 0u,
+        static_cast<uint32_t>(create_result), create_category, 0
+    };
+    if (!WriteExact(g_wire, &create_ack, sizeof(create_ack)))
+    {
+        Log("[video] could not write the initial CreateFeature acknowledgement");
+        return 10;
+    }
+    if (!feature_created)
     {
         if (g_submission_failed) return 3;
         // A feature-create refusal is not a reason to kill the desktop
@@ -6240,7 +6259,7 @@ static int RunVideo()
             { Log("[cap] gray update failed; refusing mismatched motion"); return 10; }
             prepared_index = fh.index;
             prepared = true;
-            VideoResultHeader ack = {OUT_MAGIC, fh.index, 1u, 0u, 0u, fh.pts};
+            VideoResultHeader ack = {OUT_MAGIC, fh.index, OUT_STATUS_OK, 0u, 0u, fh.pts};
             if (!WriteExact(g_wire, &ack, sizeof(ack))) return 10;
             continue;
         }
@@ -6365,7 +6384,7 @@ static int RunVideo()
                 // Not a single real desktop frame yet: keep the protocol
                 // paired with an empty OUT1 and wait for the screen to change,
                 // WITHOUT running NGX on an empty colour (evaluate on zero hangs).
-                VideoResultHeader empty = { OUT_MAGIC, fh.index, 1u, 0u, g_last_eval_result, fh.pts };
+                VideoResultHeader empty = { OUT_MAGIC, fh.index, OUT_STATUS_OK, 0u, g_last_eval_result, fh.pts };
                 if (!WriteExact(g_wire, &empty, sizeof(empty))) return 10;
                 ProfileFrameResult(v, fh, false, "idle");
                 if (phase_on) ++g_ph_idle;
@@ -6416,7 +6435,9 @@ static int RunVideo()
                     // the frame it sits in can still move - keep the overlay on it.
                     FollowCapturedWindow();
                     ReassertPresentTopmost();
-                    VideoResultHeader idle = { OUT_MAGIC, fh.index, 1u, 0u, g_last_eval_result, fh.pts };
+                    VideoResultHeader idle = { OUT_MAGIC, fh.index,
+                        OUT_STATUS_OK | OUT_STATUS_SKIPPED, 0u,
+                        g_last_eval_result, fh.pts };
                     if (!WriteExact(g_wire, &idle, sizeof(idle))) return 10;
                     ProfileFrameResult(v, fh, false, "idle");
                     if (phase_on) ++g_ph_idle;
@@ -6577,7 +6598,7 @@ static int RunVideo()
             }
             else
             {
-                VideoResultHeader out = { OUT_MAGIC, fh.index, 1u, 0u, g_last_eval_result, fh.pts };
+                VideoResultHeader out = { OUT_MAGIC, fh.index, OUT_STATUS_OK, 0u, g_last_eval_result, fh.pts };
                 if (!WriteExact(g_wire, &out, sizeof(out))) return 10;
             }
         }

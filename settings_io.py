@@ -6,19 +6,23 @@ whether neural rendering is really running on it. In: the two things a user
 changes through the menu that have to survive a restart - the menu's own
 position and size, and the hotkey assignments.
 
-Both go into config.json through the atomic writer rather than over the live
-file: a crash mid-write used to truncate the config and lose every setting.
+Product defaults live in config.default.json.  The neighbouring config.json is
+the user's copy: it is created from those defaults on first launch and migrated
+in place when the schema advances.  Both menu save paths keep using the atomic
+writer rather than writing over the live file; a crash mid-write used to
+truncate the config and lose every setting.
 """
 from __future__ import annotations
 
 import math
+from copy import deepcopy
 import json
 import os
 import sys
 import winreg
 from pathlib import Path
 
-from paths import BASE_DIR
+from paths import BASE_DIR, DEFAULT_CONFIG_PATH
 from capture import devicename_for_output_idx, list_adapters, list_monitors
 from i18n import STRINGS as UI_STRINGS
 # The work caps are the worker's contract, not a setting: the same two
@@ -134,7 +138,7 @@ def _set_autostart(enabled: bool) -> bool:
 
 # The version shown in the menu header. Kept in sync with native/launcher.rc
 # (FileVersion/ProductVersion) and build_release_zip.py at release time.
-APP_VERSION = "1.12.0"
+APP_VERSION = "1.13.0"
 
 
 # The channel label: the header shows the version, the channel lives in the
@@ -248,6 +252,32 @@ PRESET_KEYS = ("intensity", "local_tone", "local_structure", "skin_structure")
 DEFAULT_LANG = "en"
 
 
+# Version 0 is every config written before config.default.json existed.  Keep
+# migrations incremental so a future schema adds one small step instead of
+# turning load_config() into a pile of unrelated compatibility checks.
+CONFIG_SCHEMA_VERSION = 1
+
+# Processing-rate limiter.  The named modes are stable config values; custom
+# remains a separate number so switching to 30/60 and back does not erase it.
+FRAME_LIMIT_MODES = ("30", "60", "custom", "unlimited")
+FRAME_LIMIT_CUSTOM_MIN = 15
+FRAME_LIMIT_CUSTOM_MAX = 240
+
+
+def frame_limit_fps(cfg: dict) -> int:
+    """Resolve the persisted limiter mode to an FPS cap; zero is unlimited."""
+    mode = str(cfg.get("frame_limit_mode", "unlimited"))
+    if mode in ("30", "60"):
+        return int(mode)
+    if mode != "custom":
+        return 0
+    try:
+        value = int(cfg.get("frame_limit_custom", 90))
+    except (TypeError, ValueError, OverflowError):
+        value = 90
+    return min(FRAME_LIMIT_CUSTOM_MAX, max(FRAME_LIMIT_CUSTOM_MIN, value))
+
+
 # The NGX plumbing a preset carries along with the four sliders: the range
 # it must be in, and what to use when it is not there at all. Presets saved
 # by builds up to 1.8.2 also carry profile/preset/ui_correction; those are
@@ -312,10 +342,86 @@ def load_presets(cfg: dict) -> dict:
     return presets
 
 
-def load_config(path: Path) -> dict:
-    """Load and validate config.json."""
+def _read_config_object(path: Path, label: str) -> dict:
+    """Read one JSON object without changing it."""
     with open(path, "r", encoding="utf-8") as fh:
-        cfg = json.load(fh)
+        value = json.load(fh)
+    if not isinstance(value, dict):
+        raise ValueError(f"{label}: root must be an object")
+    return value
+
+
+def _schema_version(cfg: dict, label: str) -> int:
+    """Return a strict non-negative schema version (missing means legacy 0)."""
+    version = cfg.get("schema_version", 0)
+    if isinstance(version, bool) or not isinstance(version, int) or version < 0:
+        raise ValueError(f"{label}: schema_version must be a non-negative integer")
+    return version
+
+
+def _load_default_config() -> dict:
+    """Load the shipped defaults and require them to match this executable."""
+    defaults = _read_config_object(DEFAULT_CONFIG_PATH, "config.default.json")
+    version = _schema_version(defaults, "config.default.json")
+    if version != CONFIG_SCHEMA_VERSION:
+        raise ValueError(
+            "config.default.json: schema_version "
+            f"{version} does not match application schema {CONFIG_SCHEMA_VERSION}"
+        )
+    return defaults
+
+
+def _migrate_config(cfg: dict, defaults: dict) -> tuple[dict, bool]:
+    """Migrate a user config without discarding keys unknown to this build.
+
+    The v0 -> v1 migration overlays the complete old user object on the shipped
+    defaults.  This fills fields introduced since the user's install while
+    preserving user values, presets, hotkeys, and third-party/experimental
+    keys.  Configs written by a newer application are rejected rather than
+    silently downgraded.
+    """
+    version = _schema_version(cfg, "config.json")
+    if version > CONFIG_SCHEMA_VERSION:
+        raise ValueError(
+            f"config.json: schema_version {version} is newer than supported "
+            f"{CONFIG_SCHEMA_VERSION}"
+        )
+
+    migrated = deepcopy(cfg)
+    changed = False
+    # Older fork configs stored only the strength: preserve their enabled state
+    # before product defaults fill the new explicit switch.
+    if "detail_enabled" not in migrated and "detail_strength" in migrated:
+        try:
+            strength = float(migrated["detail_strength"])
+            migrated["detail_enabled"] = math.isfinite(strength) and strength > 0
+        except (TypeError, ValueError, OverflowError):
+            migrated["detail_enabled"] = False
+        changed = True
+    while version < CONFIG_SCHEMA_VERSION:
+        if version == 0:
+            merged = deepcopy(defaults)
+            merged.update(migrated)
+            merged["schema_version"] = 1
+            migrated = merged
+            version = 1
+            changed = True
+            continue
+        raise ValueError(f"config.json: no migration from schema_version {version}")
+
+    # Defaults remain the authoritative list of known settings.  Filling a
+    # missing field is safe even when the version marker is already current;
+    # the user's complete object is overlaid last, so no value or unknown key
+    # is replaced.
+    merged = deepcopy(defaults)
+    merged.update(migrated)
+    if merged != migrated:
+        changed = True
+    return merged, changed
+
+
+def _validate_config(cfg: dict) -> dict:
+    """Validate and normalise an already migrated config object."""
     if not isinstance(cfg, dict):
         raise ValueError("config.json: root must be an object")
     required = {"monitor", "width", "height", "fullscreen", "warmup", "profile",
@@ -390,7 +496,47 @@ def load_config(path: Path) -> dict:
         cfg["frame_multiplier"] = min(4, max(2, int(cfg.get("frame_multiplier", 2))))
     except (ValueError, TypeError, OverflowError):
         cfg["frame_multiplier"] = 2
+    mode = str(cfg.get("frame_limit_mode", "unlimited"))
+    cfg["frame_limit_mode"] = mode if mode in FRAME_LIMIT_MODES else "unlimited"
+    try:
+        custom = int(cfg.get("frame_limit_custom", 90))
+    except (ValueError, TypeError, OverflowError):
+        custom = 90
+    cfg["frame_limit_custom"] = min(
+        FRAME_LIMIT_CUSTOM_MAX, max(FRAME_LIMIT_CUSTOM_MIN, custom))
+    for directory_key in ("recording_dir", "screenshot_dir"):
+        value = cfg.get(directory_key, "")
+        cfg[directory_key] = value if isinstance(value, str) else ""
+    screenshot_mode = str(cfg.get("screenshot_mode", "ask"))
+    cfg["screenshot_mode"] = (screenshot_mode
+                              if screenshot_mode in ("ask", "auto") else "ask")
+    screenshot_format = str(cfg.get("screenshot_format", "png")).lower()
+    cfg["screenshot_format"] = (screenshot_format
+                                if screenshot_format in ("png", "jpg") else "png")
     return cfg
+
+
+def load_config(path: Path) -> dict:
+    """Load, safely migrate, validate, and if needed create config.json.
+
+    Migration is persisted only after the complete candidate validates.  The
+    atomic writer therefore leaves an invalid, future-version, or interrupted
+    user config byte-for-byte intact.
+    """
+    path = Path(path)
+    defaults = _load_default_config()
+    normalized_defaults = _validate_config(deepcopy(defaults))
+    if normalized_defaults != defaults:
+        raise ValueError(
+            "config.default.json: values must already be in canonical form")
+
+    existed = path.is_file()
+    raw = (_read_config_object(path, "config.json") if existed else {})
+    migrated, changed = _migrate_config(raw, defaults)
+    validated = _validate_config(deepcopy(migrated))
+    if not existed or changed:
+        _atomic_write_json(path, migrated)
+    return validated
 
 
 def resolve_params(cfg: dict) -> dict:
@@ -506,7 +652,14 @@ def _menu_layout_payload(cfg: dict, params: dict, monitor: int, lang: str,
         "style": int(params.get("style", 1)),
         "monitor": monitor_name if monitor_name is not None else int(monitor),
         "rec_indicator": bool(cfg.get("rec_indicator", True)),
+        "recording_dir": cfg.get("recording_dir") or "",
         "screenshot_dir": cfg.get("screenshot_dir") or "",
+        "screenshot_mode": (str(cfg.get("screenshot_mode", "ask"))
+                            if str(cfg.get("screenshot_mode", "ask"))
+                            in ("ask", "auto") else "ask"),
+        "screenshot_format": (str(cfg.get("screenshot_format", "png"))
+                              if str(cfg.get("screenshot_format", "png"))
+                              in ("png", "jpg") else "png"),
         # The Spout2 bridge choice must survive a restart: the worker
         # reads NS_SPOUT at startup, and main sets it from this flag.
         "spout": bool(cfg.get("spout", False)),
@@ -535,6 +688,12 @@ def _menu_layout_payload(cfg: dict, params: dict, monitor: int, lang: str,
         "ui_detection": bool(cfg.get("ui_detection", False)),
         "frame_generation": bool(cfg.get("frame_generation", False)),
         "frame_multiplier": min(4, max(2, int(cfg.get("frame_multiplier", 2)))),
+        "frame_limit_mode": (str(cfg.get("frame_limit_mode", "unlimited"))
+                             if str(cfg.get("frame_limit_mode", "unlimited"))
+                             in FRAME_LIMIT_MODES else "unlimited"),
+        "frame_limit_custom": min(
+            FRAME_LIMIT_CUSTOM_MAX,
+            max(FRAME_LIMIT_CUSTOM_MIN, int(cfg.get("frame_limit_custom", 90)))),
         # The user's saved presets. Without this key "Save preset" wrote
         # everything EXCEPT the preset: the menu said "Preset saved", the
         # save really did succeed, and the preset was gone on the next
@@ -796,6 +955,20 @@ def _worker_idle(st) -> bool:
     return False
 
 
+def _window_menu_state(windows: list[tuple[int, str]],
+                       current_hwnd: int | None) -> tuple[list[dict], dict | None]:
+    """Build the window-picker payload without mixing identity into labels.
+
+    HWND remains an integer through hover and selection.  Titles are display
+    text only, so duplicate titles and titles containing colons are safe.
+    """
+    entries = [{"hwnd": int(hwnd), "title": str(title)}
+               for hwnd, title in windows]
+    current = next((dict(entry) for entry in entries
+                    if entry["hwnd"] == current_hwnd), None)
+    return entries, current
+
+
 def menu_payload(st) -> dict:
     """The current state for the menu - a single source of truth."""
     refresh_gpu_ok(st)
@@ -820,10 +993,45 @@ def menu_payload(st) -> dict:
         wins = sorted(list_capturable_windows(),
                       key=lambda hw: (str(hw[1]).casefold(), hw[0]))
         st.window_list = wins
+    window_entries, current_window = _window_menu_state(
+        wins, getattr(st, "window_hwnd", None))
     # The devicename is the stable identity: the menu hands it back
     # on a switch, so a reorder cannot redirect the capture.
     monitor_entries = [f"{i}: {w}x{h} ({dev})"
                        for i, w, h, dev in list_monitors()]
+    active_recorder = (getattr(st, "recorder", None)
+                       or getattr(st, "recording_finalizer", None))
+    last_recording = dict(getattr(st, "last_recording", None) or {})
+    if active_recorder is not None:
+        rec_status = getattr(active_recorder, "status", "recording")
+        last_recording = {
+            "container": "MP4",
+            "codec": str(getattr(active_recorder, "codec", "unknown")),
+            "fps": float(getattr(active_recorder, "fps", 0.0)),
+            "audio": bool(getattr(active_recorder, "audio_enabled", False)),
+            "path": str(getattr(active_recorder, "result_path", None)
+                        or getattr(active_recorder, "path", "")),
+            "status": str(getattr(rec_status, "value", rec_status)),
+        }
+    rec_detail = ""
+    if last_recording:
+        rec_detail = (f"{last_recording.get('container', 'MP4')} · "
+                      f"{last_recording.get('codec', 'unknown')} · "
+                      f"{float(last_recording.get('fps', 0)):g} fps · "
+                      f"{'AAC' if last_recording.get('audio') else 'no audio'}")
+    compatibility = getattr(st, "compatibility_result", None)
+    compatibility_status = (
+        str(getattr(getattr(compatibility, "status", None), "value", "not_run"))
+        if compatibility is not None else "not_run"
+    )
+    compatibility_score = ""
+    if compatibility is not None:
+        compatibility_score = (
+            f"{int(compatibility.passed)}/{int(compatibility.expected)}"
+            if compatibility.is_pass
+            else f"{int(compatibility.passed)}/{int(compatibility.attempted)} "
+                 f"(expected {int(compatibility.expected)})"
+        )
     return {
         "nr": not st.paused,
         "work_scale": st.work_scale,
@@ -858,10 +1066,18 @@ def menu_payload(st) -> dict:
                      "skin_structure")},
         "lang": st.lang,
         "recording": st.recorder is not None,
+        "recording_finalizing": getattr(st, "recording_finalizer", None) is not None,
+        "recording_status": str(last_recording.get("status", "")),
+        "recording_details": rec_detail,
+        "recording_path": str(last_recording.get("path", "")),
         "work_size": f"{st.work_w}x{st.work_h}",
-        "rec_seconds": (st.recorder.duration_ms / 1000.0) if st.recorder else 0.0,
+        "rec_seconds": ((active_recorder.duration_ms / 1000.0)
+                        if active_recorder else 0.0),
         "rec_indicator": bool(st.cfg.get("rec_indicator", True)),
+        "recording_dir": st.cfg.get("recording_dir") or "",
         "screenshot_dir": st.cfg.get("screenshot_dir") or "",
+        "screenshot_mode": str(st.cfg.get("screenshot_mode", "ask")),
+        "screenshot_format": str(st.cfg.get("screenshot_format", "png")),
         "spout": bool(st.cfg.get("spout", False)),
         "hdr": bool(st.cfg.get("hdr", False)),
         "motion_backend": st.cfg.get("motion_backend", "cpu"),
@@ -875,6 +1091,11 @@ def menu_payload(st) -> dict:
         "ui_detection": bool(st.cfg.get("ui_detection", False)),
         "frame_generation": bool(st.cfg.get("frame_generation", False)),
         "frame_multiplier": min(4, max(2, int(st.cfg.get("frame_multiplier", 2)))),
+        "frame_limit_mode": (str(st.cfg.get("frame_limit_mode", "unlimited"))
+                             if str(st.cfg.get("frame_limit_mode", "unlimited"))
+                             in FRAME_LIMIT_MODES else "unlimited"),
+        "frame_limit_custom": frame_limit_fps(
+            dict(st.cfg, frame_limit_mode="custom")),
         # Is the network idling on an unchanged screen right now? The
         # worker says so in its log; without this the menu shows a
         # healthy FPS while nothing is being processed, and the skip
@@ -910,6 +1131,8 @@ def menu_payload(st) -> dict:
         # every issue.
         "about": dict(getattr(st, "environment", None) or {},
                       gpu=st.gpu_text or ""),
+        "compatibility_status": compatibility_status,
+        "compatibility_score": compatibility_score,
         "gpu_ok": st.gpu_ok,
         "window_mode": st.window_hwnd is not None,
         "monitor_devicename": st.capture.devicename,
@@ -918,9 +1141,8 @@ def menu_payload(st) -> dict:
             (m for m in monitor_entries
              if m.startswith(f"{st.monitor}: ")),
             str(st.monitor)),
-        "windows": [f"{h:X}: {t}" for h, t in wins],
-        "window_current": next(
-            (f"{h:X}: {t}" for h, t in wins if h == st.window_hwnd), ""),
+        "windows": window_entries,
+        "window_current": current_window,
         "version": APP_VERSION,
         "channel": CHANNEL_LABEL,
         "library_updates": library_checker.snapshot(),

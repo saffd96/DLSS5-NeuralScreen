@@ -2,6 +2,7 @@
 import os
 from pathlib import Path
 import struct
+from worker_reply import read_reply
 import subprocess
 import sys
 import threading
@@ -32,7 +33,7 @@ def run():
     timer.start()
 
     def ack():
-        out = struct.unpack(wire.OUT_FMT, exact(p.stdout, struct.calcsize(wire.OUT_FMT)))
+        out = struct.unpack(wire.OUT_FMT, read_reply(p.stdout, struct.calcsize(wire.OUT_FMT)))
         assert out[2] == 1, out
         return out
 

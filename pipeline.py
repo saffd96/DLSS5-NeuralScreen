@@ -108,7 +108,8 @@ def _drain_stderr(worker, logs: list[str], stop: threading.Event) -> None:
 
 def start_worker(params: dict, width: int, height: int, warmup: int,
                  full_w: int = 0, full_h: int = 0,
-                 shm: "SharedFrameBuffer | None" = None) -> tuple[subprocess.Popen, list[str]]:
+                 shm: "SharedFrameBuffer | None" = None) -> tuple[
+                     subprocess.Popen, list[str], WorkerReader, threading.Event]:
     """Start the NGX worker in --live mode and send the header.
 
     width/height is the work resolution (the NGX feature), full_w/full_h is
@@ -135,32 +136,39 @@ def start_worker(params: dict, width: int, height: int, warmup: int,
     )
     logs: list[str] = []
     stop = threading.Event()
-    threading.Thread(target=_drain_stderr, args=(worker, logs, stop), daemon=True).start()
-    # In upscale mode (full_w>0) the worker returns full-res frames - the
-    # reader must expect the full sizes, otherwise byte_count will not match.
-    out_w = full_w if full_w else width
-    out_h = full_h if full_h else height
-    reader = WorkerReader(worker, out_w, out_h, shm)
+    try:
+        threading.Thread(
+            target=_drain_stderr, args=(worker, logs, stop), daemon=True,
+        ).start()
+        # In upscale mode (full_w>0) the worker returns full-res frames - the
+        # reader must expect the full sizes, otherwise byte_count will not match.
+        out_w = full_w if full_w else width
+        out_h = full_h if full_h else height
+        reader = WorkerReader(worker, out_w, out_h, shm)
 
-    header = struct.pack(
-        HEADER_FMT,
-        VIDEO_MAGIC, width, height, int(warmup), 0,  # frame_count=0 -> an endless loop
-        # profile, preset and ui_correction: sent, and sent as zero. All
-        # three are dead in the 310.8.0 runtime - every value gives a
-        # byte-identical frame - so they are not carried in the profiles
-        # any more. The wire keeps its shape because the resize command
-        # shares this layout and a hundred tests build it by position.
-        0, 0, params["style"],
-        params["auto_mask"], 0,
-        params["intensity"], params["local_tone"],
-        params["local_structure"], params["skin_structure"],
-        int(full_w), int(full_h),
-    )
-    worker.stdin.write(header)
-    worker.stdin.flush()
-    if shm is not None:
-        _negotiate_shm(worker, reader, shm)
-    return worker, logs, reader, stop
+        header = struct.pack(
+            HEADER_FMT,
+            VIDEO_MAGIC, width, height, int(warmup), 0,  # frame_count=0 -> an endless loop
+            # profile, preset and ui_correction: sent, and sent as zero. All
+            # three are dead in the 310.8.0 runtime - every value gives a
+            # byte-identical frame - so they are not carried in the profiles
+            # any more. The wire keeps its shape because the resize command
+            # shares this layout and a hundred tests build it by position.
+            0, 0, params["style"],
+            params["auto_mask"], 0,
+            params["intensity"], params["local_tone"],
+            params["local_structure"], params["skin_structure"],
+            int(full_w), int(full_h),
+        )
+        worker.stdin.write(header)
+        worker.stdin.flush()
+        if shm is not None:
+            _negotiate_shm(worker, reader, shm)
+        return worker, logs, reader, stop
+    except BaseException:
+        # A failed header/reader/SHM negotiation must not orphan the process.
+        shutdown_worker(worker, stop)
+        raise
 
 
 def restart_worker(worker: subprocess.Popen, params: dict, width: int, height: int,
@@ -219,6 +227,101 @@ def shutdown_worker(worker: subprocess.Popen, stop: threading.Event | None = Non
             worker.wait(timeout=5)
         except subprocess.TimeoutExpired:
             worker.kill()
+            try:
+                worker.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                print("[main] worker could not be reaped after kill",
+                      file=sys.stderr)
+
+
+def require_compatibility(st) -> None:
+    """Fail closed before any production worker process is created."""
+    # Local import avoids a module cycle: the isolated preflight adapter uses
+    # start_worker(), while production lifecycle code calls this guard.
+    from compatibility_runtime import require_pass
+
+    require_pass(st)
+
+
+def wants_low_cost_off(st) -> bool:
+    """Whether NR OFF may put the frame pipeline fully to sleep.
+
+    Frame Generation still needs a stream of bypass frames.  Recording and a
+    pending screenshot are explicit frame consumers too, so they temporarily
+    wake the bypass path even while the NR toggle itself remains off.
+    """
+    return (bool(st.paused)
+            and not bool(st.cfg.get("frame_generation", False))
+            and not bool(st.cfg.get("dlss_sr", False))
+            and not (bool(st.cfg.get("detail_enabled", False))
+                     and float(st.cfg.get("detail_strength", 0.0)) > 0.0)
+            and st.recorder is None
+            and st.pending_shot is None)
+
+
+def sync_low_cost_off(st) -> bool:
+    """Enter or leave the idle NR OFF state; return its resulting state.
+
+    Normal OFF keeps the worker process warm but closes its capture/present
+    channels and stops sending frames.  If that handshake fails, the only
+    honest low-cost fallback is to stop the worker: a later NR ON command uses
+    the existing worker-failure recovery path to start a clean one.
+    """
+    want_idle = wants_low_cost_off(st)
+    if want_idle == st.off_suspended:
+        return want_idle
+
+    if want_idle:
+        st.work_frame = None
+        st.output_rgba = None
+        try:
+            st.guides.previous_gray = None
+        except Exception:
+            pass
+
+        worker_alive = (st.worker is not None
+                        and getattr(st.worker, "poll", lambda: None)() is None)
+        if worker_alive and not st.worker_failed:
+            try:
+                channels.suspend_for_off(st)
+            except Exception as exc:
+                print(f"[main] low-cost OFF handshake failed ({exc}) - "
+                      f"stopping the worker", file=sys.stderr)
+                shutdown_worker(st.worker, st.worker_stop)
+                st.worker_failed = True
+                st.next_auto_revive = 0.0
+                channels.forget_present(st)
+                channels.forget_dda(st)
+                channels.forget_out(st)
+        elif not worker_alive:
+            st.worker_failed = True
+            st.next_auto_revive = 0.0
+
+        # A transparent HUD layer is enough for the menu while OFF.  The idle
+        # branch in main hides it completely whenever the menu is closed.
+        st.display.set_hud_only(True)
+        st.off_suspended = True
+        print("[main] NR OFF: capture, processing and presentation suspended")
+        return True
+
+    # A consumer appeared (recording/screenshot/FG) or NR was turned on.
+    # Re-arm the channels and insist on a fresh source frame/history.
+    st.off_suspended = False
+    st.present_mode = False
+    st.present_attempted = False
+    st.dda_mode = False
+    st.dda_attempted = False
+    st.gray_active = False
+    st.work_frame = None
+    st.output_rgba = None
+    try:
+        st.guides.previous_gray = None
+    except Exception:
+        pass
+    st.display.set_hud_only(True)
+    st.display.set_visible(True)
+    print("[main] frame pipeline resumed")
+    return False
 
 
 # Applying settings is coalesced: a slider dragged across its range would
@@ -250,11 +353,20 @@ def teardown_pipeline(st) -> None:
     frame size and cannot survive a change of it.
     """
     if st.recorder is not None:
-        try:
-            st.recorder.close()
-        except Exception as exc:
-            print(f"[main] failed to close the recording: {exc}", file=sys.stderr)
+        rec = st.recorder
         st.recorder = None
+        try:
+            if st.recording_finalizer is not None:
+                raise RuntimeError("a previous recording is still finalizing")
+            rec.finish()
+            st.recording_finalizer = rec
+            st.recording_finalize_deadline = (
+                time.monotonic() + float(rec.FINISH_TIMEOUT_S))
+            st.display.alert(UI_STRINGS[st.lang].get(
+                "record_finalizing", "Finalizing recording..."))
+        except Exception as exc:
+            print(f"[main] failed to start recording finalization: {exc}",
+                  file=sys.stderr)
     st.pending_shot = None
     st.shot_rgba = None
     shutdown_worker(st.worker, st.worker_stop)
@@ -294,6 +406,7 @@ def rebuild_pipeline(st, note: str) -> None:
     # min(), not the constant: a pre-Blackwell card gets 4 and must keep
     # it (audit F3 - the restart storm the shortening exists to prevent).
     warmup = min(st.effective_warmup, RESTART_WARMUP)
+    require_compatibility(st)
     st.worker, st.worker_logs, st.reader, st.worker_stop = start_worker(
         st.params, st.work_w, st.work_h, warmup, full_w, full_h,
         st.shm)
@@ -761,6 +874,8 @@ def apply_gpu(st, index: int) -> None:
     previous = int(st.cfg.get("gpu", 0))
     if int(index) == previous:
         return
+    previous_key = getattr(st, "compatibility_key", None)
+    previous_result = getattr(st, "compatibility_result", None)
     st.cfg["gpu"] = int(index)
     os.environ["NS_GPU"] = str(int(index))
     # If the chosen card turns out to drive no display, the capture stays on
@@ -768,10 +883,28 @@ def apply_gpu(st, index: int) -> None:
     # split pipeline. That is worth one alert, and only after a deliberate
     # switch (on an Optimus laptop it is the normal state from launch).
     st.gpu_switch_pending = True
-    print(f"[main] GPU: adapter {index} - restarting the worker")
+    print(f"[main] GPU: adapter {index} - running compatibility preflight")
     teardown_pipeline(st)
-    rebuild_pipeline(st, UI_STRINGS[st.lang].get("gpu_switched", "GPU switched"))
-    if gpu_came_up(st):
+    candidate_ok = False
+    try:
+        from compatibility_runtime import run_preflight
+
+        candidate_ok = run_preflight(st).is_pass
+    except Exception as exc:
+        print(f"[main] GPU compatibility preflight failed ({exc})",
+              file=sys.stderr)
+
+    if candidate_ok:
+        try:
+            rebuild_pipeline(
+                st, UI_STRINGS[st.lang].get("gpu_switched", "GPU switched"))
+            candidate_ok = gpu_came_up(st)
+        except Exception as exc:
+            print(f"[main] adapter {index} production start failed ({exc})",
+                  file=sys.stderr)
+            candidate_ok = False
+
+    if candidate_ok:
         # It works - so if it was marked as refusing the pass before, that
         # mark is stale (a driver update is the usual reason) and goes.
         marked = [i for i in st.cfg.get("gpu_no_nr") or [] if int(i) != int(index)]
@@ -792,6 +925,8 @@ def apply_gpu(st, index: int) -> None:
     st.cfg["gpu_no_nr"] = marked
     st.cfg["gpu"] = previous
     os.environ["NS_GPU"] = str(previous)
+    st.compatibility_key = previous_key
+    st.compatibility_result = previous_result
     st.gpu_switch_pending = False
     teardown_pipeline(st)
     rebuild_pipeline(st, UI_STRINGS[st.lang].get(
@@ -1000,6 +1135,7 @@ def do_restart(st, new_scale: float, new_profile: str, new_params: dict,
         # desktop). The RNSZ path above is fast and keeps the picture, so
         # it does not raise one.
         st.display.enter_switch_mode(st.output_rgba, *st.capture.resolution)
+        require_compatibility(st)
         st.worker, st.worker_logs, st.reader, st.worker_stop = restart_worker(
             st.worker, st.params, new_w, new_h, RESTART_WARMUP,
             new_full_w, new_full_h, st.worker_stop, st.shm)

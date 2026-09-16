@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import struct
+from worker_reply import read_reply
 import subprocess
 import sys
 import threading
@@ -63,14 +64,14 @@ def run(hdr=False, dynamic=False, check_pixels=False, sr=False, ui=False, detail
         worker.stdin.flush()
         if detail:
             worker.stdin.write(struct.pack(wire.FRAME_FMT,wire.DETAIL_MAGIC,0,50,0,0));worker.stdin.flush()
-            assert struct.unpack(wire.OUT_FMT,exact(worker.stdout,struct.calcsize(wire.OUT_FMT)))[2]==1
+            assert struct.unpack(wire.OUT_FMT,read_reply(worker.stdout, struct.calcsize(wire.OUT_FMT)))[2]==1
 
         if hdr:
             wire.send_wgc(worker, hwnd)
-            ack = struct.unpack(wire.WGC_ACK_FMT, exact(worker.stdout, struct.calcsize(wire.WGC_ACK_FMT)))
+            ack = struct.unpack(wire.WGC_ACK_FMT, read_reply(worker.stdout, struct.calcsize(wire.WGC_ACK_FMT)))
             assert ack[0] == wire.WGC_ACK_MAGIC and ack[1] == 1, ack
         wire.send_window(worker, w, h)
-        ack = struct.unpack(wire.WINDOW_ACK_FMT, exact(worker.stdout, struct.calcsize(wire.WINDOW_ACK_FMT)))
+        ack = struct.unpack(wire.WINDOW_ACK_FMT, read_reply(worker.stdout, struct.calcsize(wire.WINDOW_ACK_FMT)))
         assert ack[0] == wire.WINDOW_ACK_MAGIC and ack[1] == 1, ack
         motion = np.zeros((work_h, work_w, 2), dtype=np.float16)
         motion[:, :, 0] = -4 * work_w / w
@@ -97,14 +98,14 @@ def run(hdr=False, dynamic=False, check_pixels=False, sr=False, ui=False, detail
                 flags = (flags | 0x800 | 0x4000) & ~(0x100 | 0x2000)
             if detail:
                 worker.stdin.write(struct.pack(wire.FRAME_FMT,wire.DETAIL_MAGIC,0,0 if bypass and not nr_off else 50,0,0));worker.stdin.flush()
-                assert struct.unpack(wire.OUT_FMT,exact(worker.stdout,struct.calcsize(wire.OUT_FMT)))[2]==1
+                assert struct.unpack(wire.OUT_FMT,read_reply(worker.stdout, struct.calcsize(wire.OUT_FMT)))[2]==1
             if hdr:
                 pygame.event.pump()
                 screen.blit(pygame.image.frombuffer(frame.tobytes(), (w, h), "RGBA"), (0, 0))
                 pygame.display.flip()
                 worker.stdin.write(struct.pack(wire.FRAME_FMT, wire.CAPTURE_MAGIC, i, 0, 0, i))
                 worker.stdin.flush()
-                prepared = struct.unpack(wire.OUT_FMT, exact(worker.stdout, struct.calcsize(wire.OUT_FMT)))
+                prepared = struct.unpack(wire.OUT_FMT, read_reply(worker.stdout, struct.calcsize(wire.OUT_FMT)))
                 assert prepared[1] == i and prepared[2] == 1
                 flags |= wire.FRAME_FLAG_NO_COLOR | wire.FRAME_FLAG_PREPARED
             if ui:
@@ -117,7 +118,7 @@ def run(hdr=False, dynamic=False, check_pixels=False, sr=False, ui=False, detail
                 worker.stdin.write(frame.tobytes())
             worker.stdin.write(motion.tobytes())
             worker.stdin.flush()
-            ack = struct.unpack(wire.OUT_FMT, exact(worker.stdout, struct.calcsize(wire.OUT_FMT)))
+            ack = struct.unpack(wire.OUT_FMT, read_reply(worker.stdout, struct.calcsize(wire.OUT_FMT)))
             assert ack[0] == wire.OUT_MAGIC and ack[2] == 1, ack
             if ack[3]:
                 output = exact(worker.stdout, ack[3])
@@ -126,16 +127,16 @@ def run(hdr=False, dynamic=False, check_pixels=False, sr=False, ui=False, detail
             time.sleep(max(0, 1/60 - (time.monotonic() - started)))
         if hdr:
             wire.send_wgc(worker, 0)
-            ack = struct.unpack(wire.WGC_ACK_FMT, exact(worker.stdout, struct.calcsize(wire.WGC_ACK_FMT)))
+            ack = struct.unpack(wire.WGC_ACK_FMT, read_reply(worker.stdout, struct.calcsize(wire.WGC_ACK_FMT)))
             assert ack[1] == 1, ack
             worker.stdin.write(struct.pack(wire.FRAME_FMT,wire.DETAIL_MAGIC,0,0,0,0));worker.stdin.flush()
-            assert struct.unpack(wire.OUT_FMT,exact(worker.stdout,struct.calcsize(wire.OUT_FMT)))[2]==1
+            assert struct.unpack(wire.OUT_FMT,read_reply(worker.stdout, struct.calcsize(wire.OUT_FMT)))[2]==1
             worker.stdin.write(struct.pack(wire.FRAME_FMT, wire.FRAME_MAGIC, total, 1,
                 wire.FRAME_FLAG_BYPASS | wire.FRAME_FLAG_WANT_PIXELS | 0x800 | 0x4000, total))
             worker.stdin.write(frame.tobytes())
             worker.stdin.write(motion.tobytes())
             worker.stdin.flush()
-            ack = struct.unpack(wire.OUT_FMT, exact(worker.stdout, struct.calcsize(wire.OUT_FMT)))
+            ack = struct.unpack(wire.OUT_FMT, read_reply(worker.stdout, struct.calcsize(wire.OUT_FMT)))
             assert ack[2] == 1 and ack[3] == frame.nbytes, ack
             assert exact(worker.stdout, ack[3]) == frame.tobytes(), "HDR to SDR export changed"
     finally:
