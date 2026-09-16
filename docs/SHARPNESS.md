@@ -1,8 +1,9 @@
 # Output sharpness
 
-The main menu's Sharpness slider appears and runs only with SR/DLAA enabled,
-after neural rendering and SR/DLAA, before HDR reconstruction, frame generation and export.
-Disabling SR/DLAA disables sharpening but preserves its chosen strength.
+The main menu's Sharpness switch enables the filter independently of SR/DLAA.
+Its 0?100% slider appears while enabled. Turning it off preserves the chosen
+strength and sends zero to the worker; turning it back on restores that value.
+It runs on neural output before HDR reconstruction, frame generation and export.
 It does not change the resolution or the existing SR/DLAA behavior.
 
 The range is 0?100%. Start around 50%; 0% disables the pass completely (no allocation, copy or

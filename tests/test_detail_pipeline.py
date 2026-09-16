@@ -103,19 +103,16 @@ if __name__ == '__main__':
             # Compare matching frame positions in an unsharpened control run,
             # not unrelated frames at different points in its initialization.
             deltas = []
-            for strength, raw, out in zip((0, 50, 100, 0, 0, 100), baseline, enhanced):
+            for strength, raw, out in zip((0, 50, 100, 0, 100, 100), baseline, enhanced):
                 delta = np.abs(out.astype(int)-raw.astype(int))
                 assert np.array_equal(raw[:, :, 3], out[:, :, 3]), 'alpha changed'
-                if strength == 0 or not mode[1]:
+                if strength == 0:
                     assert np.array_equal(raw, out), f'{mode[0]}: zero changed pixels'
                 else:
                     assert delta.max() <= 31, 'unbounded sharpening'
                     assert np.count_nonzero(delta) > 1000, 'too few affected pixels'
                     deltas.append(delta.max())
-            if mode[1]:
-                assert deltas[0] >= 2 and deltas[1] > deltas[0], 'weak slider response'
-                print(f'PASS {mode[0]}: max changes 50%={deltas[0]}, 100%={deltas[1]}; zero and bypass exact', flush=True)
-            else:
-                print('PASS: SR/DLAA off: all sharpness strengths leave NR output pixel-exact', flush=True)
+            assert deltas[0] >= 2 and deltas[1] > deltas[0], 'weak slider response'
+            print(f'PASS {mode[0]}: max changes 50%={deltas[0]}, 100%={deltas[1]}; SR toggling preserves sharpening; zero and bypass exact', flush=True)
     else:
         print('SKIP: requires --run and NVIDIA runtime')

@@ -681,7 +681,8 @@ def main() -> int:
             try:
                 check_worker(st.worker, st.worker_logs)
                 sync_sr_scale(st.worker, st.reader, float(st.cfg.get("dlss_sr_scale", .65)))
-                sync_detail(st.worker, st.reader, float(st.cfg.get("detail_strength", 0.0)))
+                sync_detail(st.worker, st.reader, float(st.cfg.get("detail_strength", 0.0)),
+                            enabled=bool(st.cfg.get("detail_enabled", False)))
                 if st.gray_active:
                     prepare_capture(st.worker, st.reader, st.frame_index, st.pts)
                 try:

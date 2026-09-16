@@ -382,6 +382,7 @@ def load_config(path: Path) -> dict:
     except (ValueError, TypeError):
         detail = 0.0
     cfg["detail_strength"] = min(1.0, max(0.0, detail))
+    cfg["detail_enabled"] = cfg.get("detail_enabled", cfg["detail_strength"] > 0) is True
     cfg["dlss_sr"] = bool(cfg.get("dlss_sr", False))
     cfg["ui_detection"] = bool(cfg.get("ui_detection", False))
     cfg["frame_generation"] = bool(cfg.get("frame_generation", False))
@@ -529,6 +530,7 @@ def _menu_layout_payload(cfg: dict, params: dict, monitor: int, lang: str,
         "skip_static": bool(cfg.get("skip_static", False)),
         "dlss_sr_scale": float(cfg.get("dlss_sr_scale", .65)),
         "detail_strength": float(cfg.get("detail_strength", 0.0)),
+        "detail_enabled": bool(cfg.get("detail_enabled", False)),
         "dlss_sr": bool(cfg.get("dlss_sr", False)),
         "ui_detection": bool(cfg.get("ui_detection", False)),
         "frame_generation": bool(cfg.get("frame_generation", False)),
@@ -868,6 +870,7 @@ def menu_payload(st) -> dict:
         "library_updates_enabled": st.cfg.get("library_updates_enabled", False) is True,
         "dlss_sr_scale": float(st.cfg.get("dlss_sr_scale", .65)),
         "detail_strength": float(st.cfg.get("detail_strength", 0.0)),
+        "detail_enabled": bool(st.cfg.get("detail_enabled", False)),
         "dlss_sr": bool(st.cfg.get("dlss_sr", False)),
         "ui_detection": bool(st.cfg.get("ui_detection", False)),
         "frame_generation": bool(st.cfg.get("frame_generation", False)),

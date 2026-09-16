@@ -193,6 +193,7 @@ class OverlayMenu:
             "display_fps": None,
             "dlss_sr_scale": .65,
             "detail_strength": 0.0,
+            "detail_enabled": False,
             "dlss_sr": False,
             "ui_detection": False,
             "frame_generation": False,
@@ -1033,6 +1034,9 @@ class OverlayMenu:
                 slider("dlss_sr_scale", .25, 1.0, sr_scale, s["dlss_sr_input"],
                        value_text=sr_size, ends=("25%", "100% (DLAA)"))
 
+            detail_enabled = bool(self.state.get("detail_enabled", False))
+            toggle("detail_enabled", s["detail_strength"], detail_enabled)
+            if detail_enabled:
                 detail = float(self.state.get("detail_strength", 0.0))
                 slider("detail_strength", 0.0, 1.0, detail, s["detail_strength"],
                        value_text=f"{int(detail*100+.5)}%", ends=("0%", "100%"))

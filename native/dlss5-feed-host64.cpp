@@ -5292,7 +5292,7 @@ static bool EvaluateVideo(VideoState &v, int reset, UINT64 *submitted = nullptr)
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         h.list->ResourceBarrier(1, &back);
     }
-    if (use_sr && !g_sr.failed) ApplyDetail(v);
+    ApplyDetail(v);
     if (ts) ProfileGpuEnd(PS_EVAL, 4);
     const UINT64 fence = EndCommands();
     if (submitted) *submitted = fence;
