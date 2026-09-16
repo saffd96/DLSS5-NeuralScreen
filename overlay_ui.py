@@ -58,6 +58,9 @@ THEMES = {
 HOTKEY_ROWS = (
     ("toggle", "hk_nr"),
     ("framegen", "hk_framegen"),
+    ("dlss_sr", "dlss_sr"),
+    ("detail_enabled", "detail_strength"),
+    ("boost", "boost"),
     ("settings", "hk_menu"),
     ("screenshot_menu", "hk_shot"),
     ("record", "hk_record"),

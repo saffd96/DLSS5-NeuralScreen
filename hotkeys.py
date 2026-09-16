@@ -106,6 +106,9 @@ DEFAULT_BINDINGS = {
     9: (MOD_NOREPEAT, VK_NUMPAD[7], "framegen", "Num7"),
 }
 
+# Optional actions have stable IDs but reserve no key until assigned.
+OPTIONAL_BINDINGS = {10: "dlss_sr", 11: "detail_enabled", 12: "boost"}
+
 # Key name -> VK (for parsing the config)
 _KEY_NAMES = {
     "F1": 0x70, "F2": 0x71, "F3": 0x72, "F4": 0x73, "F5": 0x74,
@@ -185,6 +188,11 @@ def build_bindings(overrides: dict | None = None) -> dict:
             continue
         new_mods, new_vk = parsed
         bindings[hk_id] = (new_mods, new_vk, cmd, text)
+    for hk_id, cmd in OPTIONAL_BINDINGS.items():
+        text = overrides.get(cmd)
+        parsed = parse_binding(text) if isinstance(text, str) and text else None
+        if parsed is not None:
+            bindings[hk_id] = (*parsed, cmd, text)
     return bindings
 
 

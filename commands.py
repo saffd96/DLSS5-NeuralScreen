@@ -632,6 +632,11 @@ def drain_commands(st) -> bool:
                 st.tray._set_state(nr=not st.paused)
             elif cmd == "screenshot_menu":
                 request_screenshot(st)
+            elif cmd in ("dlss_sr", "detail_enabled", "boost"):
+                apply_menu_action(st, ("toggle", cmd))
+                if cmd != "boost":
+                    # Boost is queued through the normal resize/apply path.
+                    st.display.menu.set_state({cmd: bool(st.cfg.get(cmd, False))})
             elif cmd == "framegen":
                 # A plain on/off for Frame Generation (user request 15.09).
                 # The same path the menu switch takes, so the config write,
