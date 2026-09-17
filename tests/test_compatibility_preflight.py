@@ -105,7 +105,7 @@ def digest(data):
 
 
 def make_key(
-    fs, *, version="1.13.0", gpu=0, driver="600.01", hz=144,
+    fs, *, version="1.14.0", gpu=0, driver="600.01", hz=144,
     runtime=b"runtime-v1", worker=b"worker-v1",
 ):
     fs.files["runtime.dll"] = runtime
@@ -144,7 +144,9 @@ class CompatibilityPreflightTests(unittest.TestCase):
         self.assertEqual(payload["worker_sha256"], digest(b"worker-v1"))
 
         variants = [
-            make_key(self.fs, version="1.13.1"),
+            # A version change alone must move the digest: the variant uses
+            # the previous release, which is exactly an app upgrade.
+            make_key(self.fs, version="1.13.0"),
             make_key(self.fs, gpu=1),
             make_key(self.fs, driver="601.00"),
             make_key(self.fs, hz=60),
@@ -325,7 +327,7 @@ class CompatibilityPreflightTests(unittest.TestCase):
         self.fs.files["C:\\private\\runtime.dll"] = b"runtime"
         self.fs.files["D:\\secret\\worker.exe"] = b"worker"
         key = CompatibilityKey.from_files(
-            app_version="1.13.0",
+            app_version="1.14.0",
             runtime_path="C:\\private\\runtime.dll",
             worker_path="D:\\secret\\worker.exe",
             selected_gpu={"index": 0, "name": "RTX test"},

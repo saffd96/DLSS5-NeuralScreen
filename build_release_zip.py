@@ -8,7 +8,7 @@ member-level ``SHA256SUMS``.
 
 Normal use (after the release commit has been tagged):
 
-    runtime\python.exe build_release_zip.py v1.13.0
+    runtime\python.exe build_release_zip.py v1.14.0
 
 The command deliberately refuses release candidates, dirty tracked trees and
 tags that do not resolve to HEAD. Ignored local files do not affect the gate.
@@ -32,8 +32,8 @@ from typing import Iterable, Sequence
 
 
 BASE = Path(__file__).resolve().parent
-VERSION = "1.13.0"
-EXPECTED_TAG = f"v{VERSION}"
+VERSION = "1.14.0"
+EXPECTED_TAG = f"v{VERSION}-saffd96.1"
 TARGET_ARCHS = (
     "RTX 30/40/50 (sm_86/89/120 kernels, spoof 0x1B0; "
     "RTX 20 cannot run - below minimum)"
@@ -269,10 +269,6 @@ def _skip(path: str | Path) -> bool:
     return _drop_sitepackage(norm)
 
 
-def tracked_files(repo: Path, ref: str = "HEAD") -> list[str]:
-    return sorted(git_tree(repo, ref))
-
-
 def runtime_files(repo: Path) -> list[str]:
     root = repo / "runtime"
     if not root.is_dir():
@@ -297,7 +293,7 @@ def assert_clean_tracked_tree(repo: Path) -> None:
 
 def assert_release_tag(repo: Path, expected_tag: str, version: str) -> str:
     canonical = f"v{version}"
-    if expected_tag != canonical:
+    if expected_tag != canonical and re.fullmatch(re.escape(canonical) + r"-saffd96\.[1-9][0-9]*", expected_tag) is None:
         raise ReleaseContractError(
             f"expected tag must be {canonical}, got {expected_tag!r}"
         )

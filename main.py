@@ -26,17 +26,11 @@ from __future__ import annotations
 
 import argparse
 import ctypes
-from ctypes import wintypes
 import json
-import mmap
-import os
 import queue
-import struct
 import subprocess
 import sys
-import threading
 import time
-import uuid
 from pathlib import Path
 
 
@@ -71,21 +65,14 @@ import cv2
 import numpy as np
 import pygame  # HUD overlay on the recorded frame (image.frombuffer)
 
-from capture import (ScreenCapture, devicename_for_output_idx, list_monitors,
-                     resolve_output_idx)
+from capture import ScreenCapture, resolve_output_idx
 from display import Display
 from guides import TemporalGuideGenerator
 from motion_backend import MotionBackendStatus
-from hotkeys import (HotkeyController, build_bindings,
-                     describe as describe_hotkeys, numlock_needed, numlock_on,
+from hotkeys import (describe as describe_hotkeys, numlock_needed, numlock_on,
                      parse_binding)
-from recorder import VideoRecorder
-from gpuinfo import describe as gpu_describe, probe as gpu_probe
 from i18n import STRINGS as UI_STRINGS
 
-from tray import TrayController
-from taskbar import TaskbarWindow
-import dialogs
 import channels
 import commands
 import compatibility_runtime
@@ -100,16 +87,13 @@ from pipeline import (AUTO_REVIVE_BACKOFF,  # noqa: F401
 # The pieces below live in their own modules now; re-exported because
 # the rest of the program and the tests look them up in main.
 from paths import BASE_DIR, NATIVE_DIR, WORKER_EXE  # noqa: F401
-from protocol import SharedFrameBuffer, _negotiate_shm  # noqa: F401
-from pipeline import (_drain_stderr, restart_worker,  # noqa: F401
+from pipeline import (restart_worker,  # noqa: F401
                       shutdown_worker, start_worker)
-from startup import (LOG_PATH, _apply_gpu_env,  # noqa: F401
-                     _apply_nr_dll, _apply_spout_env, _init_logging,
+from startup import (_apply_nr_dll, _apply_spout_env, _init_logging,
                      _log_environment)
-from settings_io import (DEFAULT_LANG, PRESET_KEYS,  # noqa: F401
-                         load_config, load_presets,
+from settings_io import (load_config, load_presets,  # noqa: F401
                          resolve_params)
-from settings_io import _work_size, hotkey_labels  # noqa: F401
+from settings_io import hotkey_labels  # noqa: F401
 # The settings layer owns these now; re-exported because the rest
 # of the program and the tests look them up in main.
 from settings_io import (  # noqa: F401
@@ -120,8 +104,7 @@ from settings_io import (  # noqa: F401
 # The Win32 window helpers live in winapi.py now. They are re-exported here
 # on purpose: main is where the rest of the program - and the tests - look
 # them up, and moving code must not move its callers.
-from winapi import (DWMWA_EXTENDED_FRAME_BOUNDS, _RECT,  # noqa: F401
-                    _is_desktop_window, _is_our_window, _is_taskbar_window,
+from winapi import (_is_desktop_window, _is_our_window, _is_taskbar_window,
                     foreign_foreground, list_capturable_windows,
                     window_frame_rect, window_under_cursor)
 
@@ -502,7 +485,18 @@ def main() -> int:
             st.perf[key].append((time.perf_counter() - t0) * 1000.0)
 
         def _service_idle_overlay() -> None:
-            """Keep the settings menu usable without waking the frame loop."""
+            """Keep the settings menu usable without waking the frame loop.
+
+            No frame will ever arrive in this state, so a mode-switch veil
+            raised by a rebuild started from here (Spout2 / HDR / motion
+            backend / monitor / GPU) has nothing to wait for - and while it
+            is up draw_overlay refuses to paint anything, so the menu the
+            user just used stops being drawn and the screen stays frozen
+            under the assemble mark (issues #89/#96: "the window becomes
+            invisible, then it may reappear to disappear"). Every other way
+            down lives in the frame path, which this branch never reaches.
+            Both calls below are no-ops when no veil is up.
+            """
             if st.display.menu.visible:
                 for ev in pygame.event.get():
                     for action in st.display.menu.handle_event(ev):
@@ -520,8 +514,15 @@ def main() -> int:
                     st.display.reveal()
                     st.display.set_visible(True)
                 st.display.raise_topmost()
+                # With the menu up draw_overlay advances the veil's fade-out
+                # itself, so a fade started here finishes in ~SWITCH_FADE_OUT.
+                st.display.exit_switch_mode()
                 st.display.draw_overlay()
             else:
+                # Nothing is being drawn on this path, so a fade could never
+                # advance: end the veil outright. Only reachable when a
+                # rebuild raised it and the menu was closed in between.
+                st.display.drop_switch_mode()
                 st.display.set_visible(False)
 
         while st.running:
@@ -613,10 +614,18 @@ def main() -> int:
                 st.last_foreground = fg
             # A game that goes fullscreen raises itself above every topmost
             # window, ours included, and then the menu is drawn but not on
-            # screen. While it is open we keep coming back up; a SetWindowPos
-            # that changes nothing is cheap, and 30 frames is fast enough that
-            # nobody sees the menu disappear.
-            if st.display.menu.visible and st.frame_index % 30 == 0:
+            # screen. While it is open we keep coming back up.
+            if st.display.menu.visible:
+                # The menu is up: the worker's picture window is re-asserted
+                # HWND_TOPMOST on every restart (NR off->on, a settings apply,
+                # a mode switch), which lands the picture ABOVE the HUD and
+                # hides the panel behind it - the "menu disappears while I am
+                # using it" reports (#94, and the NR/FG toggle case). While
+                # the menu is open the pair is re-asserted EVERY frame: the
+                # call is idempotent (raise_topmost inserts the HUD above the
+                # picture, or does nothing when it is already there), so the
+                # steady state costs no SetWindowPos at all. The 30-frame
+                # cadence below stays for the menu-closed HUD case.
                 st.display.raise_topmost()
             # The same for the HUD even when the menu is closed: a borderless
             # game (Cyberpunk) keeps itself on top and our HUD stays
@@ -1184,11 +1193,31 @@ def main() -> int:
                 st.recording_finalizer.close()
             except Exception as exc:
                 print(f"[main] failed to close the recording: {exc}", file=sys.stderr)
-            commands.poll_recording_finalizer(st)
+            try:
+                commands.poll_recording_finalizer(st)
+            except Exception as exc:
+                print(f"[main] failed to poll the recording finalizer: {exc}",
+                      file=sys.stderr)
+        # The worker and the shared section are the two calls here without a
+        # guard, and a raise from either skips every step below it - capture,
+        # window, hotkeys, tray and taskbar all stay live, with the borderless
+        # topmost overlay still on screen and no loop left to feed it (audit
+        # H4). shutdown_worker prints and closes a pipe, and on a pythonw
+        # process stdout is the log file: a write into a log that has become
+        # unwritable raises out of print and took the whole teardown with it.
+        # Keep the order, guard each call.
         if st.worker is not None:
-            shutdown_worker(st.worker, st.worker_stop)
+            try:
+                shutdown_worker(st.worker, st.worker_stop)
+            except Exception as exc:
+                print(f"[main] failed to shut down the worker: {exc}",
+                      file=sys.stderr)
         if st.shm is not None:
-            st.shm.close()
+            try:
+                st.shm.close()
+            except Exception as exc:
+                print(f"[main] failed to close the shared memory: {exc}",
+                      file=sys.stderr)
         try:
             settings_io.save_menu_layout(st)
         except Exception:

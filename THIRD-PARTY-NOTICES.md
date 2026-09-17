@@ -8,6 +8,8 @@ the components remain controlling.
 
 The package currently contains two different classes of NVIDIA software:
 
+- `nvngx_dlss.dll` provides NVIDIA DLSS Super Resolution/DLAA and remains
+  subject to NVIDIA's applicable terms.
 - `nvngx_dlssg.dll` 310.9.1.0 is an NVIDIA-signed public DLSS-G
   redistributable and remains subject to NVIDIA's applicable terms.
 - `nvngx_dlssnr.dll` 310.8.0 is a leaked, non-public DLSS-NR build. The project

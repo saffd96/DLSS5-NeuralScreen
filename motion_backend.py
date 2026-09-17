@@ -2,7 +2,8 @@
 
 
 def normalize_backend(value):
-    return value if value in ("gpu", "nvofa") else "cpu"
+    """Preserve explicit CPU/GPU LK choices; default to NVOFA."""
+    return value if value in ("cpu", "gpu") else "nvofa"
 
 
 class MotionBackendStatus:

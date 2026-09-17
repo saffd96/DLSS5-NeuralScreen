@@ -284,7 +284,7 @@ class OverlayMenu:
             # this dict is dropped by set_state in silence, and the toggle
             # then draws as off while the action behind it fires normally.
             "hdr": False,
-            "motion_backend": "cpu",
+            "motion_backend": "nvofa",
             "gpu_motion": False,
             # Skip static frames (processing section): no new capture frame -
             # the network idles instead of re-running.
@@ -405,6 +405,12 @@ class OverlayMenu:
         # (notably one row per window), so an index would silently jump to a
         # different control after a payload refresh.
         self.focus_token: tuple | None = None
+        # Keyboard focus draws a ring; a click does not. The ring is a
+        # keyboard affordance - with the mouse the user already knows what
+        # they pressed, and on a full-width row it wrapped the label and the
+        # control together (user: "an outline appears when I pick buttons or
+        # drag a slider - that is not needed").
+        self.focus_from_mouse = False
         self._layout_size: tuple[int, int] | None = None
 
     @property
@@ -428,9 +434,49 @@ class OverlayMenu:
 
     def toggle(self) -> bool:
         self.visible = not self.visible
-        if not self.visible:
-            self._drag_item = None
         return self.visible
+
+    @property
+    def visible(self) -> bool:
+        """Whether the panel is up. Setting it False ends any interaction.
+
+        The setter is the ONE place that closes the menu, and closing it has
+        to finish whatever the pointer started (audit H3). A drag begun on the
+        title bar holds SetCapture and a live anchor in `_move_from`; if the
+        menu is closed before the button comes up - the min icon, Num2, Esc,
+        the tray, the taskbar - the matching MOUSEBUTTONUP is dropped by
+        handle_event's own `if not self.visible: return []` guard. The drag
+        then never ends: `dragging` stays True, so the main loop skips the
+        whole per-frame payload refresh (FPS, REC, the GPU verdict, the
+        profile all freeze), and the next buttonless MOUSEMOTION applies the
+        anchor, teleporting the panel by the distance the cursor travelled
+        meanwhile (measured: offset [0, 0] -> [-460, 153]).
+
+        Routes that assign the attribute directly are covered by this too;
+        they used to leave the panel dragging forever.
+        """
+        return self._visible
+
+    @visible.setter
+    def visible(self, value: bool) -> None:
+        value = bool(value)
+        if not value and getattr(self, "_visible", False):
+            self._end_interaction()
+        self._visible = value
+
+    def _end_interaction(self) -> None:
+        """Cancel every pointer interaction the menu is holding.
+
+        Called when the menu goes away underneath the pointer: the drags and
+        resizes lose their anchor, and the window gives up the mouse capture
+        it took for them - otherwise clicks keep being routed to a menu the
+        user can no longer see.
+        """
+        self._drag_item = None
+        self._move_from = None
+        self._resize_from = None
+        self._resize_h_from = None
+        self._capture_mouse(False)
 
     @property
     def dragging(self) -> bool:
@@ -576,8 +622,11 @@ class OverlayMenu:
         return next((item for item in self.items
                      if self._focus_id(item) == self.focus_token), None)
 
-    def _set_focus(self, item: Item | None) -> None:
+    def _set_focus(self, item: Item | None, *, from_mouse: bool = False) -> None:
         self.focus_token = self._focus_id(item) if item is not None else None
+        # A mouse click keeps the focus token (arrows still act on what was
+        # clicked) but must not paint the keyboard ring around it.
+        self.focus_from_mouse = from_mouse and item is not None
         if self.page == "windows":
             self.hover_window = (item.extra.get("hwnd")
                                  if item is not None
@@ -854,13 +903,22 @@ class OverlayMenu:
             nonlocal cy
             if not show:
                 return
-            items.append(Item("slider", key,
+            item = Item("slider", key,
                               pygame.Rect(pad, cy, inner_w, label_h + ctrl_h),
                               lo=lo, hi=hi, value=value,
                               extra={"label": label, "hint": hint,
                                      "mark": mark, "ends": ends,
                                      "value_text": value_text,
-                                     "label_h": label_h}))
+                                     "label_h": label_h})
+            # The hit zone is the TRACK, not the row: a click on the label
+            # or on the blank space left of the track must not jump the
+            # value (user rule 16.09). The track's rect is computed
+            # exactly as _draw_slider computes it.
+            track_y = cy + label_h + self._u(10)
+            item.extra["hit"] = pygame.Rect(
+                pad, track_y - self._u(6), inner_w,
+                self._u(SLIDER_H) + self._u(12))
+            items.append(item)
             # End captions take the same line a hint would: a slider has
             # one or the other, never both (they would overprint).
             cy += label_h + ctrl_h + (self._u(SMALL_SIZE) + 4
@@ -883,10 +941,17 @@ class OverlayMenu:
                 # plain ones did.
                 hint_h = (self._u(8) + (str(hint).count("\n") + 1) * line_h
                           - self._u(4))
-            items.append(Item("choice", key,
+            item = Item("choice", key,
                               pygame.Rect(pad, cy, inner_w, label_h + ctrl_h + hint_h),
                               payload=list(options),
-                              extra=extra))
+                              extra=extra)
+            # The hit zone is the select FIELD, not the row: the label above
+            # it is a caption (user rule 16.09). _draw_choice writes the
+            # same rect back into extra["strip"], and the hint guard below
+            # uses it too.
+            item.extra["hit"] = pygame.Rect(pad, cy + label_h, inner_w,
+                                            self._u(CTRL_H))
+            items.append(item)
             cy += label_h + ctrl_h + hint_h + gap
 
         def segmented(key: str, label: str, current: str, options: list,
@@ -950,10 +1015,23 @@ class OverlayMenu:
                 line_h = self._small_font.get_height() + self._u(4)
                 hint_h = (self._u(8) + (str(hint).count("\n") + 1) * line_h
                           - self._u(4))
+            # The hit zone is the SWITCH, not the row (user rule 16.09:
+            # "only explicit switches and choices should react"). A toggle
+            # row spans the whole panel width, and clicking its empty left
+            # half - or the label - used to flip the switch. The switch
+            # itself is drawn at the row's right end (_draw_toggle), so the
+            # zone is that pill plus a small margin for the fingertip; the
+            # label is a caption, not a control.
+            switch_size = self._u(20)
+            switch_w = int(switch_size * 1.8)   # the drawn pill (see _draw_toggle)
+            switch_x = pad + inner_w - switch_w
             items.append(Item("toggle", key,
                               pygame.Rect(pad, cy, inner_w, ctrl_h + hint_h),
                               value=1.0 if on else 0.0,
                               extra=extra))
+            items[-1].extra["hit"] = pygame.Rect(
+                switch_x - self._u(6), cy,
+                switch_w + self._u(12), ctrl_h)
             if inline_x is not None:
                 # The buttons: right-aligned against the switch's left edge,
                 # small pills in one line with the toggle.
@@ -1056,7 +1134,7 @@ class OverlayMenu:
                    bool(self.state.get("hdr")),
                    hint=s.get("hdr_mode_hint", ""))
             choice("motion_backend", s.get("motion_backend", "Motion estimation"),
-                   self.state.get("motion_backend", "cpu"), ["cpu", "gpu", "nvofa"],
+                   self.state.get("motion_backend", "nvofa"), ["cpu", "gpu", "nvofa"],
                    labels=["CPU DIS", "GPU LK (experimental)", s.get("motion_nvofa", "NVOFA (experimental)")],
                    hint=s.get("motion_hint", "Restarts the worker; CPU fallback if unavailable"))
             choice("screenshot_mode", s.get("screenshot_mode", "Screenshot saving"),
@@ -1138,11 +1216,19 @@ class OverlayMenu:
             # once.
             field_h = self._u(CTRL_H)
             for cmd, label in HOTKEY_ROWS if show else ():
-                items.append(Item("hotkey", cmd,
-                                  pygame.Rect(pad, cy, inner_w, field_h),
-                                  extra={"label": s.get(label, label),
-                                         "key": self.hotkeys.get(cmd, "—"),
-                                         "capturing": self.capturing == cmd}))
+                hk = Item("hotkey", cmd,
+                          pygame.Rect(pad, cy, inner_w, field_h),
+                          extra={"label": s.get(label, label),
+                                 "key": self.hotkeys.get(cmd, "—"),
+                                 "capturing": self.capturing == cmd})
+                # Only the key FIELD reacts, not the whole row (user rule
+                # 16.09): the action label on the left is a caption.
+                # _draw_hotkey draws the field 170 units wide at the row's
+                # right end - the same rect.
+                hk.extra["hit"] = pygame.Rect(
+                    pad + inner_w - self._u(170), cy,
+                    self._u(170), field_h)
+                items.append(hk)
                 cy += field_h + self._u(6)
             # The caption belongs to the rows above it, not to the section
             # below: a full row gap on both sides left 96 px of nothing
@@ -1604,6 +1690,13 @@ class OverlayMenu:
             # they sit above the scroll area and used to travel with it under
             # the title bar.
             it.rect = it.rect.move(x, y if it.kind == "icon" else sy)
+            # The control's own hit zone travels with the row: without this
+            # a scrolled control kept its unscrolled zone and clicks landed
+            # on the wrong row (or nowhere). extra["hit"] is built in
+            # content coordinates, like it.rect was before this move.
+            zone = it.extra.get("hit")
+            if zone is not None:
+                it.extra["hit"] = zone.move(x, y if it.kind == "icon" else sy)
             if it.kind == "choice":
                 # The select field is computed here rather than at draw time:
                 # the layout of an expanded list is built before the first
@@ -1637,8 +1730,15 @@ class OverlayMenu:
                     # the panel cannot be stretched down). Prefer opening
                     # down; flip up when the space below the strip cannot
                     # hold at least two rows and the space above can.
+                    # The room above is measured to the VIEWPORT, not to the
+                    # panel: the panel's first band is the title bar, which is
+                    # the drag handle and carries no content. Rows laid out
+                    # into it were drawn over the title text, could not be
+                    # clicked (the title bar takes the press, or hit() rejects
+                    # them) and could not be reached from the keyboard either -
+                    # visible but unreachable (audit H4).
                     down_room = self.panel_rect.bottom - strip.bottom - self._u(8)
-                    up_room = strip.top - self.panel_rect.top - self._u(8)
+                    up_room = strip.top - self._viewport.top - self._u(8)
                     open_up = (down_room < 2 * oh and up_room > down_room)
                     room = up_room if open_up else down_room
                     max_rows = max(1, room // oh)
@@ -1780,10 +1880,15 @@ class OverlayMenu:
                 for it in self.items:
                     # "info" is in the list for one row: the captured
                     # window, which opens the picker.
-                    if (it.kind in ("action", "hotkey", "button")
+                    # The hover follows the same CONTROL zone the click uses
+                    # (user rule 16.09): highlighting the whole row while
+                    # only the switch reacts promises a click target that is
+                    # not there.
+                    if (it.kind in ("action", "hotkey", "button",
+                                    "toggle", "slider", "choice")
                         or (it.kind == "info"
                             and it.key == "source_now")) and \
-                            it.rect.collidepoint(event.pos):
+                            (it.extra.get("hit") or it.rect).collidepoint(event.pos):
                         self.hover = f"{it.kind}:{it.key}"
                         break
             # The windows page rows: the row itself is highlighted too, like
@@ -1829,7 +1934,7 @@ class OverlayMenu:
             # which returns immediately. So the icons are checked first.
             for it in self.items:
                 if it.kind == "icon" and it.rect.collidepoint(event.pos):
-                    self._set_focus(it)
+                    self._set_focus(it, from_mouse=True)
                     out.extend(self._activate_item(it))
                     return out
             if self._grip.collidepoint(event.pos):
@@ -1852,7 +1957,7 @@ class OverlayMenu:
                 self._drag_item = None
                 self.open_choice = None
                 return out
-            self._set_focus(item if self._is_focusable(item) else None)
+            self._set_focus(item if self._is_focusable(item) else None, from_mouse=True)
             if item.kind == "hotkey" and item.extra.get("clear") is not None and item.extra["clear"].collidepoint(event.pos):
                 self.capturing = None
                 out.extend([("hotkey", item.key, ""), ("capture", None)])
@@ -2156,7 +2261,15 @@ class OverlayMenu:
         # the whole FG switch instead).
         best: "Item | None" = None
         for item in self.items:
-            if not item.rect.collidepoint(pos):
+            # Only the CONTROL reacts, not the whole row (user rule 16.09:
+            # "only explicit switches and choices should be clickable").
+            # A toggle/slider/choice row spans the panel width, and the
+            # label - or the empty space beside the control - used to
+            # activate it. extra["hit"] is the control's own rectangle
+            # (the switch pill, the slider track, the select field, the
+            # hotkey field), computed by layout.
+            zone = item.extra.get("hit") or item.rect
+            if not zone.collidepoint(pos):
                 continue
             # A hint under a toggle is a caption, not a hit target:
             # clicking it must not flip the switch (the Spout2 toggle
@@ -2169,8 +2282,8 @@ class OverlayMenu:
                 strip = item.extra.get("strip")
                 if strip is not None and pos[1] > strip.bottom:
                     continue
-            if best is None or item.rect.w * item.rect.h \
-                    < best.rect.w * best.rect.h:
+            if best is None or zone.w * zone.h < best.extra.get("hit", best.rect).w * \
+                    best.extra.get("hit", best.rect).h:
                 best = item
         return best
 
@@ -2314,8 +2427,22 @@ class OverlayMenu:
         self._draw_scrollbar(surface)
 
     def _draw_focus_ring(self, surface, item: Item) -> None:
-        """A high-contrast, theme-specific ring independent of hover state."""
-        rect = item.rect
+        """The keyboard focus ring - never drawn for a mouse click.
+
+        With the mouse the user already knows what they pressed, and on a
+        full-width row the ring wrapped the label and the control together
+        (user rule 16.09: "an outline appears when I pick buttons or drag a
+        slider - that is not needed"). Keyboard focus still shows it: there
+        the ring is the only thing telling the user where they are.
+        """
+        if self.focus_from_mouse:
+            return
+        # The ring marks the CONTROL, not its row: a slider's row carries the
+        # label and the value, and wrapping those in the ring is what the
+        # user saw as "a big outline over the labels and the bar" (16.09).
+        # extra["hit"] is exactly the rect a click tests, so the ring and the
+        # click target agree.
+        rect = item.extra.get("hit") or item.rect
         if item.kind == "choice":
             rect = item.extra.get("strip") or rect
         elif item.kind == "hotkey":
@@ -2408,19 +2535,44 @@ class OverlayMenu:
             skipped = max(0, int(st.get("skipped_static", 0) or 0))
             readings.append(f"{s.get('skipped_short', 'SKIP')} {skipped}")
             readings.append(str(st.get("resolution", "—")))
+
+        name = str(self.state.get("gpu_text") or "")
+        # The card the network runs on gets its room FIRST (audit M4). The
+        # readings used to be laid out from the right and the name took
+        # whatever was left - measured 72 px at 1080p and 74 px at 4K, because
+        # the reading block grows with the font while the panel scale stops at
+        # 1.2. So "NVIDIA GeForce RTX 5070 Ti" came out as "NVIDIA…", and in
+        # German at 4K (room 38 px, below the old 40-unit floor) the name was
+        # not drawn at all. The name is the one value here that says which
+        # hardware is running, so it is placed first and the readings are
+        # elided into what remains: a shortened "NR 144.0" still reads, a
+        # missing card name does not.
+        name_x = lx + label.get_width() + self._u(14)
+        name_room = 0
+        if name:
+            # Never more than a third of the bar: the readings matter too, and
+            # a name that eats the line is as unhelpful as one that vanishes.
+            name_room = max(self._u(24),
+                            min(rect.w // 3, self._small_font.size(name)[0]))
+            name_room = min(name_room, max(0, rect.right - pad - name_x
+                                           - self._u(60)))
+            if name_room > 0:
+                img = self._clip(self._small_font, name,
+                                 _rgb(self.c["muted"]), name_room)
+                surface.blit(img, (name_x, cyr - img.get_height() // 2))
+                name_room = img.get_width()
+
         x = rect.right - pad
+        limit = name_x + name_room + self._u(14) if name_room else lx + label.get_width() + self._u(14)
         for value in reversed(readings):
             img = self._mono_small.render(value, True, _rgb(self.c["muted"]))
+            # Drop a reading that cannot fit beside the name: a clipped number
+            # is worse than a missing one, and the resolution is the longest.
+            if x - img.get_width() < limit:
+                continue
             x -= img.get_width()
             surface.blit(img, (x, cyr - img.get_height() // 2))
             x -= self._u(14)
-
-        name = str(self.state.get("gpu_text") or "")
-        room = x - (lx + label.get_width() + self._u(14))
-        if name and room > self._u(40):
-            img = self._clip(self._small_font, name, _rgb(self.c["muted"]), room)
-            surface.blit(img, (x - img.get_width(),
-                               cyr - img.get_height() // 2))
 
     def _rec_text(self, s: dict) -> str:
         """Recording state: the duration is more useful than a bare "on"."""
@@ -2582,7 +2734,11 @@ class OverlayMenu:
 
     def _draw_choice(self, surface, item: Item, s: dict) -> None:
         label_h = item.extra.get("label_h", self._u(LABEL_H))
-        label = self._font.render(item.extra.get("label", item.key), True, _rgb(self.c["text"]))
+        # Clipped like every other label (audit M1): "the captions are short"
+        # is not a rule that survives a translation.
+        label = self._clip(self._font,
+                           str(item.extra.get("label", item.key)),
+                           _rgb(self.c["text"]), item.rect.w)
         surface.blit(label, (item.rect.x, item.rect.y))
 
         # The field is the CONTROL, not the rest of the row. A row with a
@@ -2601,8 +2757,14 @@ class OverlayMenu:
         labels = item.extra.get("labels") or item.payload or []
         if cur_val in (item.payload or []):
             cur_val = str(labels[item.payload.index(cur_val)])
-        cur = self._font.render(cur_val, True,
-                                _rgb(self.c["text"]))
+        # Clipped to the space the field actually leaves (audit M1). The value
+        # used to be rendered at full width: the GPU picker's is
+        # "<i>: <name>" plus " - <no_nr>" for an adapter that was already
+        # refused, so at 1080p/ja it measured 566 px against 460 px of field -
+        # it ran under the drop-down arrow and past the border. The arrow is
+        # 16 px from the right edge and the text starts 12 px from the left.
+        cur = self._clip(self._font, cur_val, _rgb(self.c["text"]),
+                         strip.w - self._u(12) - self._u(16))
         surface.blit(cur, (strip.x + self._u(12),
                            strip.centery - cur.get_height() // 2))
         cx = strip.right - self._u(16)
@@ -2712,8 +2874,21 @@ class OverlayMenu:
         the accent under the pointer so that it reads as one.
         """
         value = str(item.extra.get("value") or "")
-        val = self._mono_small.render(value, True, _rgb(self.c["muted"]))
-        room = item.rect.w - val.get_width() - self._u(12)
+        # The value is clipped too, and the label keeps a floor (audit M1). A
+        # recording path is the user's folder plus a fixed tail
+        # (neuralscreen-YYYYMMDD-HHMMSS-mmm.mp4), so it is routinely longer
+        # than the row: measured at 1080p, 492 px of value in a 365 px row, and
+        # the label was handed `room = item.rect.w - value_w - 12` - a NEGATIVE
+        # width, so _clip returned an empty surface and the caption vanished as
+        # well. Both now share the row: the value takes what it needs up to a
+        # share of the row, the label keeps the rest with a readable floor.
+        label_floor = self._u(90) if value else 0
+        val_room = max(self._u(60),
+                       item.rect.w - label_floor - self._u(12)) if value else 0
+        val = (self._clip(self._mono_small, value, _rgb(self.c["muted"]),
+                          val_room) if value else None)
+        room = item.rect.w - (val.get_width() if val is not None else 0) \
+            - self._u(12)
         hot = (item.key == "source_now"
                and self.hover == f"info:{item.key}")
         label = self._clip(self._font, str(item.extra.get("label") or ""),
@@ -2721,7 +2896,7 @@ class OverlayMenu:
                            room)
         y = item.rect.centery
         surface.blit(label, (item.rect.x, y - label.get_height() // 2))
-        if value:
+        if value and val is not None:
             surface.blit(val, (item.rect.right - val.get_width(),
                                y - val.get_height() // 2))
 

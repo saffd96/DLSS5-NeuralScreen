@@ -266,6 +266,14 @@ def sync_low_cost_off(st) -> bool:
     channels and stops sending frames.  If that handshake fails, the only
     honest low-cost fallback is to stop the worker: a later NR ON command uses
     the existing worker-failure recovery path to start a clean one.
+
+    This function does NOT own `next_auto_revive` (audit H1). The transient
+    failure handler arms exactly one automatic revive and announces it in the
+    log; main reads that deadline one line after the call below. Zeroing it
+    here disarmed the revive before it was ever read, so in the default
+    configuration (FG off, no recording) the promised recovery never came and
+    NR stayed off until the user pressed Num1 - the one case the feature
+    exists for. A dead worker is still marked failed; the arm is left alone.
     """
     want_idle = wants_low_cost_off(st)
     if want_idle == st.off_suspended:
@@ -289,13 +297,11 @@ def sync_low_cost_off(st) -> bool:
                       f"stopping the worker", file=sys.stderr)
                 shutdown_worker(st.worker, st.worker_stop)
                 st.worker_failed = True
-                st.next_auto_revive = 0.0
                 channels.forget_present(st)
                 channels.forget_dda(st)
                 channels.forget_out(st)
         elif not worker_alive:
             st.worker_failed = True
-            st.next_auto_revive = 0.0
 
         # A transparent HUD layer is enough for the menu while OFF.  The idle
         # branch in main hides it completely whenever the menu is closed.
@@ -790,7 +796,12 @@ def apply_hdr(st, enabled: bool) -> None:
 def apply_motion_backend(st, value: str) -> None:
     from motion_backend import normalize_backend
     value = normalize_backend(value)
-    if value == normalize_backend(st.cfg.get("motion_backend")):
+    # Only a recorded choice that already matches is a no-op. A config that
+    # has no key yet (an old file, a synthetic state) must still take the
+    # value and persist it: with NVOFA as the shipped default, comparing a
+    # missing key against it made the first explicit selection do nothing.
+    current = st.cfg.get("motion_backend")
+    if current is not None and normalize_backend(current) == value:
         return
     st.cfg["motion_backend"] = value
     st.cfg["gpu_motion"] = value == "gpu"

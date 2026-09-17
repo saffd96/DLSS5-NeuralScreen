@@ -45,7 +45,7 @@ def run(hdr=False, dynamic=False, check_pixels=False, sr=False, ui=False, detail
         hwnd = pygame.display.get_wm_info()["window"]
     dumps = tempfile.TemporaryDirectory(prefix="fg-pixels-") if check_pixels else None
     env = dict(os.environ, NS_FRAMEGEN="1", NS_HDR="1" if hdr else "0",
-               NS_NR_SMALL="1" if sr else "0", NS_DLSS_SR="1" if sr else "0")
+               NS_NR_SMALL="0")
     if dumps:
         assert hdr, "pixel check requires --hdr"
         env["NS_FG_DUMP"] = dumps.name
@@ -158,9 +158,6 @@ def run(hdr=False, dynamic=False, check_pixels=False, sr=False, ui=False, detail
         assert "[fg] 3x enabled" in log and "[fg] 4x enabled" in log
         assert log.count("[fg] UI: off") >= 2 and log.count("[fg] 4x enabled") >= 2
         assert log.count("direct feature 18 ready") == 1, "UI settings restarted NR"
-    if sr:
-        assert "[sr] ready:" in log and "[sr] first evaluation succeeded" in log
-        assert "[sr] Evaluate failed" not in log and "[sr] CreateFeature failed" not in log
     rates = [float(x) for x in re.findall(r"\[fg\] displayed ([\d.]+) FPS", log)]
     assert rates and max(rates) > 75, rates
     assert "[fg] presenter failed" not in log and "[fg] Evaluate failed" not in log

@@ -185,9 +185,12 @@ def shipped_config_defaults():
     if head.get("frame_generation") is not False:
         problems.append(f"frame_generation={head.get('frame_generation')!r} "
                         f"- a fresh install must be opt-in")
-    if head.get("motion_backend") != "cpu":
+    # NVOFA is the default since 1.13.1 (user rule 16.09): the driver path is
+    # the one the program is built around, and CPU DIS stays as the automatic
+    # fallback and an explicit choice.
+    if head.get("motion_backend") != "nvofa":
         problems.append(f"motion_backend={head.get('motion_backend')!r} "
-                        f"- cpu is the default")
+                        f"- nvofa is the default")
     for key in ("intensity", "local_tone", "local_structure", "skin_structure"):
         if key not in head or head[key] is None:
             continue
@@ -199,7 +202,7 @@ def shipped_config_defaults():
             problems.append(f"{key}={head[key]!r} - Natural says {natural[key]}")
     if problems:
         return False, "HEAD config is not the product default: " + "; ".join(problems)
-    return True, "multiplier 2, FG off, CPU motion, Natural's four sliders"
+    return True, "multiplier 2, FG off, NVOFA motion, Natural's four sliders"
 
 
 def tests_isolate_user_config():
@@ -233,12 +236,25 @@ def zip_integrity():
     import settings_io
     version = settings_io.APP_VERSION
     tag = f"v{version}"
+    # The manifest pins the RELEASE, so it is checked against the tag - not
+    # against HEAD. It lists every shipped file with its git blob, and a
+    # checkout that has moved on since the release (a test fix, a translation,
+    # a comment) differs from it by design; comparing with HEAD reported that
+    # normal state as a broken contract. If the tag is missing, fall back to
+    # HEAD so a pre-release tree is still validated.
+    git_ref = subprocess.run(
+        ["git", "rev-list", "-n", "1", tag],
+        cwd=ROOT, capture_output=True, text=True,
+        encoding="utf-8", errors="replace",
+    ).stdout.strip()
+    if not git_ref:
+        git_ref = "HEAD"
     try:
         manifest, _raw = release.validate_runtime_manifest(
             ROOT,
             version=version,
             expected_tag=tag,
-            git_ref="HEAD",
+            git_ref=git_ref,
         )
     except release.ReleaseContractError as exc:
         return False, f"release manifest: {exc}"
@@ -251,17 +267,28 @@ def zip_integrity():
                       f"{runtime_count} runtime files pinned; ZIP waits for {tag}")
 
     import verify_github as verifier
-    commit = subprocess.check_output(
-        ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True,
+    # The archive is built from the TAGGED commit - the builder refuses to run
+    # anywhere else - so the tag is what it has to match. Resolving HEAD here
+    # instead reported a fault on every working tree that had moved on since
+    # the release (a test fix, a documentation line), because the commit
+    # compiled into VERSION.txt is the tag's, not HEAD's. That is the normal
+    # state of a checkout after a release, so the check read as broken while
+    # the archive was perfectly correct.
+    tag_commit = subprocess.run(
+        ["git", "rev-list", "-n", "1", tag],
+        cwd=ROOT, capture_output=True, text=True,
         encoding="utf-8", errors="replace",
-    ).strip()
+    ).stdout.strip()
+    if not tag_commit:
+        return False, (f"a release ZIP exists but tag {tag} does not - the "
+                       f"archive cannot be matched to a release")
     failures = verifier.validate_release_set(
-        ROOT, tag=tag, tag_commit=commit, repo=ROOT,
+        ROOT, tag=tag, tag_commit=tag_commit, repo=ROOT,
     )
     if failures:
         return False, "release ZIP: " + "; ".join(failures[:5])
     return True, (f"{zpath.stat().st_size} bytes, exact {package_count}-file "
-                  "payload, tagged blobs and checksums verified")
+                  f"payload, blobs and checksums verified against {tag}")
 
 
 def gpuinfo_works():
