@@ -167,6 +167,23 @@ class ReleaseContractTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
+    def test_fork_release_tag_keeps_manifest_and_commit_binding(self) -> None:
+        self.fixture.tag = f"v{self.fixture.version}-saffd96.1"
+        builder.write_runtime_manifest(
+            self.repo, version=self.fixture.version, expected_tag=self.fixture.tag,
+            mandatory_files=self.fixture.mandatory,
+            required_runtime_artifacts=self.fixture.runtime_artifacts,
+        )
+        run_git(self.repo, "add", builder.RUNTIME_MANIFEST)
+        run_git(self.repo, "commit", "-qm", "pin fork manifest")
+        run_git(self.repo, "tag", self.fixture.tag)
+        self.fixture.build()
+        self.assertEqual([], verifier.validate_release_set(
+            self.fixture.dist, tag=self.fixture.tag,
+            tag_commit=self.fixture.commit, repo=self.repo))
+        with self.assertRaises(builder.ReleaseContractError):
+            builder.assert_release_tag(self.repo, "v9.8.0-saffd96.1", self.fixture.version)
+
     def test_build_creates_strict_release_set_and_complete_inventory(self) -> None:
         # An ignored local file is intentionally allowed by the tracked-tree gate.
         (self.repo / "ignored.local").write_text("developer state", encoding="utf-8")

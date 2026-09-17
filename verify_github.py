@@ -24,7 +24,7 @@ from typing import Mapping, Sequence
 
 
 ROOT = Path(__file__).resolve().parent
-REPOSITORY = "perseval-BLR/NeuralScreen"
+REPOSITORY = "saffd96/DLSS5-NeuralScreen"
 RAW_ROOT = f"https://raw.githubusercontent.com/{REPOSITORY}"
 RUNTIME_MANIFEST = "runtime-manifest.json"
 THIRD_PARTY_NOTICES = "THIRD-PARTY-NOTICES.md"
