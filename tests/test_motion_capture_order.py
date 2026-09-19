@@ -67,7 +67,7 @@ def main():
     # interpolate (#104) - and the reset also reaches FG, which resets on
     # `fh.reset` regardless of the bypass flag.
     frame = object()
-    guide = SimpleNamespace(motion=object(), reset=False)
+    guide = SimpleNamespace(motion=object(), reset=False, ui_regions=())
     calls = []
     def process(*args, **kwargs):
         calls.append('guides')
