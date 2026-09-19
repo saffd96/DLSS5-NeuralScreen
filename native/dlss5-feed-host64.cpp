@@ -148,6 +148,7 @@ static const char *NgxResultName(NVSDK_NGX_Result r)
     switch (static_cast<unsigned>(r))
     {
     case 0x1:        return "Success";
+    case 0xBAD00000: return "Fail";
     case 0xBAD00001: return "FeatureNotSupported";
     // What the feature library answers when the call did not leave a module
     // whose path contains "nvngx.dll" - the commonest way for a broken
@@ -156,12 +157,23 @@ static const char *NgxResultName(NVSDK_NGX_Result r)
     case 0xBAD00003: return "FeatureAlreadyExists";
     case 0xBAD00004: return "FeatureNotFound";
     case 0xBAD00005: return "InvalidParameter";
+    case 0xBAD00006: return "ScratchBufferTooSmall";
     case 0xBAD00007: return "NotInitialized";
     case 0xBAD00008: return "UnsupportedInputFormat";
+    case 0xBAD00009: return "RWFlagMissing";
     case 0xBAD0000A: return "MissingInput";
     case 0xBAD0000B: return "UnableToInitializeFeature";
+    // The values in nvsdk_ngx_defs.h are DECIMAL, so `Fail | 12` is 0x0C,
+    // not 0x12 - the two were conflated once and the log named both as "?".
+    // 0x0C is the one a user with an older driver hits on the feature
+    // requirements query (raycornea's log), 0x12 is NotImplemented.
+    case 0xBAD0000C: return "OutOfDate";
     case 0xBAD0000D: return "OutOfGPUMemory";
     case 0xBAD0000E: return "UnsupportedFormat";
+    case 0xBAD0000F: return "UnableToWriteToAppDataPath";
+    case 0xBAD00010: return "UnsupportedParameter";
+    case 0xBAD00011: return "Denied";
+    case 0xBAD00012: return "NotImplemented";
     default:         return "?";
     }
 }
@@ -936,19 +948,11 @@ static void AbortCommands()   // never execute a list NGX crashed in
     }
 }
 
-static NVSDK_NGX_Result SafeCreateDLSS(NVSDK_NGX_DLSS_Create_Params *cp, DWORD *code)
-{
-    *code = 0;
-    __try { return NGX_D3D12_CREATE_DLSS_EXT(h.list, 1, 1, &h.feature, h.params, cp); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { *code = GetExceptionCode(); return static_cast<NVSDK_NGX_Result>(0x7FFFFFFF); }
-}
-
-static NVSDK_NGX_Result SafeEvaluateDLSS(NVSDK_NGX_D3D12_DLSS_Eval_Params *ep, DWORD *code)
-{
-    *code = 0;
-    __try { return NGX_D3D12_EVALUATE_DLSS_EXT(h.list, h.feature, h.params, ep); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { *code = GetExceptionCode(); return static_cast<NVSDK_NGX_Result>(0x7FFFFFFF); }
-}
+// SafeCreateDLSS/SafeEvaluateDLSS used to wrap the NGX CORE entry points. They
+// are gone: the feature is created and evaluated through the DLSSNR runtime
+// (g_nr_create/g_nr_evaluate) on every path, and the core wrapper only ever
+// answered 0xBAD00004 (FeatureNotFound) for a handle the runtime owns - the
+// reason --test reported 0/300 for as long as it existed.
 
 static void SafeReleaseFeature(NVSDK_NGX_Handle *f)
 {
@@ -1516,10 +1520,11 @@ static bool CreateFeature(UINT w, UINT h_, int flags, NVSDK_NGX_Result *out_r, U
     // for this query; the bitmask meanings come from the NGX header
     // (1 check absent, 2 driver, 4 adapter, 8 OS, 16 not implemented).
     // Measured on the bundled 310.8.0 runtime: the query itself returns
-    // FAIL_OutOfDate (0xBAD00012) - discovery for feature 18 is newer than
-    // this build. The query is diagnostic only: the create's own result
-    // stays the truth, and a NEWER BYO runtime (310.9+) answers it - which
-    // is exactly the BYO UX case this is for.
+    // FAIL_NotImplemented (0xBAD00012 - the header's literals are decimal,
+    // so `Fail | 18` is 0x12; `Fail | 12`, OutOfDate, is 0x0C and is the
+    // code an older driver answers). The query is diagnostic only: the
+    // create's own result stays the truth, and a NEWER BYO runtime
+    // (310.9+) answers it - which is exactly the BYO UX case this is for.
     {
         wchar_t data_path[MAX_PATH] = {};
         GetModuleFileNameW(nullptr, data_path, MAX_PATH);
@@ -1561,7 +1566,8 @@ static bool CreateFeature(UINT w, UINT h_, int flags, NVSDK_NGX_Result *out_r, U
             }
         }
         else
-            Log("[host] feature requirements query failed 0x%08X - continuing with the create", qrr);
+            Log("[host] feature requirements query failed 0x%08X (%s) - continuing with the create",
+                qrr, NgxResultName(qrr));
     }
 
     if (TestFailureOnce("create"))
@@ -1622,26 +1628,33 @@ static bool ReinitNgx()
     return InitNgx();
 }
 
+// Forward declarations: the NR parameter block lives below (it needs
+// SetVerifiedU/F, g_video_options and g_pw_exposure, which are declared after
+// this point), but Evaluate has to share it - both must set the same parameters
+// the live path sets, or --test exercises a different contract than the program
+// runs.
+static void ApplyNrEvalParams(NVSDK_NGX_Parameter *p, ID3D12Resource *color,
+                              ID3D12Resource *output, ID3D12Resource *mv,
+                              UINT w, UINT h, int reset, float mvsx, float mvsy);
+
 static bool Evaluate(ID3D12Resource *color, ID3D12Resource *output, ID3D12Resource *depth, ID3D12Resource *mv,
                      UINT w, UINT h_, int reset, float mvsx, float mvsy)
 {
     if (!BeginCommands()) return false;
 
-    NVSDK_NGX_D3D12_DLSS_Eval_Params ep = {};
-    ep.Feature.pInColor  = color;
-    ep.Feature.pInOutput = output;
-    ep.pInDepth          = depth;
-    ep.pInMotionVectors  = mv;
-    ep.InRenderSubrectDimensions.Width  = w;
-    ep.InRenderSubrectDimensions.Height = h_;
-    ep.InReset           = reset;
-    ep.InMVScaleX        = mvsx;
-    ep.InMVScaleY        = mvsy;
-    ep.InPreExposure     = 1.0f;
-    ep.InExposureScale   = 1.0f;
-
+    // The feature is created through the DLSSNR runtime (g_nr_create), so it
+    // must be evaluated through the same runtime. This used to call the NGX
+    // CORE entry point (NGX_D3D12_EVALUATE_DLSS_EXT) - a different
+    // implementation that knows nothing about that handle, so every evaluate
+    // answered 0xBAD00004 (FeatureNotFound) and --test reported 0/300 while
+    // the real pipeline was fine. The live path (EvaluateVideo) has always
+    // used g_nr_evaluate; this is the same call, with the same parameter
+    // contract.
+    ApplyNrEvalParams(h.params, color, output, mv, w, h_, reset, mvsx, mvsy);
     DWORD ecode = 0;
-    NVSDK_NGX_Result re = SafeEvaluateDLSS(&ep, &ecode);
+    NVSDK_NGX_Result re = static_cast<NVSDK_NGX_Result>(0x7FFFFFFF);
+    __try { re = g_nr_evaluate(h.list, h.feature, h.params, nullptr); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { ecode = GetExceptionCode(); }
     if (ecode != 0) { AbortCommands(); Log("[host] evaluate raised 0x%08X (caught; nothing submitted)", ecode); return false; }
     if (EndCommands() == 0) return false;   // queue Signal failed (device removed)
     if (NVSDK_NGX_FAILED(re)) { Log("[host] evaluate failed 0x%08X (%s)", re, NgxResultName(re)); return false; }
@@ -1676,6 +1689,10 @@ static int RunTest()
 {
     const UINT W = 640, H = 360;
     Log("[host] --test: %ux%u synthetic DLAA", W, H);
+
+    // No stream header in this mode, so the NR profile comes from
+    // ShippedVideoDefaults() inside the shared parameter block - the same
+    // fallback the Serve path uses. Nothing to set up here.
 
     ID3D12Resource *color  = MakeTex(W, H, DXGI_FORMAT_R8G8B8A8_UNORM, false);
     ID3D12Resource *output = MakeTex(W, H, DXGI_FORMAT_R8G8B8A8_UNORM, true);
@@ -2054,7 +2071,12 @@ static float g_hdr_frame_white = 1.0f;
 static UINT g_hdr_split = UINT_MAX;
 static bool PresentHdr(VideoState &v, bool bypass);
 static bool FgRequested();
-static bool FgPresent(VideoState &v, ID3D12Resource *color, D3D12_RESOURCE_STATES state);
+// `bypass` tells the presenter that the frame it is handing over is the raw
+// capture (NR off), not the neural result: the export must follow the same
+// source the screen shows. Defaulted so the two ordinary call sites are
+// unchanged.
+static bool FgPresent(VideoState &v, ID3D12Resource *color, D3D12_RESOURCE_STATES state,
+                      bool bypass = false);
 // The fence value FgPresent submitted and waited on. PresentFrame reads it
 // for the defer-tail contract: the FG branch returns early, before the
 // ordinary EndCommands/submit path fills the caller's token. Defined in
@@ -2068,6 +2090,11 @@ static bool EnsurePresentFormat(bool hdr, bool pq = false);
 static void CloseHdrResources();
 
 static VideoHeader g_video_options = {};
+// True once RunVideo has stored a stream header. --test and the Serve path (a
+// 32-bit game on the feed pipe) never send one, and the NR parameter block has
+// to fall back to the shipped defaults there instead of writing a zero profile
+// that tells the runtime to do nothing.
+static bool g_video_profile_set = false;
 static uint32_t g_last_eval_result = 0;
 // Static-frame skipping (FRAME_FLAG_SKIP_STATIC): how many frames were skipped
 // since the last change, and whether the "idle" line was already written for
@@ -2080,6 +2107,11 @@ static uint32_t g_last_eval_result = 0;
 static uint32_t g_skip_static_count = 0;
 static bool     g_skip_static_logged = false;
 static bool     g_last_out_bypass = false;
+// Which source the last frame presented: the neural result or the raw capture.
+// FG's history is only valid inside one source, so the change of this flag is
+// what resets the presenter - the bypass flag itself is true on every frame of
+// the mode and resetting on it made the runtime interpolate nothing.
+static bool     g_fg_source_bypass = false;
 static bool     g_last_out_split_on = false;
 static uint32_t g_last_out_split_x = 0;
 static bool     g_force_next_frame = false;   // render one frame even if unchanged
@@ -2675,10 +2707,23 @@ static bool PresentFrame(VideoState &v, UINT64 *submitted = nullptr)
 static bool PresentBypass(VideoState &v)
 {
     if (!RebuildPresentIfStale()) return false;
-    StopFgPresentation();
+    // NR OFF is not a reason to tear the presenter down. Frame Generation owns
+    // the present loop on this path too; it only goes away when it is not
+    // asked for (or the switch is off). This used to call
+    // StopFgPresentation() unconditionally, which joined the presenter thread
+    // and cleared its history on every bypass frame - so the runtime was
+    // rebuilt per frame and never interpolated anything (#104).
+    const bool framegen = FgRequested();
+    if (!framegen) StopFgPresentation();
     if (g_hdr_capture) return PresentHdr(v, true);
     // Same as PresentFrame: nothing to restore unless HDR has been on (#58).
     if (HdrEnabled() && !EnsurePresentFormat(false)) return false;
+    // Before GetBuffer: FG submits and waits on its own fence, and the
+    // backbuffer must not be taken and left unreleased. v.color rests in
+    // NON_PIXEL_SHADER_RESOURCE between frames (see the barriers below).
+    if (framegen && FgPresent(v, v.color.tex,
+                              D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, true))
+        return true;
     ID3D12Resource *bb = nullptr;
     const HRESULT get_buffer = g_present_swap->GetBuffer(
         g_present_swap->GetCurrentBackBufferIndex(), __uuidof(ID3D12Resource),
@@ -3669,7 +3714,7 @@ static bool EnsureDdaSwizzle()
     prm[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     D3D12_ROOT_SIGNATURE_DESC rsd = {};
     prm[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    prm[2].Constants.Num32BitValues = 3;   // isFloat, white, rotate180
+    prm[2].Constants.Num32BitValues = 4;   // isFloat, white, rotate180, hdr
     prm[2].Constants.ShaderRegister = 0;
     rsd.NumParameters = 3; rsd.pParameters = prm;
     ID3DBlob *sig = nullptr;
@@ -4594,10 +4639,13 @@ static bool SwizzleCaptureIntoColor(VideoState &v)
     h.list->SetComputeRootDescriptorTable(1, g1);
     // rotate180 only for duplication: a WGC window is already composed the
     // way the user sees it, so turning it over would be a second rotation.
-    struct { UINT is_float; float white; UINT rotate180; } hdr = {
+    // hdr is the second, independent fact about the same frame: FP16 arrival
+    // says nothing about the picture being scRGB (see kHdrCaptureHlsl).
+    struct { UINT is_float; float white; UINT rotate180; UINT hdr; } hdr = {
         g_capture_float ? 1u : 0u, g_hdr_frame_white,
-        (g_dda_active && g_capture_rotate180) ? 1u : 0u };
-    h.list->SetComputeRoot32BitConstants(2, 3, &hdr, 0);
+        (g_dda_active && g_capture_rotate180) ? 1u : 0u,
+        g_hdr_capture ? 1u : 0u };
+    h.list->SetComputeRoot32BitConstants(2, 4, &hdr, 0);
     h.list->Dispatch((g_dda_w + 7) / 8, (g_dda_h + 7) / 8, 1);
     // copy swizzled dst into v.color.tex
     D3D12_RESOURCE_BARRIER pre_color = Transition(v.color.tex, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
@@ -5291,6 +5339,78 @@ static bool EvaluateIndependent(VideoState &v, bool reset)
     return fence != 0 && ProfileWait(PS_EVAL, fence, 60000);
 }
 
+// The shipped Natural profile: what a live session sends when the user has not
+// chosen anything else. `--test` and the Serve path (a 32-bit game on the feed
+// pipe) never receive a stream header, so these are the values the NR
+// parameters must be built from there - a zeroed profile would tell the runtime
+// to do nothing (intensity 0, style 0) and would look like a broken build.
+static VideoHeader ShippedVideoDefaults()
+{
+    VideoHeader vh = {};
+    vh.warmup = 8;
+    vh.intensity = 1.00f;
+    vh.local_tone = 0.50f;
+    vh.local_structure = 1.00f;
+    vh.skin_structure = -1.0f;
+    vh.style = 1;
+    vh.auto_mask = 1;
+    vh.ui_correction = 0;
+    return vh;
+}
+
+// The NR parameter block, shared by the live evaluate, the self-test and the
+// Serve path. All must set the same names with the same verification, or one of
+// them exercises a different contract than the program runs.
+static void ApplyNrEvalParams(NVSDK_NGX_Parameter *p, ID3D12Resource *color,
+                              ID3D12Resource *output, ID3D12Resource *mv,
+                              UINT w, UINT hgt, int reset, float mvsx, float mvsy)
+{
+    const VideoHeader opts = g_video_profile_set ? g_video_options : ShippedVideoDefaults();
+    p->Reset();
+    p->Set("DLSSNR.Color", color);
+    p->Set("DLSSNR.Output", output);
+    p->Set("DLSSNR.MVec", mv);
+    p->Set("DLSSNR.ColorSubrectBaseX", 0u); p->Set("DLSSNR.ColorSubrectBaseY", 0u);
+    p->Set("DLSSNR.ColorSubrectWidth", w); p->Set("DLSSNR.ColorSubrectHeight", hgt);
+    p->Set("DLSSNR.MVecSubrectBaseX", 0u); p->Set("DLSSNR.MVecSubrectBaseY", 0u);
+    p->Set("DLSSNR.MVecSubrectWidth", w); p->Set("DLSSNR.MVecSubrectHeight", hgt);
+    p->Set("DLSSNR.OutputSubrectBaseX", 0u); p->Set("DLSSNR.OutputSubrectBaseY", 0u);
+    p->Set("DLSSNR.OutputSubrectWidth", w); p->Set("DLSSNR.OutputSubrectHeight", hgt);
+    p->Set("DLSSNR.MVecScaleX", mvsx); p->Set("DLSSNR.MVecScaleY", mvsy);
+    bool verified = true;
+    verified &= SetVerifiedU(p, "DLSSNR.Enabled", 1u);
+    verified &= SetVerifiedU(p, "DLSSNR.Reset", (unsigned int)reset);
+    verified &= SetVerifiedF(p, "DLSSNR.Intensity", opts.intensity);
+    verified &= SetVerifiedF(p, "DLSSNR.LocalToneStrength", opts.local_tone);
+    verified &= SetVerifiedF(p, "DLSSNR.LocalStructureStrength", opts.local_structure);
+    verified &= SetVerifiedF(p, "DLSSNR.SkinStructureStrength", opts.skin_structure);
+    verified &= SetVerifiedU(p, "DLSSNR.UseAutoMask", opts.auto_mask);
+    verified &= SetVerifiedU(p, "DLSSNR.Style", opts.style);
+    verified &= SetVerifiedU(p, "DLSSNR.UICorrection", opts.ui_correction);
+    if (!verified)
+        Log("[host] NGX parameter read-back mismatch - a value did not stick");
+    p->Set("DLSS.Pre.Exposure", 1.0f);
+    p->Set("DLSS.Exposure.Scale", g_pw_exposure);
+}
+
+// --test drives the worker with no client, so no header ever fills
+// g_video_options. The defaults a live session sends for the shipped Natural
+// profile go in instead - the read-back check above needs real values, and a
+// zeroed profile would make the synthetic run report a contract failure that
+// only exists in the self-test.
+static void SetTestVideoParams()
+{
+    g_video_options = {};
+    g_video_options.warmup = 8;
+    g_video_options.intensity = 1.00f;
+    g_video_options.local_tone = 0.50f;
+    g_video_options.local_structure = 1.00f;
+    g_video_options.skin_structure = -1.0f;
+    g_video_options.style = 1;
+    g_video_options.auto_mask = 1;
+    g_video_options.ui_correction = 0;
+}
+
 static bool EvaluateVideo(VideoState &v, int reset, UINT64 *submitted = nullptr)
 {
     if (submitted) *submitted = 0;
@@ -5964,6 +6084,7 @@ static int RunVideo()
     if (upscale && (vh.full_w < vh.width || vh.full_h < vh.height || vh.full_w > 7680 || vh.full_h > 4320))
     { Log("[video] invalid full-res size %ux%u", vh.full_w, vh.full_h); return 2; }
     g_video_options = vh;
+    g_video_profile_set = true;
     const bool live = g_live_force || (vh.frame_count == 0);
     std::string full_note;
     if (upscale) full_note = " (full-res frames " + std::to_string(vh.full_w) + "x" + std::to_string(vh.full_h) + ")";
@@ -6357,7 +6478,6 @@ static int RunVideo()
             g_sr.history = false;
             g_force_next_frame = true;
             fh.reset = 1;
-            StopFgPresentation();
             Log("[video] NR %s; independent effects and HDR follow their settings",
                 nr_enabled ? "on" : "off");
         }
@@ -6613,9 +6733,11 @@ static int RunVideo()
         const bool independent = !nr_enabled && (SrRequested() || FgRequested() || g_detail_strength != 0);
         const bool bypass = !nr_enabled && !independent;
         if (bypass) g_sr.history = false;
-        g_fg_reset = frame == 0 || fh.reset != 0 || nr_changed || bypass
+        const bool fg_source_switch = (!nr_enabled != g_fg_source_bypass);
+        g_fg_reset = frame == 0 || fh.reset != 0 || nr_changed || fg_source_switch
                      || previous_hdr_split != g_hdr_split
                      || (stall_pending && source_fresh);
+        g_fg_source_bypass = !nr_enabled;
         // The NR evaluate shares the same stall reset: one forced reset
         // frame, then the ordinary flow.
         const bool stall_reset = stall_pending && source_fresh;

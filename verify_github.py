@@ -29,6 +29,11 @@ RAW_ROOT = f"https://raw.githubusercontent.com/{REPOSITORY}"
 RUNTIME_MANIFEST = "runtime-manifest.json"
 THIRD_PARTY_NOTICES = "THIRD-PARTY-NOTICES.md"
 CHECKSUMS = "SHA256SUMS"
+# The documents the release page must carry, on top of the four emitted
+# artifacts. build_release_zip.RELEASE_DOCUMENTS is the same set - a test
+# compares the two, because a doc missing from one list and present in the
+# other is exactly how "release vX is missing asset README.md" happened.
+RELEASE_DOCUMENTS = ("README.md", "README.ru.md", "TECHNICAL.md", "TECHNICAL.ru.md")
 VERSION_SOURCE_PATHS = (
     "build_release_zip.py",
     "settings_io.py",
@@ -769,7 +774,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     version = match.group(1) if match else "?"
     tag = args[0] if args else f"v{version}"
     failures: list[str] = []
-    if tag != f"v{version}":
+    if tag != f"v{version}" and re.fullmatch(re.escape(f"v{version}") + r"-saffd96\.[1-9][0-9]*", tag) is None:
         failures.append(f"requested tag {tag!r} does not match builder v{version}")
     local_tag_commit = _local_tag_commit(tag)
     if not local_tag_commit:
@@ -779,7 +784,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     docs = [
         "docs/screenshot-main-light.png", "docs/screenshot-main-dark.png",
         "docs/screenshot-settings.png", "docs/screenshot-windows.png",
-        "README.md", "README.ru.md", "TECHNICAL.md", "TECHNICAL.ru.md",
+        *RELEASE_DOCUMENTS,
     ]
     temp = ROOT / "_work" / "verify-github"
     temp.mkdir(parents=True, exist_ok=True)
@@ -832,7 +837,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         archive_name = f"neuralscreen-v{version}-full.zip"
         required_assets = {
             archive_name, CHECKSUMS, RUNTIME_MANIFEST, THIRD_PARTY_NOTICES,
-            "README.md", "README.ru.md", "TECHNICAL.md", "TECHNICAL.ru.md",
+            *RELEASE_DOCUMENTS,
         }
         assets: Mapping[str, dict] = {
             asset["name"]: asset for asset in release.get("assets", [])

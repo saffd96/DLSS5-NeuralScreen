@@ -8,7 +8,7 @@ member-level ``SHA256SUMS``.
 
 Normal use (after the release commit has been tagged):
 
-    runtime\python.exe build_release_zip.py v1.14.0
+    runtime\python.exe build_release_zip.py v1.15.1
 
 The command deliberately refuses release candidates, dirty tracked trees and
 tags that do not resolve to HEAD. Ignored local files do not affect the gate.
@@ -32,7 +32,7 @@ from typing import Iterable, Sequence
 
 
 BASE = Path(__file__).resolve().parent
-VERSION = "1.14.0"
+VERSION = "1.16.0"
 EXPECTED_TAG = f"v{VERSION}-saffd96.1"
 TARGET_ARCHS = (
     "RTX 30/40/50 (sm_86/89/120 kernels, spoof 0x1B0; "
@@ -41,6 +41,14 @@ TARGET_ARCHS = (
 RUNTIME_MANIFEST = "runtime-manifest.json"
 THIRD_PARTY_NOTICES = "THIRD-PARTY-NOTICES.md"
 CHECKSUMS = "SHA256SUMS"
+
+# The documents a release page must carry, on top of the four artifacts this
+# builder emits. They are inside the archive as payload, but GitHub needs them
+# as separate assets, and uploading them by hand is exactly the step that was
+# forgotten once: the verifier reported "release vX is missing asset README.md"
+# after everything else had already passed. verify_github.py holds the same set
+# in `required_assets`; the release commands in RELEASING.md are built from it.
+RELEASE_DOCUMENTS = ("README.md", "README.ru.md", "TECHNICAL.md", "TECHNICAL.ru.md")
 
 MANDATORY_FILES = (
     "config.default.json",
@@ -978,6 +986,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         archive = build_release(BASE, expected_tag=args.tag)
         print(f"built {archive.name} ({archive.stat().st_size} bytes)")
         print(f"sidecars: {CHECKSUMS}, {RUNTIME_MANIFEST}, {THIRD_PARTY_NOTICES}")
+        # The release command, with the complete asset list. Assembling it by
+        # hand is how the four documents were left off a published release once:
+        # the builder never named them as assets, and nothing failed until the
+        # verifier ran.
+        assets = " ".join(
+            [archive.name, CHECKSUMS, RUNTIME_MANIFEST, THIRD_PARTY_NOTICES,
+             *RELEASE_DOCUMENTS]
+        )
+        print("next: upload all eight assets -")
+        print(f"  gh release create {args.tag} \\")
+        print("    -R perseval-BLR/NeuralScreen \\")
+        print('    --title "<one line>" \\')
+        print("    --notes-file <draft> \\")
+        print(f"    {assets}")
         return 0
     except ReleaseContractError as exc:
         print(f"RELEASE CONTRACT FAILED: {exc}", file=sys.stderr)

@@ -290,6 +290,7 @@ class _Pipeline:
         "last_foreground",
         "window_list",
         "last_restart",
+        "menu_opened_at",
         "mon_h",
         "mon_w",
         "monitor",
@@ -1108,6 +1109,9 @@ def main() -> int:
                 # worker reports it every two seconds. The HUD pairs the
                 # network rate with it ("42 / 84 fps"); None while FG is off.
                 "display_fps": settings_io._fg_displayed_fps(st),
+                # And which multiplier is really running (issue #100): the
+                # user's pick and the live step can differ after a step-down.
+                "fg_multiplier_active": settings_io._fg_active_multiplier(st),
                 "skipped_static": st.skipped_static_frames,
                 "status": status,
                 "resolution": f"{st.width}x{st.height}",

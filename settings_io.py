@@ -138,7 +138,7 @@ def _set_autostart(enabled: bool) -> bool:
 
 # The version shown in the menu header. Kept in sync with native/launcher.rc
 # (FileVersion/ProductVersion) and build_release_zip.py at release time.
-APP_VERSION = "1.14.0"
+APP_VERSION = "1.16.0"
 
 
 # The channel label: the header shows the version, the channel lives in the
@@ -943,6 +943,14 @@ def fg_verdict(lines):
     from an earlier, already-handled attempt must not flip the switch
     again. Success is the presenter's own "[fg] Nx enabled at ..." line.
     None means the runtime has not answered yet.
+
+    A REFUSED MULTIPLIER is not a refusal of the feature. The worker steps
+    the multiplier down and rebuilds at the lower step (2x is the floor), so
+    the "Nx refused ... stepping down" and "CreateFeature failed" lines that
+    precede a working build must not turn the switch off - the switch would
+    go dark on a card that runs Frame Generation perfectly well. The worker
+    logs "stepping down" exactly for that case, and the step it lands on
+    still prints its own "enabled at" line, which wins because it is newer.
     """
     for line in lines:
         if "[fg] UI: on" in line:
@@ -951,6 +959,8 @@ def fg_verdict(lines):
             return None            # disabled - nothing to judge
         if "enabled at" in line and "[fg]" in line:
             return True            # "[fg] 2x enabled at 3840x2160"
+        if "stepping down to" in line:
+            return None            # a retry is in flight, not a verdict
         if "[fg] Init_Ext -> 0x" in line and "0x00000001" not in line:
             return False           # the FG runtime itself refused
         if any(token in line for token in FG_VERDICT_FAIL):
@@ -1046,9 +1056,10 @@ def _gpu_label(index) -> str:
 def _fg_displayed_fps(st) -> float | None:
     """The frame rate the presenter actually shows (real + generated).
 
-    The worker reports it every two seconds - "[fg] displayed 87.1 FPS".
-    The pipeline counter stays the honest network rate; this is what the
-    screen really shows with Frame Generation on. None while FG is off.
+    The worker reports it every two seconds - "[fg] displayed 87.1 FPS
+    (real + generated, 2x)". The pipeline counter stays the honest network
+    rate; this is what the screen really shows with Frame Generation on.
+    None while FG is off.
     """
     for line in reversed(st.worker_logs[-200:]):
         if "[fg] displayed" in line:
@@ -1057,6 +1068,29 @@ def _fg_displayed_fps(st) -> float | None:
             except (ValueError, IndexError):
                 return None
         # A marker line for FG-off resets the reading - the toggle logs one.
+        if "[fg] UI: off" in line:
+            return None
+    return None
+
+
+def _fg_active_multiplier(st) -> int | None:
+    """The multiplier the presenter is REALLY running, or None while unknown.
+
+    A card whose runtime stops at 2x answers a request for 3x/4x with a
+    refusal, and the worker steps the multiplier down instead of failing
+    (issue #100). The panel then showed the user's pick while a lower step
+    ran, so the only way to notice was the FPS counter. The presenter names
+    the step it runs in the same line as the rate, which makes this the
+    honest source - it reports what happened, not what was requested.
+    """
+    for line in reversed(st.worker_logs[-200:]):
+        if "[fg] displayed" in line:
+            try:
+                tail = line.split("real + generated", 1)[1]
+                value = tail.split(",", 1)[1].split("x", 1)[0].strip()
+                return int(value)
+            except (ValueError, IndexError):
+                return None
         if "[fg] UI: off" in line:
             return None
     return None
@@ -1223,6 +1257,11 @@ def menu_payload(st) -> dict:
         "ui_detection": bool(st.cfg.get("ui_detection", False)),
         "frame_generation": bool(st.cfg.get("frame_generation", False)),
         "frame_multiplier": min(4, max(2, int(st.cfg.get("frame_multiplier", 2)))),
+        # The step the presenter is REALLY running, when the runtime refused
+        # the requested one and the worker stepped down (issue #100). None
+        # until the worker says so; the panel marks the difference so the
+        # user is not left comparing FPS numbers.
+        "frame_multiplier_active": _fg_active_multiplier(st),
         "frame_limit_mode": (str(st.cfg.get("frame_limit_mode", "unlimited"))
                              if str(st.cfg.get("frame_limit_mode", "unlimited"))
                              in FRAME_LIMIT_MODES else "unlimited"),

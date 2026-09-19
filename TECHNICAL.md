@@ -207,12 +207,30 @@ They talk over stdin/stdout with a binary protocol:
 frame is copied into a cross-device shared texture and swizzled to RGBA.
 Python stops capturing entirely — `grab` and `guides` drop to 0.1 ms.
 
-With HDR compatibility off, DDA deliberately uses the original
-`IDXGIOutput1::DuplicateOutput`, whose desktop image is converted to BGRA8.
-The v1.12 attempt to request BGRA8 alone through `DuplicateOutput1` proved
-insufficient on the drivers reported in #86 and #89: acquired frames still
-alternated between FP16 and BGRA8 and rebuilt the bridge repeatedly.
-`DuplicateOutput1` is therefore reserved for the opt-in HDR path.
+With HDR compatibility off, DDA asks for a single format through
+`DuplicateOutput1` so it cannot flap. The v1.12 attempt to request BGRA8
+alone proved insufficient on the drivers reported in #86 and #89: acquired
+frames still alternated between FP16 and BGRA8 and rebuilt the bridge
+repeatedly - 1,955 rebuilds in 133 seconds. v1.13 moved SDR onto the
+original `IDXGIOutput1::DuplicateOutput`, whose desktop image is converted
+to BGRA8, and another reporter's log showed that call succeeding with the
+same alternation. v1.14 therefore pins the format instead of offering a
+choice: a display that can produce a high-colour surface - HDR-capable, or
+a scan-out deeper than 8 bits per colour - is asked for FP16 through
+`DuplicateOutput1`, and the plain `DuplicateOutput` path remains for an
+ordinary 8-bit display, where it works and its behaviour is preserved
+exactly.
+
+Two facts about a captured frame are easy to conflate and must not be: the
+format it ARRIVED in, and the encoding it CARRIES. A display with a
+high-colour surface - HDR-capable, or a 10-bit scan-out - has its format
+pinned to FP16 so it cannot flap (that is the #86 fix), but with HDR off
+that FP16 frame holds an ordinary SDR desktop whose 1.0 is white. The
+capture shader therefore takes `isFloat` and `hdr` as separate constants:
+only a real scRGB frame is tone-mapped, FP16-without-HDR gets the display
+encode alone. Running the HDR tone map on an SDR frame put white at
+`ToSrgb(1/(1+1)) = 0.735` - 187 instead of 255, the washed-out picture
+reported as #99. `tests/hdr_gpu.cpp` runs that case on WARP.
 
 That `guides` figure is a STATIC screen, and it is worth saying so: with
 nothing moving, `process()` sees a scene score under 0.001 and returns a
@@ -226,12 +244,18 @@ background work.
 
 Two things follow from that, both done:
 
-* **In bypass (NR OFF) it is not computed at all.** The worker skips the
-  NGX evaluate, so nothing ever reads the field; filling it cost ~2.9 ms on
-  the mode that runs fastest (121-133 FPS), about half a core spent on a
-  buffer that gets thrown away. `previous_gray` is cleared along with it, so
-  the first frame after NR comes back reports a scene cut instead of
-  correlating against a screen that may be minutes old.
+* **In bypass (NR OFF) it is not computed at all while FG is off too.** The
+  worker skips the NGX evaluate, so nothing ever reads the field; filling it
+  cost ~2.9 ms on the mode that runs fastest (121-133 FPS), about half a core
+  spent on a buffer that gets thrown away. `previous_gray` is cleared along
+  with it, so the first frame after NR comes back reports a scene cut instead
+  of correlating against a screen that may be minutes old.
+* **With FG on, that frame is read after all.** FG interpolates between the
+  frames it is handed, so the field stops being disposable the moment bypass
+  frames are presented by the FG presenter (#104). The hardware backend
+  (`motion_backend: nvofa`) already fills it for every captured frame, so the
+  DIS cost is only paid when that path is unavailable; the Python-side
+  `previous_gray` is still cleared, because the two sources must not mix.
 * **The preset is a setting now** (`flow_preset`), because it is worth a
   measurement rather than an assumption.
 
@@ -551,6 +575,11 @@ The multiplier is x2/x3/x4 (the DLSS-G contract caps there), the switch is
 opt-in, and the header reports both rates - the network's and the presenter's
 - whenever they differ.
 
+FG is independent of NR: with the neural pass off, the presenter interpolates
+the raw capture instead of the neural frame, so the doubled rate survives
+turning NR off. It used to be stopped by the bypass present path on every
+frame, which is why the switch appeared to do nothing there (#104).
+
 The FG runtime (`nvngx_dlssg.dll`) ships in the archive - the public
 310.9.1.0 redistributable, NVIDIA-signed, included unmodified. The licensing
 position is stated in the README notice: research use, takedown on request.
@@ -566,7 +595,7 @@ bundled copy remains the fallback. There is no network updater or downloader.
 
 ## Reproducible release contract
 
-`build_release_zip.py v1.14.0` accepts only a clean checkout whose `HEAD` is the
+`build_release_zip.py v1.15.0` accepts only a clean checkout whose `HEAD` is the
 requested tag and whose version sources agree. The allowlist covers every
 shipped Python/C++/header/shader/resource, while `runtime-manifest.json` binds
 the package paths and hashes. Archive ordering, timestamps and metadata are

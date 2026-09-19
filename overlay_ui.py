@@ -245,6 +245,9 @@ class OverlayMenu:
             "ui_detection": False,
             "frame_generation": False,
             "frame_multiplier": 2,
+            # The step the presenter really runs, when it differs from the
+            # pick above (issue #100: a refused 4x steps down to 2x).
+            "frame_multiplier_active": None,
             "frame_limit_mode": "unlimited",
             "frame_limit_custom": 90,
             "screen_size": "",
@@ -342,6 +345,7 @@ class OverlayMenu:
         #: what anyone wants from it.
         self.settings_tab = SETTINGS_TABS[0]
         self._stats_rect = pygame.Rect(0, 0, 0, 0)
+        self._stats_line1_rel = pygame.Rect(0, 0, 0, 0)
         self._gpu_rect = pygame.Rect(0, 0, 0, 0)
         # The relative rects are computed in layout() for the main page
         # only; the defaults keep the non-main pages safe (the drawers are
@@ -864,15 +868,25 @@ class OverlayMenu:
         # the other pages do the work). The rects are still computed for the
         # main page - the drawers check the page before drawing.
         if self.page == "main":
-            # ONE status line, where a six-cell readings grid and a separate
-            # card row used to be. Four of those six said what the page below
-            # already says: MODE is the source segment, PROFILE is the
-            # profile picker, REC is the Record button and the red dot on
-            # screen, and FRAMES was a counter nobody acts on. What is left is
-            # what you actually want at a glance - is it working, how fast,
-            # at what size, on which card.
-            status_h = self._u(SMALL_SIZE) + self._u(18)
+            # ONE status line again, but with the readings anchored to the
+            # RIGHT edge and built BEFORE the card name is placed, so the name
+            # can only ever eat its own space. The old line laid the readings
+            # out from the right in reverse order and skipped whatever did not
+            # fit - and the order made the FIRST casualty NR, the rate people
+            # watch, while the resolution (printed again in the source section)
+            # stayed. Measured at 4K with a real card name: NR and FG gone,
+            # "SKIP 0  3840x2160" on screen. A reading nobody can see reads as
+            # a counter that does not work (report: "no frame count at all").
+            #
+            # The readings are what cannot be read anywhere else: the NR rate
+            # and the FG rate. Resolution, the skipped-frame count and the
+            # frame counter are gone from the line by decision (19.09) - the
+            # first is already printed above, the other two are numbers nobody
+            # acts on. Order left to right: NR, FG.
+            line_h = self._u(SMALL_SIZE) + self._u(18)
+            status_h = line_h
             self._stats_rel = pygame.Rect(pad, cy, inner_w, status_h)
+            self._stats_line1_rel = pygame.Rect(pad, cy, inner_w, line_h)
             self._gpu_rel = pygame.Rect(0, 0, 0, 0)   # folded into the line
             cy += status_h + gap
 
@@ -1373,7 +1387,20 @@ class OverlayMenu:
             # preference for the next attempt, not a live control - locking it
             # behind the switch deadlocked a 40-series card (caps at 2x) when
             # the first attempt refused and flipped itself back off.
-            toggle("frame_generation", "DLSS 4.5 FG", fg,
+            # The live step, when the runtime refused the pick and the worker
+            # stepped down (issue #100). The buttons show the PREFERENCE (they
+            # stay where the user put them, so the next attempt asks for it
+            # again); this hint says what is actually running, so a 4x pick on
+            # a 2x-capable card does not silently differ from the FPS counter.
+            live = self.state.get("frame_multiplier_active")
+            fg_hint = ""
+            if fg and isinstance(live, int) and live != multiplier:
+                fg_hint = s.get(
+                    "fg_capped",
+                    "the runtime caps this card at x{live} - FG runs there, "
+                    "your x{want} is asked for again on the next attempt"
+                ).format(live=live, want=multiplier)
+            toggle("frame_generation", "DLSS 4.5 FG", fg, hint=fg_hint,
                    inline_right=[("frame_multiplier:2", "×2"),
                                  ("frame_multiplier:3", "×3"),
                                  ("frame_multiplier:4", "×4")])
@@ -1666,6 +1693,8 @@ class OverlayMenu:
         # any hit-testing never see a stale rect from a previous page.
         self._stats_rect = (self._stats_rel.move(x, sy)
                             if self.page == "main" else pygame.Rect(0, 0, 0, 0))
+        self._stats_line1 = (self._stats_line1_rel.move(x, sy)
+                             if self.page == "main" else pygame.Rect(0, 0, 0, 0))
         self._gpu_rect = (self._gpu_rel.move(x, sy)
                           if self.page == "main" else pygame.Rect(0, 0, 0, 0))
         self._hint_rect = self._hint_rel.move(x, sy)
@@ -2487,11 +2516,23 @@ class OverlayMenu:
         return str(s.get("status_on", "processing")), False
 
     def _draw_stats(self, surface, s: dict) -> None:
-        """The status line: is it working, how fast, how big, on what.
+        """The status line: is it working, on what, and how fast.
 
-        The dot is the same signal it has always been - green when the
-        network really runs on that card, red when it does not - and it now
-        sits next to a sentence instead of above a grid.
+        One line. The left half is the state and the card - the two values that
+        cannot be read anywhere else. The right half is the readings, anchored
+        to the RIGHT edge: NR rate then FG rate, with FG at the very edge.
+
+        The reading order matters and was the bug. The old line laid the values
+        out from the right in reverse order and skipped whatever ran out of
+        room, which made the FIRST casualty NR - the rate people watch - while
+        the resolution stayed. At 4K with a real card name the drop was
+        measured: NR and FG gone, "SKIP 0  3840x2160" still on screen.
+
+        The readings are placed FIRST and the card name gets what is left, so
+        the name can never push a reading off the bar. Resolution, the
+        skipped-frame count and the frame counter were removed from the line by
+        decision: the first is already printed in the source section above, and
+        the other two are numbers nobody acts on.
         """
         rect = self._stats_rect
         if rect.w <= 0:
@@ -2505,74 +2546,82 @@ class OverlayMenu:
         dot = (self.c["muted"] if paused or ok is None
                else self.c["ok"] if ok else self.c["danger"])
         r = max(3, self._u(4))
-        cyr = rect.centery
-        pygame.draw.circle(surface, _rgb(dot), (rect.x + pad + r, cyr), r)
+
+        line = getattr(self, "_stats_line1", None) or rect
+        cyr = line.centery
+        pygame.draw.circle(surface, _rgb(dot), (line.x + pad + r, cyr), r)
 
         text, failed = self.status_text(s)
         label = self._small_font.render(str(text), True, _rgb(self.c["text"]))
-        lx = rect.x + pad + r * 2 + self._u(9)
+        lx = line.x + pad + r * 2 + self._u(9)
         surface.blit(label, (lx, cyr - label.get_height() // 2))
 
-        # The readings hug the right edge, shortest first, and the card name
-        # takes whatever is left in the middle. A card name is the one value
-        # here with no upper bound - "NVIDIA GeForce RTX 5070 Ti Laptop GPU"
-        # is a real one - so it is the only thing that gets elided, and it
-        # disappears rather than collide when the room runs out.
-        # NR is the rate of real neural evaluations. Idle acknowledgements do
-        # not inflate it; their cumulative count is shown separately. FG is
-        # the worker presenter's reported output rate, not an inferred display
-        # refresh rate.
-        fps = st.get("fps")
-        shown = st.get("display_fps")
-        readings = []
+        # ---- the readings, anchored to the right edge ---------------------
+        # NR is the rate of real neural evaluations - idle acknowledgements do
+        # not inflate it. FG is the worker presenter's reported output rate,
+        # not an inferred display refresh. The frame counter is not shown at
+        # all: it was asked for once, then dropped again (19.09).
+        readings: list[str] = []
         if not paused and not failed:
+            fps = st.get("fps")
             readings.append(
                 f"{s.get('nr_short', 'NR')} {fps:.1f}"
                 if isinstance(fps, (int, float)) else
                 f"{s.get('nr_short', 'NR')} —")
+            shown = st.get("display_fps")
             if isinstance(shown, (int, float)) and shown > 0:
                 readings.append(f"{s.get('fg_short', 'FG')} {shown:.0f}")
-            skipped = max(0, int(st.get("skipped_static", 0) or 0))
-            readings.append(f"{s.get('skipped_short', 'SKIP')} {skipped}")
-            readings.append(str(st.get("resolution", "—")))
 
+        gap = self._u(14)
+        right = line.right - pad
+        budget = right - (line.x + pad)
+
+        def _fit(values: list[str]) -> list[tuple[object, int]] | None:
+            """Render `values` if they fit the bar, else None."""
+            imgs: list[tuple[object, int]] = []
+            used = 0
+            for value in values:
+                img = self._mono_small.render(value, True, _rgb(self.c["muted"]))
+                extra = img.get_width() + (gap if imgs else 0)
+                if used + extra > budget:
+                    return None
+                imgs.append((img, img.get_width()))
+                used += extra
+            return imgs
+
+        # Priority is explicit because dropping the wrong value was the bug.
+        # NR is the rate people watch - it survives longest, then FG, then the
+        # counter. In practice all three fit at every panel scale with the
+        # longest card name, so this only guards the degenerate case
+        # (verified from 0.4x to 2.0x).
+        imgs = _fit(readings)
+        if imgs is None:
+            imgs = _fit(readings[:2])
+        if imgs is None:
+            imgs = _fit(readings[:1])
+        if imgs is None:
+            return
+
+        # Drawn right to left, last value first, so the last reading - FG -
+        # ends up at the right edge and the list still reads NR, FG from left
+        # to right.
+        x = float(right)
+        for img, w in reversed(imgs):
+            x -= w
+            surface.blit(img, (int(round(x)),
+                               cyr - img.get_height() // 2))
+            x -= gap
+
+        # ---- the card name, in whatever room is left ----------------------
         name = str(self.state.get("gpu_text") or "")
-        # The card the network runs on gets its room FIRST (audit M4). The
-        # readings used to be laid out from the right and the name took
-        # whatever was left - measured 72 px at 1080p and 74 px at 4K, because
-        # the reading block grows with the font while the panel scale stops at
-        # 1.2. So "NVIDIA GeForce RTX 5070 Ti" came out as "NVIDIA…", and in
-        # German at 4K (room 38 px, below the old 40-unit floor) the name was
-        # not drawn at all. The name is the one value here that says which
-        # hardware is running, so it is placed first and the readings are
-        # elided into what remains: a shortened "NR 144.0" still reads, a
-        # missing card name does not.
-        name_x = lx + label.get_width() + self._u(14)
-        name_room = 0
-        if name:
-            # Never more than a third of the bar: the readings matter too, and
-            # a name that eats the line is as unhelpful as one that vanishes.
-            name_room = max(self._u(24),
-                            min(rect.w // 3, self._small_font.size(name)[0]))
-            name_room = min(name_room, max(0, rect.right - pad - name_x
-                                           - self._u(60)))
-            if name_room > 0:
+        if name and imgs:
+            left_edge = int(round(x + gap))     # leftmost reading, less its gap
+            name_x = lx + label.get_width() + self._u(14)
+            room = max(0, left_edge - self._u(14) - name_x)
+            if room > self._u(24):
                 img = self._clip(self._small_font, name,
-                                 _rgb(self.c["muted"]), name_room)
+                                 _rgb(self.c["muted"]), room)
                 surface.blit(img, (name_x, cyr - img.get_height() // 2))
-                name_room = img.get_width()
-
-        x = rect.right - pad
-        limit = name_x + name_room + self._u(14) if name_room else lx + label.get_width() + self._u(14)
-        for value in reversed(readings):
-            img = self._mono_small.render(value, True, _rgb(self.c["muted"]))
-            # Drop a reading that cannot fit beside the name: a clipped number
-            # is worse than a missing one, and the resolution is the longest.
-            if x - img.get_width() < limit:
-                continue
-            x -= img.get_width()
-            surface.blit(img, (x, cyr - img.get_height() // 2))
-            x -= self._u(14)
 
     def _rec_text(self, s: dict) -> str:
         """Recording state: the duration is more useful than a bare "on"."""

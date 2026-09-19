@@ -1898,6 +1898,8 @@ STRINGS['ru'].update({'dlss_sr': 'DLSS Super Resolution', 'dlss_sr_hint': 'се�
 
 STRINGS['en'].update({'frame_generation': 'DLSS Frame Generation', 'frame_multiplier': 'Multiplicateur de trames de sortie'})
 
+STRINGS['en'].update({'frame_generation': 'DLSS Frame Generation', 'frame_multiplier': 'Multiplicateur de trames de sortie', 'fg_capped': 'this card caps at x{live}; x{want} is retried next time'})
+
 for _strings in STRINGS.values():
     _strings.update({
         "fg_on": "DLSS FG ON",
@@ -1912,7 +1914,7 @@ STRINGS["ru"].update({
     "hk_framegen": "Генерация кадров вкл/выкл",
 })
 
-STRINGS['ru'].update({'frame_generation': 'DLSS Frame Generation', 'frame_multiplier': 'Множитель кадров'})
+STRINGS['ru'].update({'frame_generation': 'DLSS Frame Generation', 'frame_multiplier': 'Множитель кадров', 'fg_capped': 'карта ограничена до x{live}; x{want} - в следующий раз'})
 
 STRINGS['fr'].update({'dlss_sr': 'DLSS Super Resolution', 'dlss_sr_hint': 'the network runs at a lower resolution;\nDLSS restores the output resolution (experimental)', 'dlss_sr_failed': 'DLSS Super Resolution failed. Neural rendering remains active.', 'dlss_sr_input': 'DLSS input resolution', 'nr_min_hint': 'minimum processing size is limited automatically', 'frame_generation': 'DLSS Frame Generation', 'frame_multiplier': 'Multiplicateur d’images', 'ui_detection': 'HUD protection in FG (experimental)'})
 
@@ -1928,17 +1930,19 @@ STRINGS['pl'].update({'dlss_sr': 'DLSS Super Resolution', 'dlss_sr_hint': 'the n
 
 STRINGS['uk'].update({'dlss_sr': 'DLSS Super Resolution', 'dlss_sr_hint': 'the network runs at a lower resolution;\nDLSS restores the output resolution (experimental)', 'dlss_sr_failed': 'DLSS Super Resolution failed. Neural rendering remains active.', 'dlss_sr_input': 'DLSS input resolution', 'nr_min_hint': 'minimum processing size is limited automatically', 'frame_generation': 'DLSS Frame Generation', 'frame_multiplier': 'Множник кадрів', 'ui_detection': 'HUD protection in FG (experimental)'})
 
-STRINGS['de'].update({'frame_generation': 'DLSS Frame Generation', 'frame_multiplier': 'Multiplikator der Ausgabebilder'})
+STRINGS['fr'].update({'frame_generation': 'DLSS Frame Generation', 'frame_multiplier': 'Output frame multiplier', 'fg_capped': 'cette carte plafonne a x{live}; x{want} sera retente'})
 
-STRINGS['es'].update({'frame_generation': 'DLSS Frame Generation', 'frame_multiplier': 'Multiplicador de fotogramas de salida'})
+STRINGS['de'].update({'frame_generation': 'DLSS Frame Generation', 'frame_multiplier': 'Multiplikator der Ausgabebilder', 'fg_capped': 'diese Karte kann nur x{live}; x{want} wird erneut versucht'})
 
-STRINGS['it'].update({'frame_generation': 'DLSS Frame Generation', 'frame_multiplier': 'Moltiplicatore di fotogrammi in uscita'})
+STRINGS['es'].update({'frame_generation': 'DLSS Frame Generation', 'frame_multiplier': 'Multiplicador de fotogramas de salida', 'fg_capped': 'esta tarjeta llega a x{live}; x{want} se reintenta luego'})
 
-STRINGS['pt'].update({'frame_generation': 'DLSS Frame Generation', 'frame_multiplier': 'Multiplicador de quadros de saída'})
+STRINGS['it'].update({'frame_generation': 'DLSS Frame Generation', 'frame_multiplier': 'Moltiplicatore di fotogrammi in uscita', 'fg_capped': 'questa scheda arriva a x{live}; x{want} verra ritentato'})
 
-STRINGS['pl'].update({'frame_generation': 'DLSS Frame Generation', 'frame_multiplier': 'Mnożnik klatek wyjściowych'})
+STRINGS['pt'].update({'frame_generation': 'DLSS Frame Generation', 'frame_multiplier': 'Multiplicador de quadros de saída', 'fg_capped': 'esta placa chega a x{live}; x{want} sera retentado'})
 
-STRINGS['uk'].update({'frame_generation': 'DLSS Frame Generation', 'frame_multiplier': 'Множник кадрів виходу'})
+STRINGS['pl'].update({'frame_generation': 'DLSS Frame Generation', 'frame_multiplier': 'Mnożnik klatek wyjściowych', 'fg_capped': 'ta karta to maks. x{live}; x{want} zostanie powtorzone'})
+
+STRINGS['uk'].update({'frame_generation': 'DLSS Frame Generation', 'frame_multiplier': 'Множник кадрів виходу', 'fg_capped': 'карта обмежена до x{live}; x{want} - наступного разу'})
 
 STRINGS['zh'].update({'dlss_sr': 'DLSS Super Resolution', 'dlss_sr_hint': 'the network runs at a lower resolution;\nDLSS restores the output resolution (experimental)', 'dlss_sr_failed': 'DLSS Super Resolution failed. Neural rendering remains active.', 'dlss_sr_input': 'DLSS input resolution', 'nr_min_hint': 'minimum processing size is limited automatically', 'frame_generation': 'DLSS Frame Generation', 'frame_multiplier': '帧数倍率', 'ui_detection': 'HUD protection in FG (experimental)'})
 
@@ -1968,6 +1972,12 @@ for _table in STRINGS.values():
     _table["detail_strength"] = "Sharpness"
 STRINGS["ru"]["detail_strength"] = "\u0420\u0435\u0437\u043a\u043e\u0441\u0442\u044c"
 
+STRINGS['zh'].update({'frame_generation': 'DLSS Frame Generation', 'frame_multiplier': '帧倍率', 'fg_capped': '此显卡上限为 x{live}；x{want} 下次重试'})
+
+STRINGS['ja'].update({'frame_generation': 'DLSS Frame Generation', 'frame_multiplier': 'フレーム倍率', 'fg_capped': 'このカードは x{live} まで；x{want} は次回再試行'})
+
+STRINGS['ko'].update({'frame_generation': 'DLSS Frame Generation', 'frame_multiplier': '프레임 배수', 'fg_capped': '이 카드는 x{live}까지; x{want}는 다음에 재시도'})
+
 for _strings in STRINGS.values():
     _strings.update({
         "frame_limit": "Frame limit",
@@ -1978,7 +1988,6 @@ for _strings in STRINGS.values():
         "frame_limit_custom_value": "Custom limit",
         "nr_short": "NR",
         "fg_short": "FG",
-        "skipped_short": "SKIP",
         "screenshot_mode": "Screenshot saving",
         "screenshot_ask": "Save As",
         "screenshot_auto": "Save automatically",
@@ -2006,7 +2015,6 @@ STRINGS["ru"].update({
     "frame_limit_custom": "Своё",
     "frame_limit_unlimited": "Без ограничений",
     "frame_limit_custom_value": "Свой предел",
-    "skipped_short": "ПРОП.",
     "screenshot_mode": "Сохранение снимка",
     "screenshot_ask": "Спросить путь",
     "screenshot_auto": "Сохранить сразу",
@@ -2063,7 +2071,6 @@ STRINGS["fr"].update({
     'select_shot_dir': 'Choisir le dossier des captures',
     'shot_folder_set': 'Dossier des captures : {path}',
     'shot_saved': 'Capture enregistrée : {path}',
-    'skipped_short': 'IGNORÉ',
 })
 
 STRINGS["de"].update({
@@ -2098,7 +2105,6 @@ STRINGS["de"].update({
     'select_shot_dir': 'Screenshot-Ordner wählen',
     'shot_folder_set': 'Screenshot-Ordner: {path}',
     'shot_saved': 'Screenshot gespeichert: {path}',
-    'skipped_short': 'ÜBERSPR.',
 })
 
 STRINGS["es"].update({
@@ -2133,7 +2139,6 @@ STRINGS["es"].update({
     'select_shot_dir': 'Elegir la carpeta de capturas',
     'shot_folder_set': 'Carpeta de capturas: {path}',
     'shot_saved': 'Captura guardada: {path}',
-    'skipped_short': 'OMIT.',
 })
 
 STRINGS["it"].update({
@@ -2168,7 +2173,6 @@ STRINGS["it"].update({
     'select_shot_dir': 'Scegli la cartella degli screenshot',
     'shot_folder_set': 'Cartella screenshot: {path}',
     'shot_saved': 'Screenshot salvato: {path}',
-    'skipped_short': 'SALT.',
 })
 
 STRINGS["pt"].update({
@@ -2203,7 +2207,6 @@ STRINGS["pt"].update({
     'select_shot_dir': 'Escolher a pasta de capturas',
     'shot_folder_set': 'Pasta de capturas: {path}',
     'shot_saved': 'Captura salva: {path}',
-    'skipped_short': 'IGNOR.',
 })
 
 STRINGS["pl"].update({
@@ -2238,7 +2241,6 @@ STRINGS["pl"].update({
     'select_shot_dir': 'Wybierz folder zrzutów',
     'shot_folder_set': 'Folder zrzutów: {path}',
     'shot_saved': 'Zrzut zapisany: {path}',
-    'skipped_short': 'POMIN.',
 })
 
 STRINGS["uk"].update({
@@ -2273,7 +2275,6 @@ STRINGS["uk"].update({
     'select_shot_dir': 'Виберіть папку скриншотів',
     'shot_folder_set': 'Папка скриншотів: {path}',
     'shot_saved': 'Скриншот збережено: {path}',
-    'skipped_short': 'ПРОП.',
 })
 
 STRINGS["zh"].update({
@@ -2308,7 +2309,6 @@ STRINGS["zh"].update({
     'select_shot_dir': '选择截图文件夹',
     'shot_folder_set': '截图文件夹：{path}',
     'shot_saved': '截图已保存：{path}',
-    'skipped_short': '跳过',
 })
 
 STRINGS["ja"].update({
@@ -2343,7 +2343,6 @@ STRINGS["ja"].update({
     'select_shot_dir': 'スクリーンショット フォルダーを選択',
     'shot_folder_set': 'スクリーンショット フォルダー: {path}',
     'shot_saved': 'スクリーンショットを保存しました: {path}',
-    'skipped_short': 'スキップ',
 })
 
 STRINGS["ko"].update({
@@ -2378,5 +2377,4 @@ STRINGS["ko"].update({
     'select_shot_dir': '스크린샷 폴더 선택',
     'shot_folder_set': '스크린샷 폴더: {path}',
     'shot_saved': '스크린샷 저장됨: {path}',
-    'skipped_short': '건너뜀',
 })
